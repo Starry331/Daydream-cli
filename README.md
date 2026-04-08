@@ -158,10 +158,32 @@ daydream run qwen3:8b
 
 Inside chat:
 
+- `/` opens the slash-command menu in the chat box
+- `/effort` opens the reasoning-effort picker
+- `/effort instant`
+- `/effort short`
+- `/effort default`
+- `/effort long`
 - `/help`
 - `/reset`
 - `/clear`
+- `/t`
 - `/quit`
+
+### Slash commands and reasoning effort
+
+When you type `/`, Daydream shows a dim inline command menu similar to coding-agent chat UIs.
+
+`/effort` lets you manually adjust how much reasoning the model should use:
+
+- `instant`
+- `short`
+- `default`
+- `long`
+
+`default` is the starting value.
+
+If the current model likely supports reasoning-effort control, Daydream injects a small system hint for that turn. If the model does not support it, Daydream does not crash; it keeps the selected value and shows that the model may ignore it.
 
 ### Multi-line input
 
@@ -536,10 +558,32 @@ daydream run qwen3:8b
 
 聊天内支持：
 
+- `/`：在聊天框里打开命令菜单
+- `/effort`：打开思维链长度选择器
+- `/effort instant`
+- `/effort short`
+- `/effort default`
+- `/effort long`
 - `/help`
 - `/reset`
 - `/clear`
+- `/t`
 - `/quit`
+
+#### Slash 命令与 reasoning effort
+
+当你输入 `/` 时，Daydream 会在聊天框里用低透明度文字显示一组命令提示，风格更接近 Claude Code / Codex 这类 coding-agent 的聊天输入区。
+
+`/effort` 可以手动调节模型这一轮的推理强度：
+
+- `instant`
+- `short`
+- `default`
+- `long`
+
+默认值是 `default`。
+
+如果当前模型大概率支持 reasoning effort 控制，Daydream 会在请求里附加一条很小的 system hint；如果模型不支持，也不会崩溃，只会提示该模型可能忽略这个设置。
 
 #### 多行输入
 
