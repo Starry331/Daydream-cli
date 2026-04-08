@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import re
 from typing import Callable
 
 from rich.console import Console
@@ -23,6 +24,19 @@ err_console = Console(stderr=True)
 MULTILINE_SENTINEL = '"""'
 OPEN_THINK_TAG = "<think>"
 CLOSE_THINK_TAG = "</think>"
+REASONING_PREFIX_CANDIDATES = (
+    "thinking process",
+    "thinking process:",
+    "here's a thinking process",
+    "here is a thinking process",
+    "reasoning",
+    "reasoning:",
+    "analysis:",
+    "let's think",
+    "思考过程",
+    "推理过程",
+    "让我想",
+)
 
 
 def _print_stats(response):
@@ -91,6 +105,7 @@ class _ReasoningParser:
         self.saw_reasoning = False
         self._emitted_any_visible = False
         self._buffer = ""
+        self._implicit_reasoning = False
 
     def feed(self, chunk: str) -> tuple[str, str, bool]:
         self._buffer += chunk
@@ -100,9 +115,15 @@ class _ReasoningParser:
 
         while self._buffer:
             if self.in_reasoning:
+                if self._implicit_reasoning and _should_end_implicit_reasoning(self.reasoning_text, self._buffer):
+                    self.in_reasoning = False
+                    self._implicit_reasoning = False
+                    just_closed = True
+                    continue
                 if self._buffer.startswith(CLOSE_THINK_TAG):
                     self._buffer = self._buffer[len(CLOSE_THINK_TAG):]
                     self.in_reasoning = False
+                    self._implicit_reasoning = False
                     just_closed = True
                     continue
                 if _starts_with_partial_tag(self._buffer, CLOSE_THINK_TAG):
@@ -116,6 +137,7 @@ class _ReasoningParser:
             if self._buffer.startswith(OPEN_THINK_TAG):
                 self.saw_reasoning = True
                 self.in_reasoning = True
+                self._implicit_reasoning = False
                 self._buffer = self._buffer[len(OPEN_THINK_TAG):]
                 continue
 
@@ -151,7 +173,14 @@ class _ReasoningParser:
             ):
                 self.saw_reasoning = True
                 self.in_reasoning = True
+                self._implicit_reasoning = True
                 continue
+            if (
+                not self.saw_reasoning
+                and not self._emitted_any_visible
+                and _might_be_reasoning_prefix(self._buffer)
+            ):
+                break
 
             char = self._buffer[0]
             visible_parts.append(char)
@@ -197,18 +226,8 @@ def _looks_like_reasoning_prefix(text: str) -> bool:
     sample = text.lstrip()
     if not sample:
         return False
-    markers = (
-        "thinking process",
-        "reasoning",
-        "let's think",
-        "step 1",
-        "analysis:",
-        "思考过程",
-        "推理过程",
-        "让我想",
-    )
     lowered = sample.lower()
-    if any(marker in lowered for marker in markers):
+    if any(marker in lowered for marker in REASONING_PREFIX_CANDIDATES):
         return True
     if sample.startswith("1.") and "\n" in sample:
         return True
@@ -219,6 +238,97 @@ def _starts_with_partial_tag(text: str, tag: str) -> bool:
     if not text or len(text) >= len(tag):
         return False
     return tag.startswith(text)
+
+
+def _might_be_reasoning_prefix(text: str) -> bool:
+    sample = text.lstrip().lower()
+    if not sample:
+        return False
+    if len(sample) > 64:
+        return False
+    return any(candidate.startswith(sample) for candidate in REASONING_PREFIX_CANDIDATES)
+
+
+def _should_end_implicit_reasoning(reasoning_text: str, buffer: str) -> bool:
+    if not reasoning_text or not (reasoning_text.endswith("\n") or reasoning_text.endswith("\r")):
+        return False
+    sample = buffer.lstrip()
+    if not sample:
+        return False
+    if _looks_like_reasoning_line_start(sample) or _might_be_reasoning_line_start(sample):
+        return False
+    return True
+
+
+def _looks_like_reasoning_line_start(text: str) -> bool:
+    sample = text.lstrip()
+    lowered = sample.lower()
+    if sample.startswith(("**", "* ", "- ", "• ", "> ")):
+        return True
+    if re.match(r"^\d+[\.\)]\s", sample):
+        return True
+    markers = (
+        "input:",
+        "language:",
+        "meaning:",
+        "intent:",
+        "option ",
+        "analysis",
+        "reasoning",
+        "determine",
+        "draft",
+        "final",
+        "review",
+        "self-correction",
+        "let's",
+        "wait",
+        "check",
+        "步骤",
+        "分析",
+        "输入：",
+        "输入:",
+        "意图",
+        "最终",
+    )
+    return any(lowered.startswith(marker) for marker in markers)
+
+
+def _might_be_reasoning_line_start(text: str) -> bool:
+    sample = text.lstrip().lower()
+    if not sample:
+        return False
+    if len(sample) > 48:
+        return False
+    candidates = (
+        "input:",
+        "language:",
+        "meaning:",
+        "intent:",
+        "option ",
+        "analysis",
+        "reasoning",
+        "determine",
+        "draft",
+        "final",
+        "review",
+        "self-correction",
+        "let's",
+        "wait",
+        "check",
+        "步骤",
+        "分析",
+        "输入：",
+        "输入:",
+        "意图",
+        "最终",
+        "* ",
+        "- ",
+        "• ",
+        "> ",
+    )
+    if any(candidate.startswith(sample) for candidate in candidates):
+        return True
+    return bool(re.match(r"^\d+[\.\)]?$", sample))
 
 
 def _stream_response(model, tokenizer, messages, *, model_label, temp, top_p, max_tokens, verbose):
