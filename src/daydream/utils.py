@@ -166,8 +166,8 @@ def _wrap_display_text(text: str, width: int) -> list[str]:
 
 def _chat_frame_width() -> tuple[int, int]:
     columns = shutil.get_terminal_size(fallback=(96, 24)).columns
-    frame_width = min(88, max(52, columns - 12))
-    indent = max(0, (columns - frame_width) // 2)
+    indent = 2
+    frame_width = max(44, columns - (indent * 2) - 2)
     return frame_width, indent
 
 
