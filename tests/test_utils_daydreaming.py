@@ -36,6 +36,8 @@ class DaydreamingTextTests(unittest.TestCase):
         lines = build_input_box_lines(["/"], command_rows=[("/effort", "adjust reasoning depth")])
         widths = {len(_strip_ansi(line)) for line in lines}
         self.assertEqual(len(widths), 1)
+        self.assertTrue(lines[-1].startswith("━"))
+        self.assertNotIn("Send", "".join(lines))
 
     def test_build_effort_menu_lines_have_consistent_width(self) -> None:
         lines = build_effort_menu_lines("default", "long", supported=True)

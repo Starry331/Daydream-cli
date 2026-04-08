@@ -41,6 +41,7 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _DIM = "\x1b[2m"
 _BOLD = "\x1b[1m"
 _RESET = "\x1b[0m"
+_FRAME_CHAR = "━"
 
 
 # ── Generic utilities ──────────────────────────────────────────────────
@@ -173,11 +174,11 @@ def _chat_frame_width() -> tuple[int, int]:
 
 def _frame_line(label: str, frame_width: int, indent: int, *, bottom: bool = False) -> str:
     if bottom:
-        return (" " * indent) + ("─" * frame_width)
+        return (" " * indent) + (_FRAME_CHAR * frame_width)
 
     prefix = f"── {label} "
     fill = max(0, frame_width - _display_width(prefix))
-    return (" " * indent) + prefix + ("─" * fill)
+    return (" " * indent) + prefix + (_FRAME_CHAR * fill)
 
 
 def build_input_box_lines(

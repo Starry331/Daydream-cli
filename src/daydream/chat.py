@@ -261,6 +261,7 @@ def _read_live_boxed_message() -> str:
         try:
             renderer.render(_render_input_state(buffer, multiline=multiline))
             while True:
+                renderer.wait_for_input(_render_input_state(buffer, multiline=multiline))
                 key = _read_key()
 
                 if key in ("\r", "\n"):
@@ -333,6 +334,9 @@ def _select_effort(current: str, *, supported: bool) -> str:
         try:
             renderer.render(build_effort_menu_lines(current, options[index], supported=supported))
             while True:
+                renderer.wait_for_input(
+                    build_effort_menu_lines(current, options[index], supported=supported)
+                )
                 key = _read_key()
                 if key in ("\r", "\n"):
                     break
@@ -361,10 +365,19 @@ class _InlineTerminalRenderer:
         self.stream = stream
         self._line_count = 0
         self._cursor_hidden = False
+        self._wrap_disabled = False
         self._start_row: int | None = None
+        self._last_size = shutil.get_terminal_size(fallback=(96, 24))
+
+    def _terminal_size(self):
+        return shutil.get_terminal_size(fallback=(96, 24))
 
     def _terminal_rows(self) -> int:
-        return shutil.get_terminal_size(fallback=(96, 24)).lines
+        return self._terminal_size().lines
+
+    def _clear_screen_from(self, start_row: int) -> None:
+        self._move_to(start_row)
+        self.stream.write("\x1b[J")
 
     def _move_to(self, row: int, col: int = 1) -> None:
         self.stream.write(f"\x1b[{row};{col}H")
@@ -384,11 +397,15 @@ class _InlineTerminalRenderer:
         if not self._cursor_hidden:
             self.stream.write("\x1b[?25l")
             self._cursor_hidden = True
+        if not self._wrap_disabled:
+            self.stream.write("\x1b[?7l")
+            self._wrap_disabled = True
 
-        rows = self._terminal_rows()
+        size = self._terminal_size()
+        rows = size.lines
         start_row = max(1, rows - len(lines) + 1)
-        if self._start_row is not None:
-            self._clear_region(self._start_row, self._line_count)
+        clear_from = start_row if self._start_row is None else min(self._start_row, start_row)
+        self._clear_screen_from(clear_from)
 
         for index, line in enumerate(lines):
             self._move_to(start_row + index)
@@ -397,17 +414,32 @@ class _InlineTerminalRenderer:
         self.stream.flush()
         self._start_row = start_row
         self._line_count = len(lines)
+        self._last_size = size
+
+    def wait_for_input(self, lines: list[str]) -> None:
+        fd = sys.stdin.fileno()
+        while True:
+            ready, _, _ = select.select([fd], [], [], 0.05)
+            size = self._terminal_size()
+            if size != self._last_size:
+                self.render(lines)
+                continue
+            if ready:
+                return
 
     def finish(self) -> None:
         if self._line_count:
             if self._start_row is not None:
-                self._clear_region(self._start_row, self._line_count)
+                self._clear_screen_from(self._start_row)
                 self._move_to(self._start_row)
             self.stream.flush()
             self._line_count = 0
             self._start_row = None
         if self._cursor_hidden:
             self.stream.write("\x1b[?25h")
+            if self._wrap_disabled:
+                self.stream.write("\x1b[?7h")
+                self._wrap_disabled = False
             self.stream.flush()
             self._cursor_hidden = False
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import unittest
 from unittest import mock
 
@@ -111,16 +112,21 @@ class ChatTests(unittest.TestCase):
             def __init__(self, stream):
                 super().__init__(stream)
                 self.rows = 24
+                self.cols = 96
 
-            def _terminal_rows(self) -> int:
-                return self.rows
+            def _terminal_size(self):
+                return os.terminal_size((self.cols, self.rows))
 
         renderer = Renderer(stream)
         renderer.render(["top", "mid", "bot"])
         renderer.rows = 30
         renderer.render(["top", "mid", "bot"])
+        renderer.finish()
 
         output = stream.getvalue()
+        self.assertIn("\x1b[J", output)
+        self.assertIn("\x1b[?7l", output)
+        self.assertIn("\x1b[?7h", output)
         self.assertIn("\x1b[22;1H", output)
         self.assertIn("\x1b[28;1H", output)
 
