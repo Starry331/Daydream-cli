@@ -35,7 +35,15 @@ class ModelTests(unittest.TestCase):
                 models = reload_module("daydream.models")
                 models.console = Console(file=output, force_terminal=False, color_system=None)
 
-                with mock.patch.object(models, "snapshot_download", side_effect=RuntimeError("offline")):
+                def fake_snapshot_download(*args, dry_run=False, **kwargs):
+                    if dry_run:
+                        class _Entry:
+                            file_size = 1024
+                            will_download = True
+                        return [_Entry()]
+                    raise RuntimeError("offline")
+
+                with mock.patch.object(models, "snapshot_download", side_effect=fake_snapshot_download):
                     models.pull_model("smollm2:135m")
 
                 repo_id = "mlx-community/SmolLM2-135M-Instruct-4bit"

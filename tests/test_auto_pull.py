@@ -67,12 +67,17 @@ class AutoPullTests(unittest.TestCase):
                 models = reload_module("daydream.models")
                 models.console = Console(file=output, force_terminal=False, color_system=None)
 
-                def fake_snapshot_download(repo_id, allow_patterns=None, cache_dir=None):
+                def fake_snapshot_download_with_dry_run(repo_id, allow_patterns=None, cache_dir=None, dry_run=False, **kwargs):
                     self.assertEqual(repo_id, "acme/Qwen3.5-27B-MLX-4bit")
+                    if dry_run:
+                        class _Entry:
+                            file_size = 1024
+                            will_download = True
+                        return [_Entry()]
                     write_remote_cache_model(downloaded, quantized=True)
                     return str(downloaded)
 
-                with mock.patch.object(models, "snapshot_download", side_effect=fake_snapshot_download):
+                with mock.patch.object(models, "snapshot_download", side_effect=fake_snapshot_download_with_dry_run):
                     resolved = models.ensure_runtime_model(
                         "hf.co/acme/Qwen3.5-27B-MLX-4bit",
                         auto_pull=True,
@@ -100,7 +105,12 @@ class AutoPullTests(unittest.TestCase):
                 reload_module("daydream.registry")
                 models = reload_module("daydream.models")
 
-                def fake_snapshot_download(repo_id, allow_patterns=None, cache_dir=None):
+                def fake_snapshot_download(repo_id, allow_patterns=None, cache_dir=None, dry_run=False, **kwargs):
+                    if dry_run:
+                        class _Entry:
+                            file_size = 1024
+                            will_download = True
+                        return [_Entry()]
                     write_remote_cache_model(downloaded, quantized=False)
                     return str(downloaded)
 

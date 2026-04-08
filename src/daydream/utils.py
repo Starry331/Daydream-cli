@@ -123,6 +123,24 @@ def render_title_text(label: str, frame: int = 0) -> str:
     return f"{spinner} Daydream CLI — {label}"
 
 
+def render_status_footer(
+    model_label: str,
+    *,
+    tokens_per_second: float | None = None,
+    phase: str | None = None,
+) -> Text:
+    text = Text(style="dim")
+    text.append("  ")
+    text.append(model_label, style="dim")
+    if phase:
+        text.append("  ·  ", style="dim")
+        text.append(phase, style="dim")
+    if tokens_per_second:
+        text.append("  ·  ", style="dim")
+        text.append(f"{tokens_per_second:.1f} tok/s", style="dim")
+    return text
+
+
 def _title_stream():
     if getattr(sys.stderr, "isatty", lambda: False)():
         return sys.stderr
@@ -165,19 +183,41 @@ class TerminalTitleAnimator:
         set_terminal_title(DEFAULT_TERMINAL_TITLE)
 
 
-class DaydreamingAnimator:
-    def __init__(self, console: Console):
+class ConversationStatus:
+    def __init__(self, console: Console, model_label: str):
         self.console = console
+        self.model_label = model_label
         self._rainbow = random.random() < 0.3
+        self._frame = 0
+        self._phase: str | None = "thinking"
+        self._tokens_per_second: float | None = None
+        self._waiting = True
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._live: Live | None = None
+        self._lock = threading.Lock()
+        self._title_animator = TerminalTitleAnimator("Daydreaming")
+
+    def _render(self) -> Group:
+        with self._lock:
+            footer = render_status_footer(
+                self.model_label,
+                tokens_per_second=self._tokens_per_second,
+                phase=self._phase,
+            )
+            if self._waiting:
+                return Group(
+                    render_daydreaming_text(self._frame, rainbow=self._rainbow),
+                    footer,
+                )
+            return Group(footer)
 
     def start(self) -> None:
+        self._title_animator.start()
         if not self.console.is_terminal:
             return
         self._live = Live(
-            Group(render_daydreaming_text(0, rainbow=self._rainbow)),
+            self._render(),
             console=self.console,
             refresh_per_second=12,
             transient=True,
@@ -187,11 +227,24 @@ class DaydreamingAnimator:
         self._thread.start()
 
     def _run(self) -> None:
-        frame = 0
         while not self._stop.wait(0.08):
-            frame += 1
+            with self._lock:
+                self._frame += 1
             if self._live is not None:
-                self._live.update(Group(render_daydreaming_text(frame, rainbow=self._rainbow)))
+                self._live.update(self._render())
+
+    def update(self, *, phase: str | None = None, tokens_per_second: float | None = None, waiting: bool | None = None) -> None:
+        with self._lock:
+            if phase is not None:
+                self._phase = phase
+            if tokens_per_second is not None:
+                self._tokens_per_second = tokens_per_second
+            if waiting is not None and self._waiting != waiting:
+                self._waiting = waiting
+                if not waiting:
+                    self._title_animator.stop()
+        if self._live is not None:
+            self._live.update(self._render())
 
     def stop(self) -> None:
         self._stop.set()
@@ -199,19 +252,17 @@ class DaydreamingAnimator:
             self._thread.join(timeout=0.2)
         if self._live is not None:
             self._live.stop()
+        self._title_animator.stop()
 
 
 @contextmanager
-def daydreaming_status(console: Console):
-    animator = DaydreamingAnimator(console)
-    title_animator = TerminalTitleAnimator("Daydreaming")
-    title_animator.start()
+def daydreaming_status(console: Console, model_label: str):
+    animator = ConversationStatus(console, model_label)
     animator.start()
     try:
         yield animator
     finally:
         animator.stop()
-        title_animator.stop()
 
 
 @contextmanager

@@ -66,25 +66,32 @@ def _collect_multiline_message(
     return first_line
 
 
-def _stream_response(model, tokenizer, messages, *, temp, top_p, max_tokens, verbose):
+def _stream_response(model, tokenizer, messages, *, model_label, temp, top_p, max_tokens, verbose):
     """Stream a response, collecting the full text. Returns (full_text, last_response)."""
     full_text = ""
     last_response = None
     wrote_output = False
-    with daydreaming_status(err_console):
+    with daydreaming_status(err_console, model_label) as status:
         for response in engine.generate_stream(
             model, tokenizer, messages,
             max_tokens=max_tokens, temp=temp, top_p=top_p,
         ):
             text_chunk = response.text or ""
+            if response.prompt_tps and not wrote_output:
+                status.update(phase="prefill", tokens_per_second=response.prompt_tps, waiting=True)
             if text_chunk and not wrote_output:
                 err_console.print()
+                status.update(waiting=False)
             full_text += text_chunk
             last_response = response
 
             if text_chunk:
                 print(text_chunk, end="", flush=True)
                 wrote_output = True
+                if response.generation_tps:
+                    status.update(phase=None, tokens_per_second=response.generation_tps, waiting=False)
+            elif response.generation_tps:
+                status.update(phase=None, tokens_per_second=response.generation_tps, waiting=False)
 
             if response.finish_reason:
                 break
@@ -130,6 +137,7 @@ def run_oneshot(
 
     _stream_response(
         model, tokenizer, messages,
+        model_label=reverse_lookup(resolved_name) or model_name,
         temp=temp, top_p=top_p, max_tokens=max_tokens, verbose=verbose,
     )
 
@@ -190,6 +198,7 @@ def run_chat(
 
         full_text, _ = _stream_response(
             model, tokenizer, messages,
+            model_label=short,
             temp=temp, top_p=top_p, max_tokens=max_tokens, verbose=verbose,
         )
 

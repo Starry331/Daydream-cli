@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -12,7 +14,16 @@ from huggingface_hub import scan_cache_dir, snapshot_download
 from huggingface_hub.file_download import repo_folder_name
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TransferSpeedColumn,
+)
 from rich.table import Table
 
 from daydream.config import MODEL_CACHE_DIR, ensure_home
@@ -163,6 +174,43 @@ def _fixture_storage_path(repo_id: str) -> tuple[Path, str]:
     return storage_dir / "snapshots" / commit_hash, commit_hash
 
 
+def _repo_storage_dir(repo_id: str) -> Path:
+    return MODEL_CACHE_DIR / repo_folder_name(repo_id=repo_id, repo_type="model")
+
+
+def _estimate_download_bytes(repo_id: str) -> int | None:
+    try:
+        entries = snapshot_download(
+            repo_id,
+            allow_patterns=MODEL_FILE_PATTERNS,
+            cache_dir=str(MODEL_CACHE_DIR),
+            dry_run=True,
+        )
+    except Exception:
+        return None
+
+    if not isinstance(entries, list):
+        return None
+
+    return sum(entry.file_size for entry in entries if entry.will_download)
+
+
+def _watch_downloaded_bytes(
+    progress: Progress,
+    task_id: int,
+    storage_dir: Path,
+    initial_bytes: int,
+    total_bytes: int | None,
+    stop_event: threading.Event,
+) -> None:
+    while not stop_event.wait(0.12):
+        current_bytes = _dir_size(storage_dir) if storage_dir.exists() else initial_bytes
+        completed = max(0, current_bytes - initial_bytes)
+        if total_bytes is not None:
+            completed = min(completed, total_bytes)
+        progress.update(task_id, completed=completed)
+
+
 def _install_fixture_model(repo_id: str) -> Optional[Path]:
     """Install a tiny offline test fixture into the HF cache layout."""
     if repo_id not in FIXTURE_MODELS:
@@ -213,15 +261,31 @@ def pull_model(name: str, *, register_alias: bool = False) -> None:
     short = reverse_lookup(repo_id) or name
 
     console.print(f"Pulling [bold cyan]{short}[/] ({repo_id})...")
+    storage_dir = _repo_storage_dir(repo_id)
+    initial_bytes = _dir_size(storage_dir) if storage_dir.exists() else 0
+    total_bytes = _estimate_download_bytes(repo_id)
+    download_total = total_bytes if total_bytes and total_bytes > 0 else None
 
     with terminal_title_status(f"Downloading {short}"):
         with Progress(
             SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
+            TextColumn("[progress.description]{task.description}", style="dim"),
+            BarColumn(bar_width=24, complete_style="cyan", finished_style="dim", pulse_style="grey37"),
+            TaskProgressColumn(text_format="[progress.percentage]{task.percentage:>3.0f}%"),
+            DownloadColumn(binary_units=True),
+            TransferSpeedColumn(),
+            TimeElapsedColumn(),
             console=console,
             transient=True,
         ) as progress:
-            task = progress.add_task("Downloading model...", total=None)
+            task = progress.add_task("Downloading model", total=download_total, completed=0)
+            stop_event = threading.Event()
+            watcher = threading.Thread(
+                target=_watch_downloaded_bytes,
+                args=(progress, task, storage_dir, initial_bytes, download_total, stop_event),
+                daemon=True,
+            )
+            watcher.start()
             try:
                 path = snapshot_download(
                     repo_id,
@@ -229,14 +293,22 @@ def pull_model(name: str, *, register_alias: bool = False) -> None:
                     cache_dir=str(MODEL_CACHE_DIR),
                 )
             except Exception as e:
+                stop_event.set()
+                watcher.join(timeout=0.2)
                 path = _install_fixture_model(repo_id)
                 if path is None:
                     console.print(f"[red]Error:[/] {e}")
                     raise SystemExit(1)
-                progress.update(task, description="Installed offline test fixture")
+                progress.update(task, description="Installed offline fixture")
                 console.print("[yellow]Hub unavailable.[/] Installed local offline fixture for testing.")
             else:
-                progress.update(task, description="Download complete")
+                stop_event.set()
+                watcher.join(timeout=0.2)
+                final_completed = download_total
+                if final_completed is None:
+                    current_bytes = _dir_size(storage_dir) if storage_dir.exists() else initial_bytes
+                    final_completed = max(0, current_bytes - initial_bytes)
+                progress.update(task, completed=final_completed, total=final_completed or 1, description="Download complete")
 
     validate_runtime_model(repo_id, source_name=short)
 
