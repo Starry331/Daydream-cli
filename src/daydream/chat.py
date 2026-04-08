@@ -29,6 +29,14 @@ REASONING_PREFIX_CANDIDATES = (
     "thinking process:",
     "here's a thinking process",
     "here is a thinking process",
+    "the user asked",
+    "the user said",
+    "the user sent",
+    "i need to",
+    "i should",
+    "first,",
+    "however,",
+    "in summary",
     "reasoning",
     "reasoning:",
     "analysis:",
@@ -36,6 +44,24 @@ REASONING_PREFIX_CANDIDATES = (
     "思考过程",
     "推理过程",
     "让我想",
+    "好的，用户",
+    "好的，用户发来",
+    "好的，用户发来的是",
+    "用户发来",
+    "用户发来的是",
+    "用户可能",
+    "用户希望",
+    "看起来他们可能",
+    "我需要",
+    "我应该",
+    "首先",
+    "不过",
+    "另外",
+    "同时",
+    "现在需要",
+    "根据我的知识库",
+    "总结",
+    "总结：",
 )
 
 
@@ -92,10 +118,11 @@ def _read_boxed_message(
 ) -> str:
     err_console.print(render_input_box_header())
     try:
-        first_line = input_func("")
-        return _collect_multiline_message(first_line, lambda _: input_func(""))
+        first_line = input_func("│ ")
+        return _collect_multiline_message(first_line, lambda _: input_func("│ "))
     finally:
         err_console.print(render_input_box_footer())
+        err_console.print()
 
 
 class _ReasoningParser:
@@ -281,6 +308,12 @@ def _looks_like_reasoning_line_start(text: str) -> bool:
         "review",
         "self-correction",
         "let's",
+        "the user",
+        "i need to",
+        "i should",
+        "first",
+        "however",
+        "summary",
         "wait",
         "check",
         "步骤",
@@ -289,6 +322,20 @@ def _looks_like_reasoning_line_start(text: str) -> bool:
         "输入:",
         "意图",
         "最终",
+        "好的，用户",
+        "用户发来",
+        "用户可能",
+        "看起来",
+        "我需要",
+        "我应该",
+        "首先",
+        "不过",
+        "另外",
+        "同时",
+        "现在需要",
+        "根据我的知识库",
+        "总结",
+        "总结：",
     )
     return any(lowered.startswith(marker) for marker in markers)
 
@@ -313,6 +360,12 @@ def _might_be_reasoning_line_start(text: str) -> bool:
         "review",
         "self-correction",
         "let's",
+        "the user",
+        "i need to",
+        "i should",
+        "first",
+        "however",
+        "summary",
         "wait",
         "check",
         "步骤",
@@ -321,6 +374,20 @@ def _might_be_reasoning_line_start(text: str) -> bool:
         "输入:",
         "意图",
         "最终",
+        "好的，用户",
+        "用户发来",
+        "用户可能",
+        "看起来",
+        "我需要",
+        "我应该",
+        "首先",
+        "不过",
+        "另外",
+        "同时",
+        "现在需要",
+        "根据我的知识库",
+        "总结",
+        "总结：",
         "* ",
         "- ",
         "• ",

@@ -17,9 +17,8 @@ from rich.text import Text
 SPINNER_FRAMES = ("◜", "◠", "◝", "◞", "◡", "◟")
 DEFAULT_TERMINAL_TITLE = "Daydream CLI"
 
-# Z animation: total cycle length in frames (~3s at 12fps)
-_Z_CYCLE = 36
-_Z_GROUPS = ("Z", "ZZ", "ZZZ")
+# Z animation: single evolving cluster Z → ZZ → ZZZ → ZZ → Z
+_Z_CYCLE = 32
 
 # Dream color palette (dark → glow)
 _C_DARK = "#1e3a5f"
@@ -30,8 +29,8 @@ _C_GLOW = "#b8e6ff"
 _C_WHITE = "#e0f2ff"
 _C_REASON = "#6b7b8d"
 
-# Title Z frames (simplified for title bar)
-_TITLE_Z_FRAMES = ("z", "z·", "z·zz", "z·zz·", "z·zz·zzz", "·zz·zzz", "zz·zzz", "·zzz", "zzz", "zz", "z", " ")
+# Title Z frames (single cluster)
+_TITLE_Z_FRAMES = ("z", "zz", "zzz", "zz", "z", "zz", "zzz", "zz")
 
 # Sentinel for "not provided" in update()
 _UNSET = object()
@@ -100,50 +99,29 @@ def _smoothstep(t: float) -> float:
     return t * t * (3.0 - 2.0 * t)
 
 
-# ── Z fade animation ──────────────────────────────────────────────────
-#
-# Each Z group (Z, ZZ, ZZZ) fades in sequentially, holds with a gentle
-# pulse, then all fade out together before a brief dark pause.
-#
-#   frames  0-5:  Z fades in
-#   frames  4-9:  ZZ fades in
-#   frames  8-13: ZZZ fades in
-#   frames 13-22: all hold with sine pulse
-#   frames 22-30: all fade out
-#   frames 30-36: dark pause
-#
+def _z_length_value(frame: int) -> float:
+    """Animated visible cluster length in [1, 3]."""
+    phase = (frame % _Z_CYCLE) / _Z_CYCLE
+    if phase < 0.5:
+        t = _smoothstep(phase / 0.5)
+        return 1.0 + 2.0 * t
+    t = _smoothstep((phase - 0.5) / 0.5)
+    return 3.0 - 2.0 * t
 
-def _z_brightness(frame: int, group: int) -> float:
-    """Brightness [0, 1] for Z group (0=Z, 1=ZZ, 2=ZZZ)."""
-    t = frame % _Z_CYCLE
 
-    fade_in_span = 6
-    stagger = 4
-    last_fade_in_end = stagger * (len(_Z_GROUPS) - 1) + fade_in_span
-    hold_end = last_fade_in_end + 1
-    breathe_end = hold_end + 8
-    fade_out_end = breathe_end + 7
-
-    in_start = group * stagger
-    in_end = in_start + fade_in_span
-
-    if t < in_start:
+def _z_slot_brightness(frame: int, slot: int) -> float:
+    """Brightness [0, 1] for a single Z slot in the evolving cluster."""
+    length_value = _z_length_value(frame)
+    activation = max(0.0, min(1.0, length_value - slot))
+    if activation <= 0.0:
         return 0.0
-    if t < in_end:
-        return 0.88 * _smoothstep((t - in_start) / max(1, in_end - in_start))
-    if t < hold_end:
-        return 0.88
-    if t < breathe_end:
-        breathe_t = (t - hold_end) / max(1, breathe_end - hold_end)
-        if breathe_t < 0.5:
-            breath = _smoothstep(breathe_t / 0.5)
-        else:
-            breath = 1.0 - _smoothstep((breathe_t - 0.5) / 0.5)
-        return 0.88 + 0.10 * breath
-    if t < fade_out_end:
-        fade_t = (t - breathe_end) / max(1, fade_out_end - breathe_end)
-        return 0.88 * (1.0 - _smoothstep(fade_t))
-    return 0.0
+
+    breathe_wave = 0.5 + 0.5 * math.sin((frame / 16.0 + slot * 0.11) * math.tau)
+    breathe = 0.08 * _smoothstep(breathe_wave)
+    shimmer_wave = 0.5 + 0.5 * math.sin((frame / 5.4) + slot * 1.15)
+    shimmer = 0.06 * (_smoothstep(shimmer_wave) - 0.5)
+    brightness = 0.62 + 0.28 * activation + breathe + shimmer
+    return max(0.0, min(1.0, brightness))
 
 
 def _brightness_to_color(b: float) -> str:
@@ -162,7 +140,7 @@ def _brightness_to_color(b: float) -> str:
 # ── Render functions ───────────────────────────────────────────────────
 
 def render_daydreaming_text(frame: int = 0) -> Text:
-    """Render dreamy Z bubbles, a sweeping Daydreaming glow, and pulsing dots."""
+    """Render a dreamy Z cluster, a sweeping Daydreaming glow, and pulsing dots."""
     text = Text()
     text.append("  ")
 
@@ -183,23 +161,13 @@ def render_daydreaming_text(frame: int = 0) -> Text:
             return f"bold {color}"
         return color
 
-    # ── Z groups ──
-    for i, zchars in enumerate(_Z_GROUPS):
-        group_brightness = _z_brightness(frame, i)
-        shimmer_strength = _smoothstep(min(1.0, group_brightness / 0.28))
-
-        for j, char in enumerate(zchars):
-            shimmer_wave = 0.5 + 0.5 * math.sin(frame / 4.8 + i * 0.9 + j * 1.35)
-            shimmer = (_smoothstep(shimmer_wave) - 0.5) * 0.14
-            offset = (j - (len(zchars) - 1) / 2.0) * 0.05
-            char_brightness = group_brightness + shimmer_strength * (shimmer + offset)
-            char_brightness = max(0.0, min(1.0, char_brightness))
-            if char_brightness > 0.003:
-                text.append(char, style=dreamy_style(char_brightness))
-            else:
-                text.append(" ")
-        if i < len(_Z_GROUPS) - 1:
-            text.append("  ")
+    # ── single Z cluster ──
+    for slot in range(3):
+        char_brightness = _z_slot_brightness(frame, slot)
+        if char_brightness > 0.01:
+            text.append("Z", style=dreamy_style(char_brightness))
+        else:
+            text.append(" ")
 
     text.append("  ")
 
@@ -285,11 +253,11 @@ def render_reasoning_box(reasoning_text: str, frame: int) -> Group:
 
 
 def render_input_box_header() -> Rule:
-    return render_frame_rule()
+    return render_frame_rule(Text(" Chat ", style="bold grey58"))
 
 
 def render_input_box_footer() -> Rule:
-    return render_frame_rule()
+    return render_frame_rule(Text(" Send ", style="grey42"))
 
 
 def render_expanded_reasoning(reasoning_text: str) -> Group:
@@ -307,6 +275,7 @@ def render_status_footer(
     *,
     tokens_per_second: float | None = None,
     phase: str | None = None,
+    hint: str | None = None,
 ) -> Text:
     """Status footer pinned at bottom of display area."""
     text = Text(style="dim")
@@ -318,6 +287,9 @@ def render_status_footer(
     if tokens_per_second:
         text.append("  ·  ", style="dim")
         text.append(f"{tokens_per_second:.1f} tok/s", style="dim")
+    if hint:
+        text.append("  ·  ", style="dim")
+        text.append(hint, style="dim")
     return text
 
 
@@ -375,7 +347,7 @@ class TerminalTitleAnimator:
 # ── Conversation status display ────────────────────────────────────────
 #
 # Layout during reasoning:
-#     Z  ZZ  ZZZ  Daydreaming ···
+#     ZZZ  Daydreaming ···
 #     ┌──────────────────────────────┐
 #     │ streamed reasoning...        │
 #     │ newest line at bottom        │
@@ -448,9 +420,13 @@ class ConversationStatus:
                     parts.append(Text())
 
             # ── Footer (always at bottom) ──
+            reasoning_hint = None
+            if self._reasoning_active or self._had_reasoning:
+                reasoning_hint = "Use /t to expand reasoning"
             parts.append(render_status_footer(
                 self.model_label,
                 tokens_per_second=self._tokens_per_second,
+                hint=reasoning_hint,
             ))
 
             return Group(*parts)

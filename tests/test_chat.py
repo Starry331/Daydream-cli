@@ -45,6 +45,29 @@ class ChatTests(unittest.TestCase):
         self.assertIn("thinking process", reasoning_delta.lower())
         self.assertFalse(closed)
 
+    def test_reasoning_parser_detects_chunked_chinese_reasoning_prefix(self) -> None:
+        parser = _ReasoningParser()
+
+        delta, reasoning_delta, closed = parser.feed("好的，用户发来的是/think，")
+        self.assertEqual(delta, "")
+        self.assertIn("好的，用户", reasoning_delta)
+        self.assertFalse(closed)
+
+        delta, reasoning_delta, closed = parser.feed("看起来他们可能想让我开启某种特殊模式。\n")
+        self.assertEqual(delta, "")
+        self.assertIn("看起来他们可能", reasoning_delta)
+        self.assertFalse(closed)
+
+        delta, reasoning_delta, closed = parser.feed("总结：用户可能误用了命令。\n")
+        self.assertEqual(delta, "")
+        self.assertIn("总结：用户", reasoning_delta)
+        self.assertFalse(closed)
+
+        delta, reasoning_delta, closed = parser.feed("你好")
+        self.assertEqual(delta, "你好")
+        self.assertEqual(reasoning_delta, "")
+        self.assertTrue(closed)
+
     def test_run_oneshot_resolves_before_preparing_load(self) -> None:
         output = io.StringIO()
 
