@@ -166,12 +166,15 @@ def _wrap_display_text(text: str, width: int) -> list[str]:
 
 def _chat_frame_width() -> tuple[int, int]:
     columns = shutil.get_terminal_size(fallback=(96, 24)).columns
-    indent = 2
-    frame_width = max(44, columns - (indent * 2) - 2)
+    indent = 0
+    frame_width = max(24, columns)
     return frame_width, indent
 
 
-def _frame_line(label: str, frame_width: int, indent: int) -> str:
+def _frame_line(label: str, frame_width: int, indent: int, *, bottom: bool = False) -> str:
+    if bottom:
+        return (" " * indent) + ("─" * frame_width)
+
     prefix = f"── {label} "
     fill = max(0, frame_width - _display_width(prefix))
     return (" " * indent) + prefix + ("─" * fill)
@@ -212,7 +215,7 @@ def build_input_box_lines(
         hint = _fit_display_width('Multiline mode · End with """', text_width)
         rendered.append(f"{pad}{_DIM}{hint}{_RESET}")
 
-    rendered.append(_frame_line("Send", frame_width, indent))
+    rendered.append(_frame_line("", frame_width, indent, bottom=True))
     return rendered
 
 
@@ -243,7 +246,7 @@ def build_effort_menu_lines(
     if not supported:
         note = _fit_display_width("This model may ignore effort controls.", text_width)
         lines.append(f"{pad}{_DIM}{note}{_RESET}")
-    lines.append(_frame_line("Apply", frame_width, indent))
+    lines.append(_frame_line("", frame_width, indent, bottom=True))
     return lines
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import select
+import shutil
 import sys
 import re
 import termios
@@ -360,50 +361,55 @@ class _InlineTerminalRenderer:
         self.stream = stream
         self._line_count = 0
         self._cursor_hidden = False
-        self._anchor_set = False
+        self._start_row: int | None = None
+
+    def _terminal_rows(self) -> int:
+        return shutil.get_terminal_size(fallback=(96, 24)).lines
+
+    def _move_to(self, row: int, col: int = 1) -> None:
+        self.stream.write(f"\x1b[{row};{col}H")
+
+    def _clear_region(self, start_row: int, count: int) -> None:
+        if count <= 0:
+            return
+        terminal_rows = self._terminal_rows()
+        for offset in range(count):
+            row = start_row + offset
+            if row < 1 or row > terminal_rows:
+                continue
+            self._move_to(row)
+            self.stream.write("\x1b[2K")
 
     def render(self, lines: list[str]) -> None:
         if not self._cursor_hidden:
             self.stream.write("\x1b[?25l")
             self._cursor_hidden = True
-        if not self._anchor_set:
-            self.stream.write("\x1b7")
-            self._anchor_set = True
-        else:
-            self.stream.write("\x1b8")
 
-        clear_count = max(self._line_count, len(lines))
-        for index in range(clear_count):
-            self.stream.write("\r\x1b[2K")
-            if index < clear_count - 1:
-                self.stream.write("\r\n")
+        rows = self._terminal_rows()
+        start_row = max(1, rows - len(lines) + 1)
+        if self._start_row is not None:
+            self._clear_region(self._start_row, self._line_count)
 
-        self.stream.write("\x1b8")
         for index, line in enumerate(lines):
-            self.stream.write("\r\x1b[2K")
+            self._move_to(start_row + index)
+            self.stream.write("\x1b[2K")
             self.stream.write(line)
-            if index < len(lines) - 1:
-                self.stream.write("\r\n")
         self.stream.flush()
+        self._start_row = start_row
         self._line_count = len(lines)
 
     def finish(self) -> None:
         if self._line_count:
-            if self._anchor_set:
-                self.stream.write("\x1b8")
-            for index in range(self._line_count):
-                self.stream.write("\r\x1b[2K")
-                if index < self._line_count - 1:
-                    self.stream.write("\r\n")
-            if self._anchor_set:
-                self.stream.write("\x1b8")
+            if self._start_row is not None:
+                self._clear_region(self._start_row, self._line_count)
+                self._move_to(self._start_row)
             self.stream.flush()
             self._line_count = 0
+            self._start_row = None
         if self._cursor_hidden:
             self.stream.write("\x1b[?25h")
             self.stream.flush()
             self._cursor_hidden = False
-        self._anchor_set = False
 
 
 class _ReasoningParser:

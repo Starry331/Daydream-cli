@@ -7,6 +7,7 @@ from unittest import mock
 from rich.console import Console
 
 from daydream.chat import (
+    _InlineTerminalRenderer,
     _ReasoningParser,
     _build_request_messages,
     _collect_multiline_message,
@@ -102,6 +103,26 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(request[1]["role"], "system")
         self.assertIn("Reasoning effort: long", request[1]["content"])
         self.assertEqual(request[2]["content"], "hello")
+
+    def test_inline_terminal_renderer_tracks_bottom_rows_across_resize(self) -> None:
+        stream = io.StringIO()
+
+        class Renderer(_InlineTerminalRenderer):
+            def __init__(self, stream):
+                super().__init__(stream)
+                self.rows = 24
+
+            def _terminal_rows(self) -> int:
+                return self.rows
+
+        renderer = Renderer(stream)
+        renderer.render(["top", "mid", "bot"])
+        renderer.rows = 30
+        renderer.render(["top", "mid", "bot"])
+
+        output = stream.getvalue()
+        self.assertIn("\x1b[22;1H", output)
+        self.assertIn("\x1b[28;1H", output)
 
     def test_run_oneshot_resolves_before_preparing_load(self) -> None:
         output = io.StringIO()
