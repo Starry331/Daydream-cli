@@ -121,6 +121,7 @@ def _stream_response(model, tokenizer, messages, *, model_label, temp, top_p, ma
     full_text = ""
     last_response = None
     wrote_output = False
+    stream_to_stdout = not err_console.is_terminal
     reasoning_started_at: float | None = None
     parser = _ReasoningParser()
     with daydreaming_status(err_console, model_label) as status:
@@ -138,7 +139,6 @@ def _stream_response(model, tokenizer, messages, *, model_label, temp, top_p, ma
                 if parser.saw_reasoning and reasoning_started_at is not None:
                     elapsed = time.monotonic() - reasoning_started_at
                     err_console.print(f"[dim]thought for {elapsed:.1f}s[/dim]")
-                err_console.print()
                 status.update(waiting=False)
             elif reasoning_closed and parser.saw_reasoning and reasoning_started_at is not None and not wrote_output:
                 elapsed = time.monotonic() - reasoning_started_at
@@ -147,7 +147,10 @@ def _stream_response(model, tokenizer, messages, *, model_label, temp, top_p, ma
             last_response = response
 
             if text_chunk:
-                print(text_chunk, end="", flush=True)
+                if stream_to_stdout:
+                    print(text_chunk, end="", flush=True)
+                else:
+                    status.append_output(text_chunk)
                 wrote_output = True
                 if response.generation_tps:
                     status.update(phase=None, tokens_per_second=response.generation_tps, waiting=False)
@@ -157,7 +160,7 @@ def _stream_response(model, tokenizer, messages, *, model_label, temp, top_p, ma
             if response.finish_reason:
                 break
 
-    if wrote_output:
+    if wrote_output and stream_to_stdout:
         print()
 
     if verbose and last_response:

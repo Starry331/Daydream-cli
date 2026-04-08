@@ -210,6 +210,7 @@ class ConversationStatus:
         self._phase: str | None = "thinking"
         self._tokens_per_second: float | None = None
         self._waiting = True
+        self._output = ""
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._live: Live | None = None
@@ -228,6 +229,8 @@ class ConversationStatus:
                     render_daydreaming_text(self._frame, rainbow=self._rainbow),
                     footer,
                 )
+            if self._output:
+                return Group(Text(self._output), footer)
             return Group(footer)
 
     def start(self) -> None:
@@ -238,7 +241,7 @@ class ConversationStatus:
             self._render(),
             console=self.console,
             refresh_per_second=12,
-            transient=True,
+            transient=False,
         )
         self._live.start()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -264,11 +267,20 @@ class ConversationStatus:
         if self._live is not None:
             self._live.update(self._render())
 
+    def append_output(self, text: str) -> None:
+        if not text:
+            return
+        with self._lock:
+            self._output += text
+        if self._live is not None:
+            self._live.update(self._render())
+
     def stop(self) -> None:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=0.2)
         if self._live is not None:
+            self._live.update(self._render())
             self._live.stop()
         self._title_animator.stop()
 
