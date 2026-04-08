@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 from rich.console import Console, Group
 from rich.live import Live
+from rich.rule import Rule
 from rich.text import Text
 
 # ── Constants ──────────────────────────────────────────────────────────
@@ -30,7 +31,7 @@ _C_WHITE = "#e0f2ff"
 _C_REASON = "#6b7b8d"
 
 # Title Z frames (simplified for title bar)
-_TITLE_Z_FRAMES = ("Z", "Z ZZ", "Z ZZ ZZZ", "  ZZ ZZZ", "     ZZZ", "        ")
+_TITLE_Z_FRAMES = ("z", "z·", "z·zz", "z·zz·", "z·zz·zzz", "·zz·zzz", "zz·zzz", "·zzz", "zzz", "zz", "z", " ")
 
 # Sentinel for "not provided" in update()
 _UNSET = object()
@@ -116,20 +117,32 @@ def _z_brightness(frame: int, group: int) -> float:
     """Brightness [0, 1] for Z group (0=Z, 1=ZZ, 2=ZZZ)."""
     t = frame % _Z_CYCLE
 
-    in_start = group * 4
-    in_end = in_start + 6
-    hold_end = 22
-    out_end = 30
+    fade_in_span = 6
+    stagger = 4
+    last_fade_in_end = stagger * (len(_Z_GROUPS) - 1) + fade_in_span
+    hold_end = last_fade_in_end + 1
+    breathe_end = hold_end + 8
+    fade_out_end = breathe_end + 7
+
+    in_start = group * stagger
+    in_end = in_start + fade_in_span
 
     if t < in_start:
         return 0.0
     if t < in_end:
-        return _smoothstep((t - in_start) / (in_end - in_start))
+        return 0.88 * _smoothstep((t - in_start) / max(1, in_end - in_start))
     if t < hold_end:
-        p = (t - in_end) / max(1, hold_end - in_end)
-        return 0.8 + 0.2 * math.sin(p * math.pi)
-    if t < out_end:
-        return 0.8 * (1.0 - _smoothstep((t - hold_end) / (out_end - hold_end)))
+        return 0.88
+    if t < breathe_end:
+        breathe_t = (t - hold_end) / max(1, breathe_end - hold_end)
+        if breathe_t < 0.5:
+            breath = _smoothstep(breathe_t / 0.5)
+        else:
+            breath = 1.0 - _smoothstep((breathe_t - 0.5) / 0.5)
+        return 0.88 + 0.10 * breath
+    if t < fade_out_end:
+        fade_t = (t - breathe_end) / max(1, fade_out_end - breathe_end)
+        return 0.88 * (1.0 - _smoothstep(fade_t))
     return 0.0
 
 
@@ -149,19 +162,42 @@ def _brightness_to_color(b: float) -> str:
 # ── Render functions ───────────────────────────────────────────────────
 
 def render_daydreaming_text(frame: int = 0) -> Text:
-    """Render  Z  ZZ  ZZZ  Daydreaming ···  with smooth fade."""
+    """Render dreamy Z bubbles, a sweeping Daydreaming glow, and pulsing dots."""
     text = Text()
     text.append("  ")
 
+    def dreamy_color(brightness: float) -> str:
+        level = max(0.0, min(1.0, brightness))
+        color = _brightness_to_color(level)
+        if level < 0.18:
+            color = _mix_color("#08111a", color, _smoothstep(level / 0.18))
+        if level > 0.82:
+            color = _mix_color(color, _C_WHITE, _smoothstep((level - 0.82) / 0.18))
+        return color
+
+    def dreamy_style(brightness: float) -> str:
+        color = dreamy_color(brightness)
+        r, g, b = _hex_to_rgb(color)
+        luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+        if brightness > 0.84 or luminance > 0.78:
+            return f"bold {color}"
+        return color
+
     # ── Z groups ──
     for i, zchars in enumerate(_Z_GROUPS):
-        b = _z_brightness(frame, i)
-        if b > 0.02:
-            color = _brightness_to_color(b)
-            style = f"bold {color}" if b > 0.5 else color
-            text.append(zchars, style=style)
-        else:
-            text.append(" " * len(zchars))
+        group_brightness = _z_brightness(frame, i)
+        shimmer_strength = _smoothstep(min(1.0, group_brightness / 0.28))
+
+        for j, char in enumerate(zchars):
+            shimmer_wave = 0.5 + 0.5 * math.sin(frame / 4.8 + i * 0.9 + j * 1.35)
+            shimmer = (_smoothstep(shimmer_wave) - 0.5) * 0.14
+            offset = (j - (len(zchars) - 1) / 2.0) * 0.05
+            char_brightness = group_brightness + shimmer_strength * (shimmer + offset)
+            char_brightness = max(0.0, min(1.0, char_brightness))
+            if char_brightness > 0.003:
+                text.append(char, style=dreamy_style(char_brightness))
+            else:
+                text.append(" ")
         if i < len(_Z_GROUPS) - 1:
             text.append("  ")
 
@@ -169,23 +205,34 @@ def render_daydreaming_text(frame: int = 0) -> Text:
 
     # ── "Daydreaming" with left-to-right sweep glow ──
     word = "Daydreaming"
-    sweep_width = 4.0
-    cycle_len = len(word) + 10
-    center = (frame * 0.5) % cycle_len - 4
+    sweep_cycle = 22.0
+    trail_width = 4.4
+    core_width = 1.6
+    travel = len(word) + trail_width * 2.0
+    center = ((frame % sweep_cycle) / sweep_cycle) * travel - trail_width
 
     for idx, char in enumerate(word):
         dist = abs(idx - center)
-        glow = _smoothstep(max(0.0, 1.0 - dist / sweep_width))
-        color = _mix_color(_C_DIM, _C_WHITE, glow * 0.8)
-        style = f"bold {color}" if glow > 0.3 else color
+        trail = _smoothstep(max(0.0, 1.0 - dist / trail_width))
+        core = _smoothstep(max(0.0, 1.0 - dist / core_width))
+        ambient_wave = 0.5 + 0.5 * math.sin((frame / 18.0 + idx * 0.08) * math.tau)
+        ambient = 0.03 * _smoothstep(ambient_wave)
+        brightness = min(1.0, 0.18 + ambient + 0.28 * trail + 0.46 * core)
+        color = dreamy_color(brightness)
+        if core > 0.0:
+            color = _mix_color(color, _C_WHITE, 0.35 * core)
+        r, g, b = _hex_to_rgb(color)
+        luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+        style = f"bold {color}" if core > 0.75 or luminance > 0.8 else color
         text.append(char, style=style)
 
     # ── Pulsing dots ··· ──
     text.append(" ")
     for i in range(3):
-        phase = math.sin((frame * 0.2 + i * 1.2) * math.pi) * 0.5 + 0.5
-        dot_color = _mix_color(_C_DIM, _C_BRIGHT, phase * 0.5)
-        text.append("·", style=dot_color)
+        wave = 0.5 + 0.5 * math.sin((frame / 18.0 + i * 0.18) * math.tau)
+        pulse = _smoothstep(wave)
+        dot_brightness = 0.22 + 0.30 * pulse
+        text.append("·", style=dreamy_style(dot_brightness))
 
     return text
 
@@ -193,24 +240,66 @@ def render_daydreaming_text(frame: int = 0) -> Text:
 def render_reasoning_line(elapsed: float, *, active: bool = True) -> Text:
     """Collapsed reasoning indicator.
 
-    active=True  →  ▸ reasoning ··· (2.3s)
-    active=False →  ▸ thought for 3.2s
+    active=True  →  ▸ daydreaming ··· (2.3s)
+    active=False →  ▸ Daydreamed for 3.2s
     """
     text = Text()
     text.append("  ")
 
     if active:
         text.append("▸ ", style=f"bold {_C_REASON}")
-        text.append("reasoning ", style=_C_REASON)
+        text.append("daydreaming ", style=_C_REASON)
         n_dots = int(elapsed * 2) % 4
         text.append("·" * n_dots, style=_C_REASON)
         text.append(" " * (3 - n_dots))
         text.append(f" ({elapsed:.1f}s)", style=f"dim {_C_REASON}")
     else:
         text.append("▸ ", style=f"dim {_C_REASON}")
-        text.append(f"thought for {elapsed:.1f}s", style=f"dim {_C_REASON}")
+        text.append(f"Daydreamed for {elapsed:.1f}s", style=f"dim {_C_REASON}")
 
     return text
+
+
+def render_frame_rule(title=None) -> Rule:
+    return Rule(title, style="grey27")
+
+
+def render_reasoning_box(reasoning_text: str, frame: int) -> Group:
+    """Render a framed reasoning box with animated header and clipped body."""
+    normalized = reasoning_text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = normalized.split("\n")
+    if normalized.endswith("\n"):
+        lines.append("")
+    visible_lines = lines[-5:] if lines else [""]
+    if not any(line.strip() for line in visible_lines):
+        visible_lines = [""] * 4 + [" "]
+    while len(visible_lines) < 5:
+        visible_lines.insert(0, "")
+
+    body = Text("\n".join(visible_lines), style=f"dim {_C_REASON}")
+    return Group(
+        render_frame_rule(render_daydreaming_text(frame)),
+        body,
+        render_frame_rule(),
+    )
+
+
+def render_input_box_header() -> Rule:
+    return render_frame_rule()
+
+
+def render_input_box_footer() -> Rule:
+    return render_frame_rule()
+
+
+def render_expanded_reasoning(reasoning_text: str) -> Group:
+    normalized = reasoning_text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    body = Text(normalized or "(no reasoning captured)", style=f"dim {_C_REASON}")
+    return Group(
+        render_frame_rule(Text(" Reasoning ", style=f"bold {_C_REASON}")),
+        body,
+        render_frame_rule(),
+    )
 
 
 def render_status_footer(
@@ -287,12 +376,15 @@ class TerminalTitleAnimator:
 #
 # Layout during reasoning:
 #     Z  ZZ  ZZZ  Daydreaming ···
-#     ▸ reasoning ··· (2.3s)
+#     ┌──────────────────────────────┐
+#     │ streamed reasoning...        │
+#     │ newest line at bottom        │
+#     └──────────────────────────────┘
 #
-#     model · thinking · 45.2 tok/s
+#     model · 45.2 tok/s
 #
 # Layout during output (after reasoning):
-#     ▸ thought for 3.2s
+#     ▸ Daydreamed for 3.2s
 #
 #     Streaming response text...
 #
@@ -313,6 +405,7 @@ class ConversationStatus:
         self._tokens_per_second: float | None = None
         self._waiting = True
         self._output = ""
+        self._reasoning_text = ""
 
         # Reasoning
         self._reasoning_active = False
@@ -328,24 +421,20 @@ class ConversationStatus:
         self._title_animator = TerminalTitleAnimator("Daydreaming", frames=_TITLE_Z_FRAMES)
 
     def _reasoning_time(self) -> float:
-        if self._reasoning_elapsed is not None:
-            return self._reasoning_elapsed
+        elapsed = self._reasoning_elapsed or 0.0
         if self._reasoning_start is not None:
-            return time.monotonic() - self._reasoning_start
-        return 0.0
+            return elapsed + (time.monotonic() - self._reasoning_start)
+        return elapsed
 
     def _render(self) -> Group:
         with self._lock:
             parts: list = []
 
-            if self._waiting:
-                # ── Header: Z animation ──
-                parts.append(render_daydreaming_text(self._frame))
-
-                # ── Collapsed reasoning ──
-                if self._reasoning_active:
-                    parts.append(render_reasoning_line(self._reasoning_time(), active=True))
-
+            if self._reasoning_active:
+                parts.append(render_reasoning_box(self._reasoning_text, self._frame))
+                parts.append(Text())
+            elif self._waiting and not self._had_reasoning:
+                parts.append(render_reasoning_box("", self._frame))
                 parts.append(Text())
             else:
                 # ── Reasoning summary (if model used thinking) ──
@@ -362,7 +451,6 @@ class ConversationStatus:
             parts.append(render_status_footer(
                 self.model_label,
                 tokens_per_second=self._tokens_per_second,
-                phase=self._phase,
             ))
 
             return Group(*parts)
@@ -410,15 +498,31 @@ class ConversationStatus:
     def start_reasoning(self) -> None:
         with self._lock:
             self._reasoning_active = True
-            self._reasoning_start = time.monotonic()
+            if self._reasoning_start is None:
+                self._reasoning_start = time.monotonic()
             self._had_reasoning = True
             self._phase = "thinking"
+        if self._live is not None:
+            self._live.update(self._render())
 
     def end_reasoning(self) -> None:
         with self._lock:
             self._reasoning_active = False
             if self._reasoning_start is not None:
-                self._reasoning_elapsed = time.monotonic() - self._reasoning_start
+                elapsed = time.monotonic() - self._reasoning_start
+                self._reasoning_elapsed = (self._reasoning_elapsed or 0.0) + elapsed
+                self._reasoning_start = None
+        self._title_animator.stop()
+        if self._live is not None:
+            self._live.update(self._render())
+
+    def append_reasoning(self, text: str) -> None:
+        if not text:
+            return
+        with self._lock:
+            self._reasoning_text += text
+        if self._live is not None:
+            self._live.update(self._render())
 
     def append_output(self, text: str) -> None:
         if not text:

@@ -6,13 +6,16 @@ import sys
 from typing import Callable
 
 from rich.console import Console
-from rich.rule import Rule
-from rich.text import Text
 
 from daydream import engine
 from daydream.models import ensure_runtime_model
 from daydream.registry import reverse_lookup
-from daydream.utils import daydreaming_status
+from daydream.utils import (
+    daydreaming_status,
+    render_expanded_reasoning,
+    render_input_box_footer,
+    render_input_box_header,
+)
 
 console = Console()
 err_console = Console(stderr=True)
@@ -69,26 +72,99 @@ def _collect_multiline_message(
     return first_line
 
 
+def _read_boxed_message(
+    *,
+    input_func: Callable[[str], str] = input,
+) -> str:
+    err_console.print(render_input_box_header())
+    try:
+        first_line = input_func("")
+        return _collect_multiline_message(first_line, lambda _: input_func(""))
+    finally:
+        err_console.print(render_input_box_footer())
+
+
 class _ReasoningParser:
     def __init__(self) -> None:
-        self.raw_text = ""
-        self.emitted_visible_length = 0
+        self.reasoning_text = ""
         self.in_reasoning = False
         self.saw_reasoning = False
+        self._emitted_any_visible = False
+        self._buffer = ""
 
-    def feed(self, chunk: str) -> tuple[str, bool]:
-        self.raw_text += chunk
-        visible_text, in_reasoning = _extract_visible_text(self.raw_text)
-        delta = visible_text[self.emitted_visible_length:]
-        just_closed = self.in_reasoning and not in_reasoning
-        self.emitted_visible_length = len(visible_text)
-        self.in_reasoning = in_reasoning
-        self.saw_reasoning = self.saw_reasoning or OPEN_THINK_TAG in self.raw_text
-        return delta, just_closed
+    def feed(self, chunk: str) -> tuple[str, str, bool]:
+        self._buffer += chunk
+        visible_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        just_closed = False
+
+        while self._buffer:
+            if self.in_reasoning:
+                if self._buffer.startswith(CLOSE_THINK_TAG):
+                    self._buffer = self._buffer[len(CLOSE_THINK_TAG):]
+                    self.in_reasoning = False
+                    just_closed = True
+                    continue
+                if _starts_with_partial_tag(self._buffer, CLOSE_THINK_TAG):
+                    break
+                char = self._buffer[0]
+                reasoning_parts.append(char)
+                self.reasoning_text += char
+                self._buffer = self._buffer[1:]
+                continue
+
+            if self._buffer.startswith(OPEN_THINK_TAG):
+                self.saw_reasoning = True
+                self.in_reasoning = True
+                self._buffer = self._buffer[len(OPEN_THINK_TAG):]
+                continue
+
+            close_index = self._buffer.find(CLOSE_THINK_TAG)
+            open_index = self._buffer.find(OPEN_THINK_TAG)
+            if (
+                not self.saw_reasoning
+                and not self._emitted_any_visible
+                and close_index != -1
+                and (open_index == -1 or close_index < open_index)
+            ):
+                prefix = self._buffer[:close_index]
+                if prefix:
+                    reasoning_parts.append(prefix)
+                    self.reasoning_text += prefix
+                self.saw_reasoning = True
+                self._buffer = self._buffer[close_index + len(CLOSE_THINK_TAG):]
+                just_closed = True
+                continue
+
+            if _starts_with_partial_tag(self._buffer, OPEN_THINK_TAG):
+                break
+            if (
+                not self.saw_reasoning
+                and not self._emitted_any_visible
+                and _starts_with_partial_tag(self._buffer, CLOSE_THINK_TAG)
+            ):
+                break
+            if (
+                not self.saw_reasoning
+                and not self._emitted_any_visible
+                and _looks_like_reasoning_prefix(self._buffer)
+            ):
+                self.saw_reasoning = True
+                self.in_reasoning = True
+                continue
+
+            char = self._buffer[0]
+            visible_parts.append(char)
+            self._buffer = self._buffer[1:]
+            if not char.isspace():
+                self._emitted_any_visible = True
+
+        return "".join(visible_parts), "".join(reasoning_parts), just_closed
 
 
-def _extract_visible_text(text: str) -> tuple[str, bool]:
+def _extract_visible_text(text: str) -> tuple[str, str, bool]:
     visible: list[str] = []
+    reasoning: list[str] = []
     in_reasoning = False
     i = 0
 
@@ -108,15 +184,45 @@ def _extract_visible_text(text: str) -> tuple[str, bool]:
         if len(remaining) < len(CLOSE_THINK_TAG) and CLOSE_THINK_TAG.startswith(remaining):
             break
 
-        if not in_reasoning:
+        if in_reasoning:
+            reasoning.append(text[i])
+        else:
             visible.append(text[i])
         i += 1
 
-    return "".join(visible), in_reasoning
+    return "".join(visible), "".join(reasoning), in_reasoning
+
+
+def _looks_like_reasoning_prefix(text: str) -> bool:
+    sample = text.lstrip()
+    if not sample:
+        return False
+    markers = (
+        "thinking process",
+        "reasoning",
+        "let's think",
+        "step 1",
+        "analysis:",
+        "思考过程",
+        "推理过程",
+        "让我想",
+    )
+    lowered = sample.lower()
+    if any(marker in lowered for marker in markers):
+        return True
+    if sample.startswith("1.") and "\n" in sample:
+        return True
+    return False
+
+
+def _starts_with_partial_tag(text: str, tag: str) -> bool:
+    if not text or len(text) >= len(tag):
+        return False
+    return tag.startswith(text)
 
 
 def _stream_response(model, tokenizer, messages, *, model_label, temp, top_p, max_tokens, verbose):
-    """Stream a response, collecting the full text. Returns (full_text, last_response)."""
+    """Stream a response, collecting the full text. Returns (full_text, last_response, reasoning_text)."""
     full_text = ""
     last_response = None
     wrote_output = False
@@ -130,11 +236,13 @@ def _stream_response(model, tokenizer, messages, *, model_label, temp, top_p, ma
             max_tokens=max_tokens, temp=temp, top_p=top_p,
         ):
             raw_chunk = response.text or ""
-            text_chunk, reasoning_closed = parser.feed(raw_chunk)
+            text_chunk, reasoning_chunk, reasoning_closed = parser.feed(raw_chunk)
 
             # Reasoning state transitions → drive the status display
             if parser.in_reasoning and not prev_reasoning:
                 status.start_reasoning()
+            if reasoning_chunk:
+                status.append_reasoning(reasoning_chunk)
             if reasoning_closed:
                 status.end_reasoning()
             prev_reasoning = parser.in_reasoning
@@ -170,7 +278,7 @@ def _stream_response(model, tokenizer, messages, *, model_label, temp, top_p, ma
     if verbose and last_response:
         _print_stats(last_response)
 
-    return full_text, last_response
+    return full_text, last_response, parser.reasoning_text
 
 
 def run_oneshot(
@@ -226,21 +334,20 @@ def run_chat(
     short = reverse_lookup(repo_id) or model_name
 
     err_console.print(f"[bold cyan]{short}[/]")
-    err_console.print("[dim]>>> Send a message. Use /help for commands.[/dim]")
+    err_console.print("[dim]Use /help for commands.[/dim]")
     err_console.print()
 
     messages: list[dict] = []
+    last_reasoning = ""
     if system:
         messages.append({"role": "system", "content": system})
 
     while True:
         try:
-            user_input = input(">>> ")
+            user_input = _read_boxed_message()
         except (EOFError, KeyboardInterrupt):
             err_console.print()
             break
-
-        user_input = _collect_multiline_message(user_input)
         stripped = user_input.strip()
         if not stripped:
             continue
@@ -257,17 +364,21 @@ def run_chat(
             err_console.print("[dim]\\        — continue input on the next line[/dim]")
             err_console.print("[dim]/reset  — clear conversation history[/dim]")
             err_console.print("[dim]/clear  — alias for /reset[/dim]")
+            err_console.print("[dim]/t      — show last captured reasoning[/dim]")
             err_console.print("[dim]/quit   — exit chat[/dim]")
             err_console.print("[dim]/help   — show this help[/dim]")
             continue
+        if stripped in ("/t", "/thoughts"):
+            err_console.print(render_expanded_reasoning(last_reasoning))
+            continue
 
         messages.append({"role": "user", "content": user_input})
-        err_console.print(Rule(Text(" Daydream ", style="bold cyan"), style="grey35"))
 
-        full_text, _ = _stream_response(
+        full_text, _, reasoning_text = _stream_response(
             model, tokenizer, messages,
             model_label=short,
             temp=temp, top_p=top_p, max_tokens=max_tokens, verbose=verbose,
         )
+        last_reasoning = reasoning_text
 
         messages.append({"role": "assistant", "content": full_text})

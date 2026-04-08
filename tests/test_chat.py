@@ -21,19 +21,29 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(result, "first line\nsecond line\nthird line")
 
     def test_extract_visible_text_hides_think_blocks(self) -> None:
-        visible, in_reasoning = _extract_visible_text("<think>hidden</think>Hello")
+        visible, reasoning, in_reasoning = _extract_visible_text("<think>hidden</think>Hello")
         self.assertEqual(visible, "Hello")
+        self.assertEqual(reasoning, "hidden")
         self.assertFalse(in_reasoning)
 
     def test_reasoning_parser_returns_only_visible_delta(self) -> None:
         parser = _ReasoningParser()
-        delta, closed = parser.feed("<think>hidden")
+        delta, reasoning_delta, closed = parser.feed("<think>hidden")
         self.assertEqual(delta, "")
+        self.assertEqual(reasoning_delta, "hidden")
         self.assertFalse(closed)
 
-        delta, closed = parser.feed("</think>Hello")
+        delta, reasoning_delta, closed = parser.feed("</think>Hello")
         self.assertEqual(delta, "Hello")
+        self.assertEqual(reasoning_delta, "")
         self.assertTrue(closed)
+
+    def test_reasoning_parser_detects_plain_thinking_prefix(self) -> None:
+        parser = _ReasoningParser()
+        delta, reasoning_delta, closed = parser.feed("Here's a thinking process:\n1. Analyze.\n")
+        self.assertEqual(delta, "")
+        self.assertIn("thinking process", reasoning_delta.lower())
+        self.assertFalse(closed)
 
     def test_run_oneshot_resolves_before_preparing_load(self) -> None:
         output = io.StringIO()
