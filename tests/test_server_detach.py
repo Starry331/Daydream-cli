@@ -109,7 +109,12 @@ class ServerDetachTests(unittest.TestCase):
 
                 spawn.assert_not_called()
                 run_fixture.assert_called_once_with("127.0.0.1", 11434, "mlx-community/Foo-4bit")
-                self.assertIn("server listening on", output.getvalue())
+                rendered = output.getvalue()
+                self.assertIn("server listening on", rendered)
+                self.assertIn("Client setup", rendered)
+                self.assertIn("Base URL: http://127.0.0.1:11434/v1", rendered)
+                self.assertIn("API key:  daydream-local", rendered)
+                self.assertIn("Model:    mlx-community/Foo-4bit", rendered)
 
 
 if __name__ == "__main__":

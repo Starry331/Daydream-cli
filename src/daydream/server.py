@@ -27,6 +27,24 @@ from daydream.registry import reverse_lookup
 console = Console()
 
 
+def _api_base_url(host: str, port: int) -> str:
+    return f"http://{host}:{port}/v1"
+
+
+def _print_client_setup(host: str, port: int, repo_id: str | None) -> None:
+    console.print("[bold]Client setup[/]")
+    console.print(f"  Base URL: {_api_base_url(host, port)}")
+    console.print("  API key:  daydream-local  [dim](any non-empty value works)[/dim]")
+    if repo_id:
+        console.print(f"  Model:    {repo_id}")
+        short = reverse_lookup(repo_id)
+        if short and short != repo_id:
+            console.print(f"  Alias:    {short}  [dim](Daydream CLI only)[/dim]")
+    else:
+        console.print("  Model:    choose one from /v1/models after the server is ready")
+    console.print()
+
+
 def _build_server_args(*, model=None, host="127.0.0.1", port=11434) -> argparse.Namespace:
     """Build the argparse.Namespace that mlx_lm.server.ModelProvider expects."""
     return argparse.Namespace(
@@ -263,8 +281,9 @@ def start_server(*, model=None, host="127.0.0.1", port=11434, detach: bool = Fal
     console.print(f"[bold cyan]Daydream[/] server listening on [bold]http://{host}:{port}[/]")
     if short:
         console.print(f"Model: [bold]{short}[/] ({repo_id})")
-    console.print(f"API:   [dim]http://{host}:{port}/v1/chat/completions[/]")
+    console.print(f"API:   [dim]{_api_base_url(host, port)}/chat/completions[/]")
     console.print()
+    _print_client_setup(host, port, repo_id)
 
     try:
         if repo_id and is_fixture_model(repo_id):
@@ -306,6 +325,7 @@ def show_status() -> None:
 
     console.print("[green]●[/] Server running")
     console.print(f"  Endpoint: http://{host}:{port}")
+    console.print(f"  OpenAI:   {_api_base_url(host, port)}")
     pid = state.get("pid")
     if isinstance(pid, int):
         console.print(f"  PID: {pid}")
@@ -324,6 +344,7 @@ def show_status() -> None:
         model_id = model.get("id", "unknown")
         short = reverse_lookup(model_id) or model_id
         console.print(f"  Model: [bold]{short}[/] ({model_id})")
+    console.print("  API key: any non-empty value")
 
 
 def stop_server(*, force: bool = False) -> None:

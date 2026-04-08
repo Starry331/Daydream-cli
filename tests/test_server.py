@@ -61,6 +61,8 @@ class ServerTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertIn("Server running", rendered)
         self.assertIn("smollm2:135m", rendered)
+        self.assertIn("OpenAI:   http://127.0.0.1:11434/v1", rendered)
+        self.assertIn("API key: any non-empty value", rendered)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,8 @@ from daydream.chat import (
     _current_command_selection,
     _effort_system_prompt,
     _extract_visible_text,
+    _is_down_key,
+    _is_up_key,
     _matching_slash_commands,
     _model_supports_effort,
     _normalize_effort,
@@ -105,6 +107,22 @@ class ChatTests(unittest.TestCase):
             side_effect=[([0], [], []), ([0], [], []), ([], [], [])],
         ):
             self.assertEqual(_read_key(), "\x1bOA")
+
+    def test_read_key_waits_for_delayed_csi_sequence(self) -> None:
+        stdin = mock.Mock()
+        stdin.read.side_effect = ["\x1b", "[", "B"]
+        stdin.fileno.return_value = 0
+        with mock.patch("daydream.chat.sys.stdin", stdin), mock.patch(
+            "daydream.chat.select.select",
+            side_effect=[([0], [], []), ([0], [], []), ([], [], [])],
+        ):
+            self.assertEqual(_read_key(), "\x1b[B")
+
+    def test_arrow_key_helpers_accept_modified_sequences(self) -> None:
+        self.assertTrue(_is_up_key("\x1bOA"))
+        self.assertTrue(_is_up_key("\x1b[1;2A"))
+        self.assertTrue(_is_down_key("\x1b[B"))
+        self.assertTrue(_is_down_key("\x1b[1;5B"))
 
     def test_effort_helpers_only_emit_prompts_for_supported_models(self) -> None:
         self.assertEqual(_normalize_effort("LONG"), "long")

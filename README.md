@@ -270,6 +270,111 @@ This is intended for:
 - coding tools
 - OpenAI-compatible clients
 
+### Client setup at a glance
+
+When Daydream is running, the safest copy-paste values are:
+
+- Base URL: `http://127.0.0.1:11434/v1`
+- API key: any non-empty string, for example `daydream-local`
+- Model: the exact repo ID returned by `daydream ps` or `GET /v1/models`
+
+If a client asks for an "OpenAI endpoint", "Base URL", "API host", or "Custom API URL", use the same `http://127.0.0.1:11434/v1` value.
+
+### Cherry Studio
+
+Daydream works best in Cherry Studio through its OpenAI-compatible provider flow.
+
+1. Start Daydream first:
+
+```bash
+daydream serve --model hf.co/mlx-community/SmolLM2-135M-Instruct-4bit
+```
+
+2. In Cherry Studio, add a custom OpenAI-compatible provider or edit an existing OpenAI-style provider.
+3. Fill in:
+
+- Base URL: `http://127.0.0.1:11434/v1`
+- API key: `daydream-local`
+- Model: `mlx-community/SmolLM2-135M-Instruct-4bit`
+
+4. Save and run a test chat.
+
+Tips:
+
+- If Cherry Studio requires a model list refresh, make sure Daydream is already running, then refresh models from `/v1/models`.
+- Use the repo ID for the model field, not the Daydream short alias.
+- If Cherry Studio asks for "API Host" instead of "Base URL", still use `http://127.0.0.1:11434/v1`.
+
+### OpenClaw
+
+Daydream works with OpenClaw as a self-hosted OpenAI-compatible backend.
+
+1. Start Daydream:
+
+```bash
+daydream serve --model hf.co/mlx-community/SmolLM2-135M-Instruct-4bit
+```
+
+2. Point OpenClaw at Daydream's local `/v1` endpoint.
+3. Use an OpenAI-compatible provider entry and set the API mode to the OpenAI completions/chat-completions path.
+
+Example shape:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "daydream/mlx-community/SmolLM2-135M-Instruct-4bit"
+      }
+    }
+  },
+  "models": {
+    "providers": {
+      "daydream": {
+        "baseUrl": "http://127.0.0.1:11434/v1",
+        "apiKey": "daydream-local",
+        "api": "openai-completions"
+      }
+    }
+  }
+}
+```
+
+Then use:
+
+- provider: `daydream`
+- model id: `mlx-community/SmolLM2-135M-Instruct-4bit`
+
+Tips:
+
+- If your OpenClaw setup asks for a model string in the form `provider/model`, use `daydream/mlx-community/SmolLM2-135M-Instruct-4bit`.
+- Keep the API mode on the OpenAI-compatible completions/chat-completions route.
+- Use `daydream ps` to confirm the exact model ID Daydream is serving.
+
+### Claude Code
+
+Daydream is not a drop-in replacement for Claude Code's native Anthropic backend.
+
+The practical boundary is:
+
+- Cherry Studio / OpenClaw / other OpenAI-compatible tools: direct fit
+- Claude Code native Anthropic flow: not a direct fit
+
+If your Claude Code workflow includes an OpenAI-compatible relay or custom gateway layer, point that relay at:
+
+- Base URL: `http://127.0.0.1:11434/v1`
+- API key: `daydream-local`
+- Model: the repo ID from `daydream ps`
+
+If you are using Claude Code in its standard official setup without a relay layer, use Daydream alongside Claude Code rather than inside Claude Code itself.
+
+Good side-by-side workflow:
+
+- use Daydream for local MLX chat, local coding prompts, and local agent backends
+- use Claude Code for its normal cloud-native workflow
+- switch between them depending on whether you want local privacy / local latency or Claude's native backend
+
 ## Listing And Inspecting Models
 
 List downloaded models:
@@ -669,6 +774,125 @@ curl http://127.0.0.1:11434/v1/chat/completions \
 - 本地 agent
 - coding tools
 - OpenAI 兼容客户端
+
+### 一眼看懂的客户端配置
+
+只要 Daydream 已经在运行，最稳妥的接入参数就是：
+
+- Base URL：`http://127.0.0.1:11434/v1`
+- API Key：任意非空字符串，例如 `daydream-local`
+- Model：`daydream ps` 或 `GET /v1/models` 返回的完整 repo ID
+
+如果客户端界面里写的是：
+
+- OpenAI Endpoint
+- Base URL
+- API Host
+- Custom API URL
+
+都填同一个值：
+
+```text
+http://127.0.0.1:11434/v1
+```
+
+### Cherry Studio 接入
+
+Daydream 最适合通过 Cherry Studio 的 OpenAI 兼容提供方方式接入。
+
+1. 先启动 Daydream：
+
+```bash
+daydream serve --model hf.co/mlx-community/SmolLM2-135M-Instruct-4bit
+```
+
+2. 在 Cherry Studio 中新增一个 OpenAI 兼容提供方，或者编辑一个 OpenAI 风格的提供方。
+3. 填入：
+
+- Base URL：`http://127.0.0.1:11434/v1`
+- API Key：`daydream-local`
+- Model：`mlx-community/SmolLM2-135M-Instruct-4bit`
+
+4. 保存后做一次测试对话。
+
+注意：
+
+- 如果 Cherry Studio 需要刷新模型列表，请先确认 Daydream 已在运行，然后再从 `/v1/models` 刷新。
+- Model 字段请优先使用 repo ID，不要用 Daydream 的短别名。
+- 如果界面里写的是 `API Host` 而不是 `Base URL`，也仍然填 `http://127.0.0.1:11434/v1`。
+
+### OpenClaw 接入
+
+Daydream 可以作为 OpenClaw 的自托管 OpenAI 兼容后端来使用。
+
+1. 先启动 Daydream：
+
+```bash
+daydream serve --model hf.co/mlx-community/SmolLM2-135M-Instruct-4bit
+```
+
+2. 在 OpenClaw 中把 Daydream 配成一个本地 OpenAI 兼容 provider。
+3. API 模式使用 OpenAI completions / chat-completions 路径。
+
+配置结构示意：
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "daydream/mlx-community/SmolLM2-135M-Instruct-4bit"
+      }
+    }
+  },
+  "models": {
+    "providers": {
+      "daydream": {
+        "baseUrl": "http://127.0.0.1:11434/v1",
+        "apiKey": "daydream-local",
+        "api": "openai-completions"
+      }
+    }
+  }
+}
+```
+
+然后使用：
+
+- provider：`daydream`
+- model id：`mlx-community/SmolLM2-135M-Instruct-4bit`
+
+注意：
+
+- 如果 OpenClaw 要求模型名写成 `provider/model` 形式，就写 `daydream/mlx-community/SmolLM2-135M-Instruct-4bit`
+- API 模式保持在 OpenAI 兼容 completions / chat-completions 路径
+- 用 `daydream ps` 确认当前实际提供的模型 ID
+
+### Claude Code 接入说明
+
+Daydream 不是 Claude Code 原生 Anthropic 后端的直接替代品。
+
+可以这样理解：
+
+- Cherry Studio / OpenClaw / 其他 OpenAI 兼容工具：可以直接接
+- Claude Code 原生 Anthropic 工作流：不能直接替换
+
+如果你的 Claude Code 工作流里有 OpenAI 兼容的 relay / gateway / proxy 层，那么把那一层指向：
+
+- Base URL：`http://127.0.0.1:11434/v1`
+- API Key：`daydream-local`
+- Model：`daydream ps` 显示的 repo ID
+
+如果你用的是 Claude Code 官方默认工作流，没有中间 relay 层，那么更实际的用法是：
+
+- Claude Code 继续走原生后端
+- Daydream 负责本地 MLX 聊天、本地 coding prompt、本地 agent 后端
+
+一个很实用的组合方式是：
+
+- 用 Daydream 做本地聊天 / 本地代码辅助 / 本地 agent 接口
+- 用 Claude Code 做它自己的云端 coding 工作流
+- 按照隐私、延迟、成本和效果在两者之间切换
 
 ### 模型查看与管理
 

@@ -228,18 +228,33 @@ def _read_key() -> str:
         return first
 
     fd = sys.stdin.fileno()
-    if not select.select([fd], [], [], 0.02)[0]:
+    sequence = first
+    # Arrow / function key escape sequences can arrive in multiple chunks,
+    # especially in Terminal.app. Give them a wider grace window than a lone Esc.
+    wait_until = 0.20
+
+    if not select.select([fd], [], [], wait_until)[0]:
         return first
-    second = sys.stdin.read(1)
-    if second not in ("[", "O"):
-        return first + second
-    sequence = first + second
-    while select.select([fd], [], [], 0.02)[0]:
-        char = sys.stdin.read(1)
-        sequence += char
-        if char.isalpha() or char == "~":
-            break
+
+    sequence += sys.stdin.read(1)
+    while True:
+        if select.select([fd], [], [], 0.02)[0]:
+            char = sys.stdin.read(1)
+            sequence += char
+            if char.isalpha() or char == "~":
+                break
+            continue
+        break
+
     return sequence
+
+
+def _is_up_key(key: str) -> bool:
+    return key in ("k",) or (key.startswith("\x1b") and key.endswith("A"))
+
+
+def _is_down_key(key: str) -> bool:
+    return key in ("j",) or (key.startswith("\x1b") and key.endswith("B"))
 
 
 def _render_input_state(
@@ -314,7 +329,7 @@ def _read_live_boxed_message() -> str:
                 )
                 key = _read_key()
 
-                if key in ("\x1b[A", "\x1bOA", "k") and matches:
+                if _is_up_key(key) and matches:
                     names = [name for name, _ in matches]
                     index = names.index(selected_command) if selected_command in names else 0
                     selected_command = names[(index - 1) % len(names)]
@@ -327,7 +342,7 @@ def _read_live_boxed_message() -> str:
                     )
                     continue
 
-                if key in ("\x1b[B", "\x1bOB", "j") and matches:
+                if _is_down_key(key) and matches:
                     names = [name for name, _ in matches]
                     index = names.index(selected_command) if selected_command in names else 0
                     selected_command = names[(index + 1) % len(names)]
@@ -471,9 +486,9 @@ def _select_effort(current: str, *, supported: bool) -> str:
                     renderer.finish()
                     err_console.print()
                     return current
-                if key in ("\x1b[A", "\x1bOA", "k"):
+                if _is_up_key(key):
                     index = (index - 1) % len(options)
-                elif key in ("\x1b[B", "\x1bOB", "j"):
+                elif _is_down_key(key):
                     index = (index + 1) % len(options)
                 elif key in ("1", "2", "3", "4"):
                     index = int(key) - 1
