@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import sys
+import time
 from typing import Callable
 
 from rich.console import Console
+from rich.rule import Rule
 from rich.text import Text
 
 from daydream import engine
@@ -17,6 +19,8 @@ console = Console()
 err_console = Console(stderr=True)
 
 MULTILINE_SENTINEL = '"""'
+OPEN_THINK_TAG = "<think>"
+CLOSE_THINK_TAG = "</think>"
 
 
 def _print_stats(response):
@@ -66,22 +70,79 @@ def _collect_multiline_message(
     return first_line
 
 
+class _ReasoningParser:
+    def __init__(self) -> None:
+        self.raw_text = ""
+        self.emitted_visible_length = 0
+        self.in_reasoning = False
+        self.saw_reasoning = False
+
+    def feed(self, chunk: str) -> tuple[str, bool]:
+        self.raw_text += chunk
+        visible_text, in_reasoning = _extract_visible_text(self.raw_text)
+        delta = visible_text[self.emitted_visible_length:]
+        just_closed = self.in_reasoning and not in_reasoning
+        self.emitted_visible_length = len(visible_text)
+        self.in_reasoning = in_reasoning
+        self.saw_reasoning = self.saw_reasoning or OPEN_THINK_TAG in self.raw_text
+        return delta, just_closed
+
+
+def _extract_visible_text(text: str) -> tuple[str, bool]:
+    visible: list[str] = []
+    in_reasoning = False
+    i = 0
+
+    while i < len(text):
+        remaining = text[i:]
+        if not in_reasoning and remaining.startswith(OPEN_THINK_TAG):
+            in_reasoning = True
+            i += len(OPEN_THINK_TAG)
+            continue
+        if in_reasoning and remaining.startswith(CLOSE_THINK_TAG):
+            in_reasoning = False
+            i += len(CLOSE_THINK_TAG)
+            continue
+
+        if len(remaining) < len(OPEN_THINK_TAG) and OPEN_THINK_TAG.startswith(remaining):
+            break
+        if len(remaining) < len(CLOSE_THINK_TAG) and CLOSE_THINK_TAG.startswith(remaining):
+            break
+
+        if not in_reasoning:
+            visible.append(text[i])
+        i += 1
+
+    return "".join(visible), in_reasoning
+
+
 def _stream_response(model, tokenizer, messages, *, model_label, temp, top_p, max_tokens, verbose):
     """Stream a response, collecting the full text. Returns (full_text, last_response)."""
     full_text = ""
     last_response = None
     wrote_output = False
+    reasoning_started_at: float | None = None
+    parser = _ReasoningParser()
     with daydreaming_status(err_console, model_label) as status:
         for response in engine.generate_stream(
             model, tokenizer, messages,
             max_tokens=max_tokens, temp=temp, top_p=top_p,
         ):
-            text_chunk = response.text or ""
+            raw_chunk = response.text or ""
+            if OPEN_THINK_TAG in raw_chunk and reasoning_started_at is None:
+                reasoning_started_at = time.monotonic()
+            text_chunk, reasoning_closed = parser.feed(raw_chunk)
             if response.prompt_tps and not wrote_output:
                 status.update(phase="prefill", tokens_per_second=response.prompt_tps, waiting=True)
             if text_chunk and not wrote_output:
+                if parser.saw_reasoning and reasoning_started_at is not None:
+                    elapsed = time.monotonic() - reasoning_started_at
+                    err_console.print(f"[dim]thought for {elapsed:.1f}s[/dim]")
                 err_console.print()
                 status.update(waiting=False)
+            elif reasoning_closed and parser.saw_reasoning and reasoning_started_at is not None and not wrote_output:
+                elapsed = time.monotonic() - reasoning_started_at
+                err_console.print(f"[dim]thought for {elapsed:.1f}s[/dim]")
             full_text += text_chunk
             last_response = response
 
@@ -194,7 +255,7 @@ def run_chat(
             continue
 
         messages.append({"role": "user", "content": user_input})
-        err_console.print(Text("Daydream", style="bold cyan"))
+        err_console.print(Rule(Text(" Daydream ", style="bold cyan"), style="grey35"))
 
         full_text, _ = _stream_response(
             model, tokenizer, messages,

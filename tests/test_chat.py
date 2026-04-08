@@ -6,7 +6,7 @@ from unittest import mock
 
 from rich.console import Console
 
-from daydream.chat import _collect_multiline_message, run_oneshot
+from daydream.chat import _ReasoningParser, _collect_multiline_message, _extract_visible_text, run_oneshot
 
 
 class ChatTests(unittest.TestCase):
@@ -19,6 +19,21 @@ class ChatTests(unittest.TestCase):
         lines = iter(["second line\\", "third line"])
         result = _collect_multiline_message("first line\\", lambda _: next(lines))
         self.assertEqual(result, "first line\nsecond line\nthird line")
+
+    def test_extract_visible_text_hides_think_blocks(self) -> None:
+        visible, in_reasoning = _extract_visible_text("<think>hidden</think>Hello")
+        self.assertEqual(visible, "Hello")
+        self.assertFalse(in_reasoning)
+
+    def test_reasoning_parser_returns_only_visible_delta(self) -> None:
+        parser = _ReasoningParser()
+        delta, closed = parser.feed("<think>hidden")
+        self.assertEqual(delta, "")
+        self.assertFalse(closed)
+
+        delta, closed = parser.feed("</think>Hello")
+        self.assertEqual(delta, "Hello")
+        self.assertTrue(closed)
 
     def test_run_oneshot_resolves_before_preparing_load(self) -> None:
         output = io.StringIO()
