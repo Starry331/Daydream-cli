@@ -15,7 +15,7 @@ Daydream is intentionally narrow. It focuses on quantized MLX models, local term
 
 ## Status
 
-Current release: `v0.1.0`
+Current release: `v0.1.1`
 
 Implemented commands:
 
