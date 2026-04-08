@@ -11,16 +11,15 @@ from contextlib import contextmanager
 from typing import Callable
 
 from rich.console import Console
-from rich.live import Live
 
 from daydream import engine
 from daydream.models import ensure_runtime_model
 from daydream.registry import reverse_lookup
 from daydream.utils import (
+    build_effort_menu_lines,
+    build_input_box_lines,
     daydreaming_status,
-    render_effort_menu,
     render_expanded_reasoning,
-    render_input_box,
 )
 
 console = Console()
@@ -244,7 +243,7 @@ def _render_input_state(buffer: str, *, multiline: bool) -> object:
     if normalized.endswith("\n"):
         lines.append("")
     command_rows = _matching_slash_commands(normalized) if not multiline else []
-    return render_input_box(
+    return build_input_box_lines(
         lines,
         command_rows=command_rows,
         placeholder="Type a message or / for commands",
@@ -257,15 +256,9 @@ def _read_live_boxed_message() -> str:
     multiline = False
 
     with _raw_stdin():
-        live = Live(
-            _render_input_state(buffer, multiline=multiline),
-            console=err_console,
-            transient=False,
-            auto_refresh=False,
-        )
-        live.start()
+        renderer = _InlineTerminalRenderer(sys.stderr)
         try:
-            live.update(_render_input_state(buffer, multiline=multiline), refresh=True)
+            renderer.render(_render_input_state(buffer, multiline=multiline))
             while True:
                 key = _read_key()
 
@@ -277,19 +270,19 @@ def _read_live_boxed_message() -> str:
                             buffer = "\n".join(parts[:-1]).strip()
                             break
                         buffer += "\n"
-                        live.update(_render_input_state(buffer, multiline=multiline), refresh=True)
+                        renderer.render(_render_input_state(buffer, multiline=multiline))
                         continue
 
                     if buffer.strip() == MULTILINE_SENTINEL:
                         buffer = ""
                         multiline = True
-                        live.update(_render_input_state(buffer, multiline=multiline), refresh=True)
+                        renderer.render(_render_input_state(buffer, multiline=multiline))
                         continue
 
                     if current_line.endswith("\\"):
                         buffer = buffer[:-1].rstrip() + "\n"
                         multiline = True
-                        live.update(_render_input_state(buffer, multiline=multiline), refresh=True)
+                        renderer.render(_render_input_state(buffer, multiline=multiline))
                         continue
 
                     buffer = buffer.strip()
@@ -298,7 +291,7 @@ def _read_live_boxed_message() -> str:
                 if key in ("\x7f", "\b"):
                     if buffer:
                         buffer = buffer[:-1]
-                        live.update(_render_input_state(buffer, multiline=multiline), refresh=True)
+                        renderer.render(_render_input_state(buffer, multiline=multiline))
                     continue
 
                 if key == "\x03":
@@ -314,15 +307,14 @@ def _read_live_boxed_message() -> str:
 
                 if key == "\t":
                     buffer += "    "
-                    live.update(_render_input_state(buffer, multiline=multiline), refresh=True)
+                    renderer.render(_render_input_state(buffer, multiline=multiline))
                     continue
 
                 if key.isprintable():
                     buffer += key
-                    live.update(_render_input_state(buffer, multiline=multiline), refresh=True)
+                    renderer.render(_render_input_state(buffer, multiline=multiline))
         finally:
-            live.update(_render_input_state(buffer, multiline=multiline), refresh=True)
-            live.stop()
+            renderer.finish()
 
     err_console.print()
     return buffer
@@ -336,15 +328,9 @@ def _select_effort(current: str, *, supported: bool) -> str:
     index = options.index(current)
 
     with _raw_stdin():
-        live = Live(
-            render_effort_menu(current, options[index], supported=supported),
-            console=err_console,
-            transient=False,
-            auto_refresh=False,
-        )
-        live.start()
+        renderer = _InlineTerminalRenderer(sys.stderr)
         try:
-            live.update(render_effort_menu(current, options[index], supported=supported), refresh=True)
+            renderer.render(build_effort_menu_lines(current, options[index], supported=supported))
             while True:
                 key = _read_key()
                 if key in ("\r", "\n"):
@@ -352,7 +338,7 @@ def _select_effort(current: str, *, supported: bool) -> str:
                 if key in ("\x03",):
                     raise KeyboardInterrupt
                 if key == "\x1b":
-                    live.stop()
+                    renderer.finish()
                     err_console.print()
                     return current
                 if key in ("\x1b[A", "k"):
@@ -361,13 +347,45 @@ def _select_effort(current: str, *, supported: bool) -> str:
                     index = (index + 1) % len(options)
                 elif key in ("1", "2", "3", "4"):
                     index = int(key) - 1
-                live.update(render_effort_menu(current, options[index], supported=supported), refresh=True)
+                renderer.render(build_effort_menu_lines(current, options[index], supported=supported))
         finally:
-            live.update(render_effort_menu(current, options[index], supported=supported), refresh=True)
-            live.stop()
+            renderer.finish()
 
     err_console.print()
     return options[index]
+
+
+class _InlineTerminalRenderer:
+    def __init__(self, stream) -> None:
+        self.stream = stream
+        self._line_count = 0
+        self._cursor_hidden = False
+
+    def render(self, lines: list[str]) -> None:
+        if not self._cursor_hidden:
+            self.stream.write("\x1b[?25l")
+            self._cursor_hidden = True
+        if self._line_count:
+            self.stream.write("\r")
+            if self._line_count > 1:
+                self.stream.write(f"\x1b[{self._line_count - 1}A")
+            self.stream.write("\x1b[J")
+        self.stream.write("\n".join(lines))
+        self.stream.flush()
+        self._line_count = len(lines)
+
+    def finish(self) -> None:
+        if self._line_count:
+            self.stream.write("\r")
+            if self._line_count > 1:
+                self.stream.write(f"\x1b[{self._line_count - 1}A")
+            self.stream.write("\x1b[J")
+            self.stream.flush()
+            self._line_count = 0
+        if self._cursor_hidden:
+            self.stream.write("\x1b[?25h")
+            self.stream.flush()
+            self._cursor_hidden = False
 
 
 class _ReasoningParser:

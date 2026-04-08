@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import math
+import re
+import shutil
 import sys
 import threading
 import time
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -34,6 +37,10 @@ _TITLE_Z_FRAMES = ("z", "zz", "zzz", "zz", "z", "zz", "zzz", "zz")
 
 # Sentinel for "not provided" in update()
 _UNSET = object()
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_DIM = "\x1b[2m"
+_BOLD = "\x1b[1m"
+_RESET = "\x1b[0m"
 
 
 # ── Generic utilities ──────────────────────────────────────────────────
@@ -97,6 +104,149 @@ def _smoothstep(t: float) -> float:
     """Hermite smoothstep for buttery animations."""
     t = max(0.0, min(1.0, t))
     return t * t * (3.0 - 2.0 * t)
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
+def _display_width(text: str) -> int:
+    width = 0
+    for char in _strip_ansi(text):
+        if unicodedata.combining(char):
+            continue
+        if unicodedata.east_asian_width(char) in ("W", "F"):
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+def _fit_display_width(text: str, width: int) -> str:
+    plain = _strip_ansi(text)
+    result: list[str] = []
+    used = 0
+    for char in plain:
+        if unicodedata.combining(char):
+            continue
+        char_width = 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+        if used + char_width > width:
+            break
+        result.append(char)
+        used += char_width
+    padding = max(0, width - used)
+    return "".join(result) + (" " * padding)
+
+
+def _wrap_display_text(text: str, width: int) -> list[str]:
+    plain = _strip_ansi(text)
+    if plain == "":
+        return [""]
+
+    lines: list[str] = []
+    current: list[str] = []
+    used = 0
+    for char in plain:
+        if char == "\n":
+            lines.append("".join(current))
+            current = []
+            used = 0
+            continue
+        char_width = 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+        if used and used + char_width > width:
+            lines.append("".join(current))
+            current = [char]
+            used = char_width
+            continue
+        current.append(char)
+        used += char_width
+    lines.append("".join(current))
+    return lines or [""]
+
+
+def _chat_frame_width() -> tuple[int, int]:
+    columns = shutil.get_terminal_size(fallback=(96, 24)).columns
+    frame_width = min(92, max(56, columns - 8))
+    indent = max(0, (columns - frame_width) // 2)
+    return frame_width, indent
+
+
+def _frame_line(label: str, frame_width: int, indent: int, *, top: bool) -> str:
+    left_corner = "╭" if top else "╰"
+    right_corner = "╮" if top else "╯"
+    prefix = f"{left_corner}─ {label} "
+    fill = max(0, frame_width - _display_width(prefix) - 1)
+    return (" " * indent) + prefix + ("─" * fill) + right_corner
+
+
+def build_input_box_lines(
+    lines: list[str],
+    *,
+    command_rows: list[tuple[str, str]] | None = None,
+    placeholder: str = "Type a message",
+    multiline: bool = False,
+) -> list[str]:
+    frame_width, indent = _chat_frame_width()
+    text_width = frame_width - 4
+    pad = " " * indent
+
+    rendered = [_frame_line("Chat", frame_width, indent, top=True)]
+    source_lines = lines or [""]
+
+    for index, line in enumerate(source_lines):
+        if index == 0 and not line:
+            content = _fit_display_width(placeholder, text_width)
+            rendered.append(f"{pad}│ {_DIM}{content}{_RESET} │")
+            continue
+
+        wrapped = _wrap_display_text(line or "", text_width)
+        for segment in wrapped:
+            rendered.append(f"{pad}│ {_fit_display_width(segment, text_width)} │")
+
+    if command_rows:
+        rendered.append(f"{pad}│ {_fit_display_width('', text_width)} │")
+        rendered.append(f"{pad}│ {_DIM}{_fit_display_width('Commands', text_width)}{_RESET} │")
+        for name, description in command_rows:
+            row = _fit_display_width(f"{name:<9} {description}", text_width)
+            rendered.append(f"{pad}│ {_DIM}{row}{_RESET} │")
+    elif multiline:
+        rendered.append(f"{pad}│ {_fit_display_width('', text_width)} │")
+        hint = _fit_display_width('Multiline mode · End with """', text_width)
+        rendered.append(f"{pad}│ {_DIM}{hint}{_RESET} │")
+
+    rendered.append(_frame_line("Send", frame_width, indent, top=False))
+    return rendered
+
+
+def build_effort_menu_lines(
+    current: str,
+    selected: str,
+    *,
+    supported: bool,
+) -> list[str]:
+    frame_width, indent = _chat_frame_width()
+    text_width = frame_width - 4
+    pad = " " * indent
+    lines = [_frame_line("Reasoning Effort", frame_width, indent, top=True)]
+
+    for option in ("instant", "short", "default", "long"):
+        marker = "› " if option == selected else "  "
+        suffix = "  current" if option == current else ""
+        content = _fit_display_width(f"{marker}{option}{suffix}", text_width)
+        if option == selected:
+            content = f"{_BOLD}{content}{_RESET}"
+        elif option == current:
+            content = f"{_DIM}{content}{_RESET}"
+        lines.append(f"{pad}│ {content} │")
+
+    lines.append(f"{pad}│ {_fit_display_width('', text_width)} │")
+    hint = _fit_display_width("Use ↑/↓ or j/k · Enter to apply · Esc to cancel", text_width)
+    lines.append(f"{pad}│ {_DIM}{hint}{_RESET} │")
+    if not supported:
+        note = _fit_display_width("This model may ignore effort controls.", text_width)
+        lines.append(f"{pad}│ {_DIM}{note}{_RESET} │")
+    lines.append(_frame_line("Apply", frame_width, indent, top=False))
+    return lines
 
 
 def _z_length_value(frame: int) -> float:

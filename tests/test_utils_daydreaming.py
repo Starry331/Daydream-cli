@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import unittest
 
-from daydream.utils import render_daydreaming_text, render_status_footer, render_title_text
+from daydream.utils import (
+    _strip_ansi,
+    build_effort_menu_lines,
+    build_input_box_lines,
+    render_daydreaming_text,
+    render_status_footer,
+    render_title_text,
+)
 
 
 class DaydreamingTextTests(unittest.TestCase):
@@ -24,6 +31,16 @@ class DaydreamingTextTests(unittest.TestCase):
         self.assertIn("qwen3:8b", rendered.plain)
         self.assertIn("42.5 tok/s", rendered.plain)
         self.assertIn("prefill", rendered.plain)
+
+    def test_build_input_box_lines_have_consistent_width(self) -> None:
+        lines = build_input_box_lines(["/"], command_rows=[("/effort", "adjust reasoning depth")])
+        widths = {len(_strip_ansi(line)) for line in lines}
+        self.assertEqual(len(widths), 1)
+
+    def test_build_effort_menu_lines_have_consistent_width(self) -> None:
+        lines = build_effort_menu_lines("default", "long", supported=True)
+        widths = {len(_strip_ansi(line)) for line in lines}
+        self.assertEqual(len(widths), 1)
 
 
 if __name__ == "__main__":
