@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import select
 import shutil
 import sys
@@ -237,24 +238,26 @@ def _raw_stdin():
 
 
 def _read_key() -> str:
-    first = sys.stdin.read(1)
+    fd = sys.stdin.fileno()
+    first = os.read(fd, 1).decode("utf-8", errors="ignore")
     if first != "\x1b":
         return first
 
-    fd = sys.stdin.fileno()
     sequence = first
     deadline = time.monotonic() + 0.65
 
     while time.monotonic() < deadline:
         if select.select([fd], [], [], 0.04)[0]:
-            sequence += sys.stdin.read(1)
+            sequence += os.read(fd, 1).decode("utf-8", errors="ignore")
             break
     if len(sequence) == 1:
         return first
 
     while time.monotonic() < deadline:
         if select.select([fd], [], [], 0.12)[0]:
-            char = sys.stdin.read(1)
+            char = os.read(fd, 1).decode("utf-8", errors="ignore")
+            if not char:
+                break
             sequence += char
             if char.isalpha() or char == "~":
                 break

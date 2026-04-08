@@ -107,9 +107,11 @@ class ChatTests(unittest.TestCase):
 
     def test_read_key_supports_ss3_arrow_sequences(self) -> None:
         stdin = mock.Mock()
-        stdin.read.side_effect = ["\x1b", "O", "A"]
         stdin.fileno.return_value = 0
         with mock.patch("daydream.chat.sys.stdin", stdin), mock.patch(
+            "daydream.chat.os.read",
+            side_effect=[b"\x1b", b"O", b"A"],
+        ), mock.patch(
             "daydream.chat.select.select",
             side_effect=[([0], [], []), ([0], [], []), ([], [], [])],
         ):
@@ -117,9 +119,11 @@ class ChatTests(unittest.TestCase):
 
     def test_read_key_waits_for_delayed_csi_sequence(self) -> None:
         stdin = mock.Mock()
-        stdin.read.side_effect = ["\x1b", "[", "B"]
         stdin.fileno.return_value = 0
         with mock.patch("daydream.chat.sys.stdin", stdin), mock.patch(
+            "daydream.chat.os.read",
+            side_effect=[b"\x1b", b"[", b"B"],
+        ), mock.patch(
             "daydream.chat.select.select",
             side_effect=[([0], [], []), ([0], [], []), ([], [], [])],
         ):
