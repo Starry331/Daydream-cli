@@ -119,9 +119,9 @@ def run_oneshot(
             err_console.print("[red]Error:[/] Empty input.")
             raise SystemExit(1)
 
+    resolved_name = ensure_runtime_model(model_name, auto_pull=True, register_alias=True)
     with err_console.status("Preparing model..."):
-        resolved_name = ensure_runtime_model(model_name, auto_pull=True, register_alias=True)
-        model, tokenizer = engine.load_model(resolved_name)
+        model, tokenizer = engine.load_model(resolved_name, ensure_available=False)
 
     messages = []
     if system:
@@ -144,9 +144,9 @@ def run_chat(
     verbose: bool = False,
 ) -> None:
     """Run an interactive chat REPL."""
+    repo_id = ensure_runtime_model(model_name, auto_pull=True, register_alias=True)
     with err_console.status("Preparing model..."):
-        repo_id = ensure_runtime_model(model_name, auto_pull=True, register_alias=True)
-        model, tokenizer = engine.load_model(repo_id)
+        model, tokenizer = engine.load_model(repo_id, ensure_available=False)
     short = reverse_lookup(repo_id) or model_name
 
     err_console.print(f"[bold cyan]{short}[/]")

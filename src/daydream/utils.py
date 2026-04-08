@@ -11,6 +11,9 @@ from rich.console import Console, Group
 from rich.live import Live
 from rich.text import Text
 
+SPINNER_FRAMES = ("◜", "◠", "◝", "◞", "◡", "◟")
+DEFAULT_TERMINAL_TITLE = "Daydream"
+
 
 def format_size(size_bytes: int) -> str:
     """Format bytes as human-readable string."""
@@ -115,6 +118,53 @@ def render_daydreaming_text(frame: int = 0, *, rainbow: bool = False) -> Text:
     return text
 
 
+def render_title_text(label: str, frame: int = 0) -> str:
+    spinner = SPINNER_FRAMES[frame % len(SPINNER_FRAMES)]
+    return f"{spinner} {label}"
+
+
+def _title_stream():
+    if getattr(sys.stderr, "isatty", lambda: False)():
+        return sys.stderr
+    if getattr(sys.stdout, "isatty", lambda: False)():
+        return sys.stdout
+    return None
+
+
+def set_terminal_title(title: str) -> None:
+    stream = _title_stream()
+    if stream is None:
+        return
+    stream.write(f"\033]0;{title}\007")
+    stream.flush()
+
+
+class TerminalTitleAnimator:
+    def __init__(self, label: str):
+        self.label = label
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if _title_stream() is None:
+            return
+        set_terminal_title(render_title_text(self.label, 0))
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        frame = 0
+        while not self._stop.wait(0.12):
+            frame += 1
+            set_terminal_title(render_title_text(self.label, frame))
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.2)
+        set_terminal_title(DEFAULT_TERMINAL_TITLE)
+
+
 class DaydreamingAnimator:
     def __init__(self, console: Console):
         self.console = console
@@ -154,6 +204,19 @@ class DaydreamingAnimator:
 @contextmanager
 def daydreaming_status(console: Console):
     animator = DaydreamingAnimator(console)
+    title_animator = TerminalTitleAnimator("Daydreaming")
+    title_animator.start()
+    animator.start()
+    try:
+        yield animator
+    finally:
+        animator.stop()
+        title_animator.stop()
+
+
+@contextmanager
+def terminal_title_status(label: str):
+    animator = TerminalTitleAnimator(label)
     animator.start()
     try:
         yield animator

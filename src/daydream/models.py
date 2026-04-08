@@ -23,6 +23,7 @@ from daydream.registry import (
     resolve,
     reverse_lookup,
 )
+from daydream.utils import terminal_title_status
 
 console = Console()
 
@@ -213,28 +214,29 @@ def pull_model(name: str, *, register_alias: bool = False) -> None:
 
     console.print(f"Pulling [bold cyan]{short}[/] ({repo_id})...")
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        task = progress.add_task("Downloading model...", total=None)
-        try:
-            path = snapshot_download(
-                repo_id,
-                allow_patterns=MODEL_FILE_PATTERNS,
-                cache_dir=str(MODEL_CACHE_DIR),
-            )
-        except Exception as e:
-            path = _install_fixture_model(repo_id)
-            if path is None:
-                console.print(f"[red]Error:[/] {e}")
-                raise SystemExit(1)
-            progress.update(task, description="Installed offline test fixture")
-            console.print("[yellow]Hub unavailable.[/] Installed local offline fixture for testing.")
-        else:
-            progress.update(task, description="Download complete")
+    with terminal_title_status(f"Downloading {short}"):
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task("Downloading model...", total=None)
+            try:
+                path = snapshot_download(
+                    repo_id,
+                    allow_patterns=MODEL_FILE_PATTERNS,
+                    cache_dir=str(MODEL_CACHE_DIR),
+                )
+            except Exception as e:
+                path = _install_fixture_model(repo_id)
+                if path is None:
+                    console.print(f"[red]Error:[/] {e}")
+                    raise SystemExit(1)
+                progress.update(task, description="Installed offline test fixture")
+                console.print("[yellow]Hub unavailable.[/] Installed local offline fixture for testing.")
+            else:
+                progress.update(task, description="Download complete")
 
     validate_runtime_model(repo_id, source_name=short)
 

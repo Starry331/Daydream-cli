@@ -249,7 +249,7 @@ def _spawn_background_server(*, model: str | None, host: str, port: int) -> None
     console.print("[dim]Status:[/]   warming up")
 
 
-def start_server(*, model=None, host="127.0.0.1", port=11434, detach: bool = True) -> None:
+def start_server(*, model=None, host="127.0.0.1", port=11434, detach: bool = False) -> None:
     """Start the OpenAI-compatible API server."""
     repo_id = ensure_runtime_model(model, auto_pull=True, register_alias=True) if model else None
 

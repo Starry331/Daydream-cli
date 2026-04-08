@@ -61,11 +61,15 @@ def _fixture_reply(messages: list[dict]) -> str:
     return "Hello from Daydream."
 
 
-def load_model(name: str, verbose: bool = False):
+def load_model(name: str, verbose: bool = False, *, ensure_available: bool = True):
     """Load a model by short name or HF repo ID. Caches the result."""
     global _loaded_model, _loaded_tokenizer, _loaded_name
 
-    repo_id = ensure_runtime_model(name, auto_pull=True, register_alias=True)
+    repo_id = (
+        ensure_runtime_model(name, auto_pull=True, register_alias=True)
+        if ensure_available
+        else name
+    )
     if _loaded_name == repo_id and _loaded_model is not None:
         return _loaded_model, _loaded_tokenizer
 

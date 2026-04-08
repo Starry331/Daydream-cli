@@ -75,7 +75,7 @@ class ServerDetachTests(unittest.TestCase):
                 self.assertFalse((home / "server.json").exists())
                 self.assertIn("Stopped server", output.getvalue())
 
-    def test_serve_defaults_to_background_mode(self) -> None:
+    def test_background_mode_spawns_background_process(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir) / "home"
             home.mkdir(parents=True, exist_ok=True)
@@ -86,9 +86,30 @@ class ServerDetachTests(unittest.TestCase):
 
                 with mock.patch.object(server, "_spawn_background_server") as spawn, \
                     mock.patch.object(server, "ensure_runtime_model", return_value="mlx-community/Foo-4bit"):
-                    server.start_server(model="hf.co/mlx-community/Foo-4bit")
+                    server.start_server(model="hf.co/mlx-community/Foo-4bit", detach=True)
 
                 spawn.assert_called_once()
+
+    def test_serve_defaults_to_foreground_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir(parents=True, exist_ok=True)
+
+            with mock.patch.dict(os.environ, {"DAYDREAM_HOME": str(home)}, clear=False):
+                reload_module("daydream.config")
+                server = reload_module("daydream.server")
+                output = io.StringIO()
+                server.console = Console(file=output, force_terminal=False, color_system=None)
+
+                with mock.patch.object(server, "_spawn_background_server") as spawn, \
+                    mock.patch.object(server, "ensure_runtime_model", return_value="mlx-community/Foo-4bit"), \
+                    mock.patch.object(server, "is_fixture_model", return_value=True), \
+                    mock.patch.object(server, "_run_fixture_server") as run_fixture:
+                    server.start_server(model="hf.co/mlx-community/Foo-4bit")
+
+                spawn.assert_not_called()
+                run_fixture.assert_called_once_with("127.0.0.1", 11434, "mlx-community/Foo-4bit")
+                self.assertIn("server listening on", output.getvalue())
 
 
 if __name__ == "__main__":
