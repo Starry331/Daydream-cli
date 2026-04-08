@@ -260,6 +260,66 @@ def render_input_box_footer() -> Rule:
     return render_frame_rule(Text(" Send ", style="grey42"))
 
 
+def render_input_box(
+    lines: list[str],
+    *,
+    command_rows: list[tuple[str, str]] | None = None,
+    placeholder: str = "Type a message",
+    multiline: bool = False,
+) -> Group:
+    parts: list = [render_input_box_header()]
+
+    if not lines:
+        lines = [""]
+
+    for index, line in enumerate(lines):
+        prefix = "│ "
+        if not line and index == 0:
+            parts.append(Text.assemble((prefix, "grey50"), (placeholder, "dim")))
+        else:
+            parts.append(Text.assemble((prefix, "grey50"), (line or " ", "default")))
+
+    if command_rows:
+        parts.append(Text())
+        parts.append(Text("  Commands", style="dim"))
+        for name, description in command_rows:
+            row = Text("  ", style="dim")
+            row.append(name, style="grey70")
+            row.append("  ")
+            row.append(description, style="dim")
+            parts.append(row)
+    elif multiline:
+        parts.append(Text())
+        parts.append(Text("  Multiline mode · End with \"\"\"", style="dim"))
+
+    parts.append(render_input_box_footer())
+    return Group(*parts)
+
+
+def render_effort_menu(
+    current: str,
+    selected: str,
+    *,
+    supported: bool,
+) -> Group:
+    parts: list = [render_frame_rule(Text(" Reasoning Effort ", style="bold grey58"))]
+    options = ("instant", "short", "default", "long")
+    for option in options:
+        marker = "› " if option == selected else "  "
+        style = "bold grey84" if option == selected else "dim"
+        label = f"{marker}{option}"
+        if option == current:
+            label += "  current"
+        parts.append(Text(label, style=style))
+
+    parts.append(Text())
+    parts.append(Text("  Use ↑/↓ or j/k · Enter to apply · Esc to cancel", style="dim"))
+    if not supported:
+        parts.append(Text("  This model may ignore effort controls.", style="dim"))
+    parts.append(render_frame_rule())
+    return Group(*parts)
+
+
 def render_expanded_reasoning(reasoning_text: str) -> Group:
     normalized = reasoning_text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
     body = Text(normalized or "(no reasoning captured)", style=f"dim {_C_REASON}")

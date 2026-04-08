@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
+import select
 import sys
 import re
+import termios
+import tty
+from contextlib import contextmanager
 from typing import Callable
 
 from rich.console import Console
+from rich.live import Live
 
 from daydream import engine
 from daydream.models import ensure_runtime_model
 from daydream.registry import reverse_lookup
 from daydream.utils import (
     daydreaming_status,
+    render_effort_menu,
     render_expanded_reasoning,
-    render_input_box_footer,
-    render_input_box_header,
+    render_input_box,
 )
 
 console = Console()
@@ -24,6 +29,15 @@ err_console = Console(stderr=True)
 MULTILINE_SENTINEL = '"""'
 OPEN_THINK_TAG = "<think>"
 CLOSE_THINK_TAG = "</think>"
+EFFORT_LEVELS = ("instant", "short", "default", "long")
+SLASH_COMMANDS = (
+    ("/effort", "adjust reasoning depth"),
+    ("/help", "show available commands"),
+    ("/reset", "clear conversation history"),
+    ("/clear", "alias for /reset"),
+    ("/t", "expand the last reasoning trace"),
+    ("/quit", "exit chat"),
+)
 REASONING_PREFIX_CANDIDATES = (
     "thinking process",
     "thinking process:",
@@ -116,13 +130,244 @@ def _read_boxed_message(
     *,
     input_func: Callable[[str], str] = input,
 ) -> str:
-    err_console.print(render_input_box_header())
+    if input_func is input and sys.stdin.isatty() and err_console.is_terminal:
+        return _read_live_boxed_message()
+
+    err_console.print(render_input_box([""], placeholder="Type a message or / for commands"))
     try:
         first_line = input_func("│ ")
         return _collect_multiline_message(first_line, lambda _: input_func("│ "))
     finally:
-        err_console.print(render_input_box_footer())
         err_console.print()
+
+
+def _matching_slash_commands(text: str) -> list[tuple[str, str]]:
+    sample = text.strip()
+    if not sample.startswith("/"):
+        return []
+    if sample == "/":
+        return list(SLASH_COMMANDS)
+
+    command_prefix = sample.split(None, 1)[0].lower()
+    matches = [row for row in SLASH_COMMANDS if row[0].startswith(command_prefix)]
+    return matches or list(SLASH_COMMANDS)
+
+
+def _normalize_effort(value: str) -> str | None:
+    choice = value.strip().lower()
+    if choice in EFFORT_LEVELS:
+        return choice
+    return None
+
+
+def _model_supports_effort(model_name: str) -> bool:
+    lowered = model_name.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "qwen3",
+            "deepseek-r1",
+            "reasoner",
+            "thinking",
+        )
+    )
+
+
+def _effort_system_prompt(effort: str, model_name: str) -> str | None:
+    if effort == "default" or not _model_supports_effort(model_name):
+        return None
+
+    prompts = {
+        "instant": (
+            "Reasoning effort: instant. Think only briefly, skip exploratory detours, "
+            "and answer as soon as you have a solid result."
+        ),
+        "short": (
+            "Reasoning effort: short. Use a compact reasoning chain, then answer directly."
+        ),
+        "long": (
+            "Reasoning effort: long. Spend more time reasoning, check edge cases, and only "
+            "then produce the final answer."
+        ),
+    }
+    return prompts.get(effort)
+
+
+def _build_request_messages(
+    history: list[dict],
+    *,
+    system_prompt: str | None,
+    effort: str,
+    model_name: str,
+) -> list[dict]:
+    request_messages: list[dict] = []
+    if system_prompt:
+        request_messages.append({"role": "system", "content": system_prompt})
+    effort_prompt = _effort_system_prompt(effort, model_name)
+    if effort_prompt:
+        request_messages.append({"role": "system", "content": effort_prompt})
+    request_messages.extend(history)
+    return request_messages
+
+
+@contextmanager
+def _raw_stdin():
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def _read_key() -> str:
+    first = sys.stdin.read(1)
+    if first != "\x1b":
+        return first
+
+    fd = sys.stdin.fileno()
+    if not select.select([fd], [], [], 0.02)[0]:
+        return first
+    second = sys.stdin.read(1)
+    if second != "[":
+        return first + second
+    if not select.select([fd], [], [], 0.02)[0]:
+        return first + second
+    third = sys.stdin.read(1)
+    return f"\x1b[{third}"
+
+
+def _render_input_state(buffer: str, *, multiline: bool) -> object:
+    normalized = buffer.replace("\r\n", "\n").replace("\r", "\n")
+    lines = normalized.split("\n")
+    if normalized.endswith("\n"):
+        lines.append("")
+    command_rows = _matching_slash_commands(normalized) if not multiline else []
+    return render_input_box(
+        lines,
+        command_rows=command_rows,
+        placeholder="Type a message or / for commands",
+        multiline=multiline,
+    )
+
+
+def _read_live_boxed_message() -> str:
+    buffer = ""
+    multiline = False
+
+    with _raw_stdin():
+        live = Live(
+            _render_input_state(buffer, multiline=multiline),
+            console=err_console,
+            transient=False,
+            auto_refresh=False,
+        )
+        live.start()
+        try:
+            live.update(_render_input_state(buffer, multiline=multiline), refresh=True)
+            while True:
+                key = _read_key()
+
+                if key in ("\r", "\n"):
+                    current_line = buffer.split("\n")[-1]
+                    if multiline:
+                        if current_line.strip() == MULTILINE_SENTINEL:
+                            parts = buffer.split("\n")
+                            buffer = "\n".join(parts[:-1]).strip()
+                            break
+                        buffer += "\n"
+                        live.update(_render_input_state(buffer, multiline=multiline), refresh=True)
+                        continue
+
+                    if buffer.strip() == MULTILINE_SENTINEL:
+                        buffer = ""
+                        multiline = True
+                        live.update(_render_input_state(buffer, multiline=multiline), refresh=True)
+                        continue
+
+                    if current_line.endswith("\\"):
+                        buffer = buffer[:-1].rstrip() + "\n"
+                        multiline = True
+                        live.update(_render_input_state(buffer, multiline=multiline), refresh=True)
+                        continue
+
+                    buffer = buffer.strip()
+                    break
+
+                if key in ("\x7f", "\b"):
+                    if buffer:
+                        buffer = buffer[:-1]
+                        live.update(_render_input_state(buffer, multiline=multiline), refresh=True)
+                    continue
+
+                if key == "\x03":
+                    raise KeyboardInterrupt
+
+                if key == "\x04":
+                    if not buffer:
+                        raise EOFError
+                    continue
+
+                if key.startswith("\x1b"):
+                    continue
+
+                if key == "\t":
+                    buffer += "    "
+                    live.update(_render_input_state(buffer, multiline=multiline), refresh=True)
+                    continue
+
+                if key.isprintable():
+                    buffer += key
+                    live.update(_render_input_state(buffer, multiline=multiline), refresh=True)
+        finally:
+            live.update(_render_input_state(buffer, multiline=multiline), refresh=True)
+            live.stop()
+
+    err_console.print()
+    return buffer
+
+
+def _select_effort(current: str, *, supported: bool) -> str:
+    if not sys.stdin.isatty() or not err_console.is_terminal:
+        return current
+
+    options = list(EFFORT_LEVELS)
+    index = options.index(current)
+
+    with _raw_stdin():
+        live = Live(
+            render_effort_menu(current, options[index], supported=supported),
+            console=err_console,
+            transient=False,
+            auto_refresh=False,
+        )
+        live.start()
+        try:
+            live.update(render_effort_menu(current, options[index], supported=supported), refresh=True)
+            while True:
+                key = _read_key()
+                if key in ("\r", "\n"):
+                    break
+                if key in ("\x03",):
+                    raise KeyboardInterrupt
+                if key == "\x1b":
+                    live.stop()
+                    err_console.print()
+                    return current
+                if key in ("\x1b[A", "k"):
+                    index = (index - 1) % len(options)
+                elif key in ("\x1b[B", "j"):
+                    index = (index + 1) % len(options)
+                elif key in ("1", "2", "3", "4"):
+                    index = int(key) - 1
+                live.update(render_effort_menu(current, options[index], supported=supported), refresh=True)
+        finally:
+            live.update(render_effort_menu(current, options[index], supported=supported), refresh=True)
+            live.stop()
+
+    err_console.print()
+    return options[index]
 
 
 class _ReasoningParser:
@@ -511,13 +756,13 @@ def run_chat(
     short = reverse_lookup(repo_id) or model_name
 
     err_console.print(f"[bold cyan]{short}[/]")
-    err_console.print("[dim]Use /help for commands.[/dim]")
+    err_console.print("[dim]Use / for commands.[/dim]")
     err_console.print()
 
     messages: list[dict] = []
     last_reasoning = ""
-    if system:
-        messages.append({"role": "system", "content": system})
+    effort = "default"
+    effort_supported = _model_supports_effort(repo_id)
 
     while True:
         try:
@@ -533,26 +778,45 @@ def run_chat(
         if stripped in ("/quit", "/exit", "/q"):
             break
         if stripped in ("/reset", "/clear", "/r"):
-            messages = messages[:1] if system else []
+            messages = []
             err_console.print("[dim]Chat history cleared.[/dim]")
             continue
         if stripped in ("/help", "/h", "/?"):
             err_console.print(f"[dim]{MULTILINE_SENTINEL}      — start/end multiline input[/dim]")
             err_console.print("[dim]\\        — continue input on the next line[/dim]")
+            err_console.print("[dim]/effort  — pick instant / short / default / long[/dim]")
             err_console.print("[dim]/reset  — clear conversation history[/dim]")
             err_console.print("[dim]/clear  — alias for /reset[/dim]")
             err_console.print("[dim]/t      — show last captured reasoning[/dim]")
             err_console.print("[dim]/quit   — exit chat[/dim]")
             err_console.print("[dim]/help   — show this help[/dim]")
             continue
+        if stripped == "/":
+            err_console.print("[dim]Type /effort, /reset, /clear, /t, /help, or /quit.[/dim]")
+            continue
+        if stripped.startswith("/effort"):
+            parts = stripped.split(maxsplit=1)
+            selected = _normalize_effort(parts[1]) if len(parts) > 1 else None
+            if selected is None:
+                selected = _select_effort(effort, supported=effort_supported)
+            effort = selected
+            note = "[dim]Model may ignore this setting.[/dim]" if not effort_supported else ""
+            err_console.print(f"[dim]Reasoning effort set to {effort}.[/dim] {note}".rstrip())
+            continue
         if stripped in ("/t", "/thoughts"):
             err_console.print(render_expanded_reasoning(last_reasoning))
             continue
 
         messages.append({"role": "user", "content": user_input})
+        request_messages = _build_request_messages(
+            messages,
+            system_prompt=system,
+            effort=effort,
+            model_name=repo_id,
+        )
 
         full_text, _, reasoning_text = _stream_response(
-            model, tokenizer, messages,
+            model, tokenizer, request_messages,
             model_label=short,
             temp=temp, top_p=top_p, max_tokens=max_tokens, verbose=verbose,
         )

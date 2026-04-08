@@ -6,7 +6,17 @@ from unittest import mock
 
 from rich.console import Console
 
-from daydream.chat import _ReasoningParser, _collect_multiline_message, _extract_visible_text, run_oneshot
+from daydream.chat import (
+    _ReasoningParser,
+    _build_request_messages,
+    _collect_multiline_message,
+    _effort_system_prompt,
+    _extract_visible_text,
+    _matching_slash_commands,
+    _model_supports_effort,
+    _normalize_effort,
+    run_oneshot,
+)
 
 
 class ChatTests(unittest.TestCase):
@@ -67,6 +77,31 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(delta, "你好")
         self.assertEqual(reasoning_delta, "")
         self.assertTrue(closed)
+
+    def test_matching_slash_commands_filters_by_prefix(self) -> None:
+        matches = _matching_slash_commands("/e")
+        self.assertEqual(matches[0][0], "/effort")
+        self.assertTrue(any(name == "/help" for name, _ in _matching_slash_commands("/")))
+
+    def test_effort_helpers_only_emit_prompts_for_supported_models(self) -> None:
+        self.assertEqual(_normalize_effort("LONG"), "long")
+        self.assertIsNone(_normalize_effort("medium"))
+        self.assertTrue(_model_supports_effort("mlx-community/Qwen3-8B-4bit"))
+        self.assertFalse(_model_supports_effort("mlx-community/SmolLM2-360M-Instruct-4bit"))
+        self.assertIsNotNone(_effort_system_prompt("short", "mlx-community/Qwen3-8B-4bit"))
+        self.assertIsNone(_effort_system_prompt("short", "mlx-community/SmolLM2-360M-Instruct-4bit"))
+
+    def test_build_request_messages_includes_effort_system_prompt(self) -> None:
+        request = _build_request_messages(
+            [{"role": "user", "content": "hello"}],
+            system_prompt="base",
+            effort="long",
+            model_name="mlx-community/Qwen3-8B-4bit",
+        )
+        self.assertEqual(request[0]["content"], "base")
+        self.assertEqual(request[1]["role"], "system")
+        self.assertIn("Reasoning effort: long", request[1]["content"])
+        self.assertEqual(request[2]["content"], "hello")
 
     def test_run_oneshot_resolves_before_preparing_load(self) -> None:
         output = io.StringIO()
