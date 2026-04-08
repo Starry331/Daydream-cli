@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-import time
 from typing import Callable
 
 from rich.console import Console
@@ -122,27 +121,32 @@ def _stream_response(model, tokenizer, messages, *, model_label, temp, top_p, ma
     last_response = None
     wrote_output = False
     stream_to_stdout = not err_console.is_terminal
-    reasoning_started_at: float | None = None
     parser = _ReasoningParser()
+    prev_reasoning = False
+
     with daydreaming_status(err_console, model_label) as status:
         for response in engine.generate_stream(
             model, tokenizer, messages,
             max_tokens=max_tokens, temp=temp, top_p=top_p,
         ):
             raw_chunk = response.text or ""
-            if OPEN_THINK_TAG in raw_chunk and reasoning_started_at is None:
-                reasoning_started_at = time.monotonic()
             text_chunk, reasoning_closed = parser.feed(raw_chunk)
+
+            # Reasoning state transitions → drive the status display
+            if parser.in_reasoning and not prev_reasoning:
+                status.start_reasoning()
+            if reasoning_closed:
+                status.end_reasoning()
+            prev_reasoning = parser.in_reasoning
+
+            # Stats updates
             if response.prompt_tps and not wrote_output:
-                status.update(phase="prefill", tokens_per_second=response.prompt_tps, waiting=True)
+                status.update(phase="prefill", tokens_per_second=response.prompt_tps)
+
+            # First visible token → switch from animation to output mode
             if text_chunk and not wrote_output:
-                if parser.saw_reasoning and reasoning_started_at is not None:
-                    elapsed = time.monotonic() - reasoning_started_at
-                    err_console.print(f"[dim]thought for {elapsed:.1f}s[/dim]")
-                status.update(waiting=False)
-            elif reasoning_closed and parser.saw_reasoning and reasoning_started_at is not None and not wrote_output:
-                elapsed = time.monotonic() - reasoning_started_at
-                err_console.print(f"[dim]thought for {elapsed:.1f}s[/dim]")
+                status.update(waiting=False, phase=None)
+
             full_text += text_chunk
             last_response = response
 
@@ -153,9 +157,9 @@ def _stream_response(model, tokenizer, messages, *, model_label, temp, top_p, ma
                     status.append_output(text_chunk)
                 wrote_output = True
                 if response.generation_tps:
-                    status.update(phase=None, tokens_per_second=response.generation_tps, waiting=False)
+                    status.update(phase=None, tokens_per_second=response.generation_tps)
             elif response.generation_tps:
-                status.update(phase=None, tokens_per_second=response.generation_tps, waiting=False)
+                status.update(tokens_per_second=response.generation_tps)
 
             if response.finish_reason:
                 break
