@@ -15,6 +15,10 @@ class DaydreamingTextTests(unittest.TestCase):
         self.assertIn("Daydream CLI", rendered)
         self.assertIn("Downloading model", rendered)
 
+    def test_render_title_text_accepts_custom_frames(self) -> None:
+        rendered = render_title_text("Daydreaming", 1, frames=("Z", "ZZ"))
+        self.assertIn("ZZ Daydream CLI", rendered)
+
     def test_render_status_footer_contains_model_and_rate(self) -> None:
         rendered = render_status_footer("qwen3:8b", tokens_per_second=42.5, phase="prefill")
         self.assertIn("qwen3:8b", rendered.plain)

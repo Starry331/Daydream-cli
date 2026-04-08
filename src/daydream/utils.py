@@ -12,6 +12,14 @@ from rich.live import Live
 from rich.text import Text
 
 SPINNER_FRAMES = ("◜", "◠", "◝", "◞", "◡", "◟")
+DAYDREAM_Z_FRAMES = (
+    "Z",
+    "Z  ZZ",
+    "Z  ZZ  ZZZ",
+    "  Z  ZZ  ZZZ",
+    "Z   ZZ   ZZZ",
+    "ZZ   ZZZ",
+)
 DEFAULT_TERMINAL_TITLE = "Daydream CLI"
 
 
@@ -77,12 +85,20 @@ def render_daydreaming_text(frame: int = 0, *, rainbow: bool = False) -> Text:
     )
     text = Text()
 
-    pulse_curve = [0.28, 0.42, 0.62, 0.82, 1.0, 0.82, 0.62, 0.42]
-    pulse = pulse_curve[frame % len(pulse_curve)]
-    orb_color = _mix_color(gradient[0], gradient[-1], pulse)
-    orb_char = "●" if pulse > 0.72 else "•" if pulse > 0.45 else "·"
-    text.append(orb_char, style=f"bold {orb_color}")
-    text.append(" ", style="dim")
+    z_frame = DAYDREAM_Z_FRAMES[frame % len(DAYDREAM_Z_FRAMES)]
+    for idx, char in enumerate(z_frame):
+        if char == " ":
+            text.append(char)
+            continue
+        palette_pos = idx / max(len(z_frame) - 1, 1)
+        color_index = palette_pos * (len(gradient) - 1)
+        base = int(color_index)
+        frac = color_index - base
+        start = gradient[base]
+        end = gradient[min(base + 1, len(gradient) - 1)]
+        color = _mix_color(start, end, frac)
+        text.append(char, style=f"bold {color}")
+    text.append("   ", style="dim")
 
     sweep_span = 4.0
     cycle_width = len(word) + 8
@@ -101,7 +117,7 @@ def render_daydreaming_text(frame: int = 0, *, rainbow: bool = False) -> Text:
         highlight_color = _mix_color(base_color, "#ffffff", 0.85 if not rainbow else 0.35)
         final_color = _mix_color(base_color, highlight_color, glow)
         style_parts = ["bold" if glow > 0.22 else "not bold", final_color]
-        if glow < 0.18:
+        if glow < 0.26:
             style_parts.append("dim")
         text.append(char, style=" ".join(style_parts))
 
@@ -118,9 +134,10 @@ def render_daydreaming_text(frame: int = 0, *, rainbow: bool = False) -> Text:
     return text
 
 
-def render_title_text(label: str, frame: int = 0) -> str:
-    spinner = SPINNER_FRAMES[frame % len(SPINNER_FRAMES)]
-    return f"{spinner} Daydream CLI — {label}"
+def render_title_text(label: str, frame: int = 0, *, frames: tuple[str, ...] | None = None) -> str:
+    active_frames = frames or SPINNER_FRAMES
+    prefix = active_frames[frame % len(active_frames)]
+    return f"{prefix} Daydream CLI — {label}"
 
 
 def render_status_footer(
@@ -158,15 +175,16 @@ def set_terminal_title(title: str) -> None:
 
 
 class TerminalTitleAnimator:
-    def __init__(self, label: str):
+    def __init__(self, label: str, *, frames: tuple[str, ...] | None = None):
         self.label = label
+        self.frames = frames
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
         if _title_stream() is None:
             return
-        set_terminal_title(render_title_text(self.label, 0))
+        set_terminal_title(render_title_text(self.label, 0, frames=self.frames))
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -174,7 +192,7 @@ class TerminalTitleAnimator:
         frame = 0
         while not self._stop.wait(0.12):
             frame += 1
-            set_terminal_title(render_title_text(self.label, frame))
+            set_terminal_title(render_title_text(self.label, frame, frames=self.frames))
 
     def stop(self) -> None:
         self._stop.set()
@@ -196,7 +214,7 @@ class ConversationStatus:
         self._thread: threading.Thread | None = None
         self._live: Live | None = None
         self._lock = threading.Lock()
-        self._title_animator = TerminalTitleAnimator("Daydreaming")
+        self._title_animator = TerminalTitleAnimator("Daydreaming", frames=DAYDREAM_Z_FRAMES)
 
     def _render(self) -> Group:
         with self._lock:
