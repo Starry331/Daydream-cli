@@ -216,8 +216,16 @@ While the model is preparing its first output, Daydream shows a `Daydreaming` st
 Start the local API server in the foreground:
 
 ```bash
+daydream serve qwen3.5 9b
+```
+
+Equivalent long-form command:
+
+```bash
 daydream serve --model hf.co/mlx-community/SmolLM2-135M-Instruct-4bit
 ```
+
+Both forms are supported. The positional form is a shortcut; `--model` is still fully supported.
 
 Check status:
 
@@ -287,6 +295,12 @@ Daydream works best in Cherry Studio through its OpenAI-compatible provider flow
 1. Start Daydream first:
 
 ```bash
+daydream serve qwen3.5 9b
+```
+
+Or keep using the explicit long form:
+
+```bash
 daydream serve --model hf.co/mlx-community/SmolLM2-135M-Instruct-4bit
 ```
 
@@ -310,6 +324,12 @@ Tips:
 Daydream works with OpenClaw as a self-hosted OpenAI-compatible backend.
 
 1. Start Daydream:
+
+```bash
+daydream serve qwen3.5 9b
+```
+
+Or use the long form:
 
 ```bash
 daydream serve --model hf.co/mlx-community/SmolLM2-135M-Instruct-4bit
@@ -721,8 +741,16 @@ daydream run qwen3:8b
 前台启动本地 API 服务：
 
 ```bash
+daydream serve qwen3.5 9b
+```
+
+等价的长写法：
+
+```bash
 daydream serve --model hf.co/mlx-community/SmolLM2-135M-Instruct-4bit
 ```
+
+这两种写法都支持。前者只是快捷写法，`--model` 并没有被替换掉。
 
 查看状态：
 
@@ -803,6 +831,12 @@ Daydream 最适合通过 Cherry Studio 的 OpenAI 兼容提供方方式接入。
 1. 先启动 Daydream：
 
 ```bash
+daydream serve qwen3.5 9b
+```
+
+或者继续使用完整长写法：
+
+```bash
 daydream serve --model hf.co/mlx-community/SmolLM2-135M-Instruct-4bit
 ```
 
@@ -826,6 +860,12 @@ daydream serve --model hf.co/mlx-community/SmolLM2-135M-Instruct-4bit
 Daydream 可以作为 OpenClaw 的自托管 OpenAI 兼容后端来使用。
 
 1. 先启动 Daydream：
+
+```bash
+daydream serve qwen3.5 9b
+```
+
+或者使用长写法：
 
 ```bash
 daydream serve --model hf.co/mlx-community/SmolLM2-135M-Instruct-4bit

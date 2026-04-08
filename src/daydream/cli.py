@@ -38,6 +38,28 @@ def _handle_errors(func):
     return wrapper
 
 
+def _coalesce_model_reference(option_model, model_parts):
+    if option_model and model_parts:
+        raise ValueError("Use either a positional model or --model, not both.")
+    if option_model:
+        return option_model
+    if not model_parts:
+        return None
+
+    parts = [part.strip() for part in model_parts if part and part.strip()]
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+
+    if all("/" not in part for part in parts):
+        family = "-".join(parts[:-1])
+        variant = parts[-1]
+        return f"{family}:{variant}"
+
+    return " ".join(parts)
+
+
 @click.group()
 @click.version_option(version=__version__, prog_name="daydream")
 def cli():
@@ -105,6 +127,7 @@ def show(model):
 
 
 @cli.command()
+@click.argument("model_parts", nargs=-1, required=False)
 @click.option("--model", type=str, default=None, help="Model to preload")
 @click.option("--host", default=get_default_host(), show_default=True, help="Bind address")
 @click.option("--port", "-p", type=int, default=get_default_port(), show_default=True, help="Port number")
@@ -112,11 +135,12 @@ def show(model):
 @click.option("--foreground", is_flag=True, hidden=True)
 @click.option("--detach", is_flag=True, hidden=True)
 @_handle_errors
-def serve(model, host, port, background, foreground, detach):
+def serve(model_parts, model, host, port, background, foreground, detach):
     """Start or manage the OpenAI-compatible API server."""
     from daydream.server import start_server
+    resolved_model = _coalesce_model_reference(model, model_parts)
     start_server(
-        model=model,
+        model=resolved_model,
         host=host,
         port=port,
         detach=background or detach,
