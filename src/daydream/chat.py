@@ -26,7 +26,6 @@ from daydream.utils import (
     build_memory_display_lines,
     build_session_list_lines,
     daydreaming_status,
-    DreamingStatus,
     render_expanded_reasoning,
     render_input_box,
 )
@@ -35,7 +34,6 @@ from daydream.storage import (
     ChatMessage,
     Memory,
     save_session,
-    load_session,
     list_sessions,
     save_memories,
     load_memories,
@@ -1192,7 +1190,7 @@ def _run_dreaming(
     session_memories: list[Memory],
     temp,
     max_tokens,
-) -> list:
+) -> list[Memory]:
     """Execute the selected dreaming mode with animated status.
 
     1. Create DreamingStatus instance
