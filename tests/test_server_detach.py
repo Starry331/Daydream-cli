@@ -116,6 +116,59 @@ class ServerDetachTests(unittest.TestCase):
                 self.assertIn("API key:  daydream-local", rendered)
                 self.assertIn("Model:    mlx-community/Foo-4bit", rendered)
 
+    def test_profile_defaults_flow_into_server_args(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir(parents=True, exist_ok=True)
+            (home / "profiles.yaml").write_text(
+                json.dumps(
+                    {
+                        "mycoder": {
+                            "from": "qwen3:8b",
+                            "system": "You are terse.",
+                            "parameters": {
+                                "temperature": 0.2,
+                                "top_p": 0.85,
+                                "max_tokens": 4096,
+                                "effort": "instant",
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(os.environ, {"DAYDREAM_HOME": str(home)}, clear=False):
+                reload_module("daydream.config")
+                reload_module("daydream.profiles")
+                server = reload_module("daydream.server")
+                output = io.StringIO()
+                server.console = Console(file=output, force_terminal=False, color_system=None)
+
+                fake_mlx_server = mock.Mock()
+                fake_provider = mock.Mock()
+
+                with mock.patch.object(server, "ensure_runtime_model", return_value="mlx-community/Foo-4bit"), \
+                    mock.patch.object(server, "is_fixture_model", return_value=False), \
+                    mock.patch.dict(
+                        "sys.modules",
+                        {
+                            "mlx_lm.server": mock.Mock(
+                                ModelProvider=fake_provider,
+                                run=fake_mlx_server,
+                            )
+                        },
+                    ):
+                    server.start_server(model="mycoder")
+
+                args = fake_provider.call_args.args[0]
+                self.assertEqual(args.model, "mlx-community/Foo-4bit")
+                self.assertEqual(args.temp, 0.2)
+                self.assertEqual(args.top_p, 0.85)
+                self.assertEqual(args.max_tokens, 4096)
+                self.assertEqual(args.chat_template_args, {"enable_thinking": False})
+                self.assertIn("CLI-only", output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

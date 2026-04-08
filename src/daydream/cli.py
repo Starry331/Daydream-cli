@@ -1,6 +1,7 @@
 import sys
 
 import click
+from click.core import ParameterSource
 from rich.console import Console
 
 from daydream import __version__
@@ -60,6 +61,22 @@ def _coalesce_model_reference(option_model, model_parts):
     return " ".join(parts)
 
 
+def _parameter_was_explicit(ctx: click.Context, name: str) -> bool:
+    try:
+        return ctx.get_parameter_source(name) == ParameterSource.COMMANDLINE
+    except Exception:
+        return False
+
+
+def _resolve_profile_reference(model: str):
+    from daydream.profiles import get_profile
+
+    profile = get_profile(model)
+    if profile is None:
+        return model, None
+    return profile.from_model, profile
+
+
 @click.group()
 @click.version_option(version=__version__, prog_name="daydream")
 def cli():
@@ -70,6 +87,18 @@ def cli():
 
 
 @cli.command()
+@click.argument("name")
+@click.option("-f", "--file", "file_path", type=click.Path(exists=True, dir_okay=False, path_type=str), default="Daydreamfile", show_default=True, help="Path to a Daydreamfile")
+@_handle_errors
+def create(name, file_path):
+    """Create a custom model profile from a Daydreamfile."""
+    from daydream.profiles import create_profile
+
+    profile = create_profile(name, file_path=file_path)
+    Console().print(f"[green]✓[/] Created custom model [bold]{profile.name}[/] from [bold]{profile.from_model}[/]")
+
+
+@cli.command()
 @click.argument("model")
 @click.argument("prompt", required=False, default=None)
 @click.option("--temp", type=float, default=get_default_temp(), show_default=True, help="Sampling temperature")
@@ -77,17 +106,49 @@ def cli():
 @click.option("--max-tokens", "-m", type=int, default=get_default_max_tokens(), show_default=True, help="Max tokens to generate")
 @click.option("--system", "-s", type=str, default=None, help="System prompt")
 @click.option("--verbose", "-v", is_flag=True, help="Show performance metrics")
+@click.pass_context
 @_handle_errors
-def run(model, prompt, temp, top_p, max_tokens, system, verbose):
+def run(ctx, model, prompt, temp, top_p, max_tokens, system, verbose):
     """Run a model — interactive chat or one-shot generation."""
     from daydream.chat import run_chat, run_oneshot
 
-    if prompt is not None or not sys.stdin.isatty():
-        run_oneshot(model, prompt=prompt, temp=temp, top_p=top_p,
-                    max_tokens=max_tokens, system=system, verbose=verbose)
+    resolved_model, profile = _resolve_profile_reference(model)
+    if profile is not None:
+        if not _parameter_was_explicit(ctx, "temp") and "temperature" in profile.parameters:
+            temp = float(profile.parameters["temperature"])
+        if not _parameter_was_explicit(ctx, "top_p") and "top_p" in profile.parameters:
+            top_p = float(profile.parameters["top_p"])
+        if not _parameter_was_explicit(ctx, "max_tokens") and "max_tokens" in profile.parameters:
+            max_tokens = int(profile.parameters["max_tokens"])
+        if not _parameter_was_explicit(ctx, "system") and profile.system:
+            system = profile.system
+        initial_effort = str(profile.parameters.get("effort", "default"))
     else:
-        run_chat(model, temp=temp, top_p=top_p, max_tokens=max_tokens,
-                 system=system, verbose=verbose)
+        initial_effort = "default"
+
+    if prompt is not None or not sys.stdin.isatty():
+        run_oneshot(
+            resolved_model,
+            prompt=prompt,
+            temp=temp,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            system=system,
+            verbose=verbose,
+            initial_effort=initial_effort,
+            display_name=profile.name if profile else model,
+        )
+    else:
+        run_chat(
+            resolved_model,
+            temp=temp,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            system=system,
+            verbose=verbose,
+            initial_effort=initial_effort,
+            display_name=profile.name if profile else model,
+        )
 
 
 @cli.command()
@@ -96,7 +157,9 @@ def run(model, prompt, temp, top_p, max_tokens, system, verbose):
 def pull(model):
     """Download a model from HuggingFace."""
     from daydream.models import pull_model
-    pull_model(model)
+
+    resolved_model, _ = _resolve_profile_reference(model)
+    pull_model(resolved_model)
 
 
 @cli.command(name="list")
@@ -113,7 +176,12 @@ def list_models():
 @_handle_errors
 def rm(model, force):
     """Remove a downloaded model."""
+    from daydream.profiles import delete_profile
     from daydream.models import remove_model
+
+    if delete_profile(model):
+        Console().print(f"[green]✓[/] Removed custom model [bold]{model}[/]")
+        return
     remove_model(model, force=force)
 
 
@@ -122,7 +190,12 @@ def rm(model, force):
 @_handle_errors
 def show(model):
     """Show model information."""
+    from daydream.profiles import get_profile, show_profile
     from daydream.models import show_model
+
+    if get_profile(model) is not None:
+        show_profile(model)
+        return
     show_model(model)
 
 
@@ -134,8 +207,9 @@ def show(model):
 @click.option("--background", is_flag=True, help="Run server in the background")
 @click.option("--foreground", is_flag=True, hidden=True)
 @click.option("--detach", is_flag=True, hidden=True)
+@click.pass_context
 @_handle_errors
-def serve(model_parts, model, host, port, background, foreground, detach):
+def serve(ctx, model_parts, model, host, port, background, foreground, detach):
     """Start or manage the OpenAI-compatible API server."""
     from daydream.server import start_server
     resolved_model = _coalesce_model_reference(model, model_parts)
@@ -169,6 +243,7 @@ def stop(force):
 def available_models():
     """List all available model names in the registry."""
     from rich.table import Table
+    from daydream.profiles import list_profiles
     from daydream.registry import list_available
     from pathlib import Path
 
@@ -181,5 +256,8 @@ def available_models():
         short_name = family if variant == "default" else f"{family}:{variant}"
         source = "local" if Path(repo_id).expanduser().exists() else "huggingface"
         table.add_row(short_name, repo_id, source)
+
+    for profile in list_profiles():
+        table.add_row(profile.name, profile.from_model, "profile")
 
     Console().print(table)

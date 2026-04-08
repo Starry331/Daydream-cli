@@ -9,6 +9,7 @@ import yaml
 DAYDREAM_HOME = Path(os.environ.get("DAYDREAM_HOME", "~/.daydream")).expanduser()
 REGISTRY_FILE = DAYDREAM_HOME / "registry.yaml"
 CONFIG_FILE = DAYDREAM_HOME / "config.yaml"
+PROFILES_FILE = DAYDREAM_HOME / "profiles.yaml"
 SERVER_STATE_FILE = DAYDREAM_HOME / "server.json"
 SERVER_LOG_FILE = DAYDREAM_HOME / "server.log"
 

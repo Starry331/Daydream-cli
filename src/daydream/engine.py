@@ -100,6 +100,7 @@ def generate_stream(
     max_tokens: int = 4096,
     temp: float = 0.6,
     top_p: float = 0.9,
+    chat_template_kwargs: dict | None = None,
 ) -> Generator:
     """Stream-generate a response from a list of chat messages."""
     if isinstance(model, FixtureModel):
@@ -122,6 +123,7 @@ def generate_stream(
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            **(chat_template_kwargs or {}),
         )
     else:
         prompt = "\n".join(f"{message['role']}: {message.get('content', '')}" for message in messages)

@@ -22,6 +22,7 @@ from daydream.config import (
     get_default_port,
 )
 from daydream.models import ensure_runtime_model, is_fixture_model
+from daydream.profiles import get_profile
 from daydream.registry import reverse_lookup
 
 console = Console()
@@ -31,10 +32,12 @@ def _api_base_url(host: str, port: int) -> str:
     return f"http://{host}:{port}/v1"
 
 
-def _print_client_setup(host: str, port: int, repo_id: str | None) -> None:
+def _print_client_setup(host: str, port: int, repo_id: str | None, *, profile_name: str | None = None) -> None:
     console.print("[bold]Client setup[/]")
     console.print(f"  Base URL: {_api_base_url(host, port)}")
     console.print("  API key:  daydream-local  [dim](any non-empty value works)[/dim]")
+    if profile_name:
+        console.print(f"  Custom:   {profile_name}  [dim](Daydream profile defaults are active)[/dim]")
     if repo_id:
         console.print(f"  Model:    {repo_id}")
         short = reverse_lookup(repo_id)
@@ -45,7 +48,16 @@ def _print_client_setup(host: str, port: int, repo_id: str | None) -> None:
     console.print()
 
 
-def _build_server_args(*, model=None, host="127.0.0.1", port=11434) -> argparse.Namespace:
+def _build_server_args(
+    *,
+    model=None,
+    host="127.0.0.1",
+    port=11434,
+    temp: float = 0.0,
+    top_p: float = 1.0,
+    max_tokens: int = 512,
+    chat_template_args: dict | None = None,
+) -> argparse.Namespace:
     """Build the argparse.Namespace that mlx_lm.server.ModelProvider expects."""
     return argparse.Namespace(
         model=model,
@@ -59,12 +71,12 @@ def _build_server_args(*, model=None, host="127.0.0.1", port=11434) -> argparse.
         log_level="INFO",
         chat_template="",
         use_default_chat_template=False,
-        temp=0.0,
-        top_p=1.0,
+        temp=temp,
+        top_p=top_p,
         top_k=0,
         min_p=0.0,
-        max_tokens=512,
-        chat_template_args={},
+        max_tokens=max_tokens,
+        chat_template_args=chat_template_args or {},
         decode_concurrency=32,
         prompt_concurrency=8,
         prefill_step_size=2048,
@@ -189,7 +201,15 @@ def _pid_is_running(pid: int) -> bool:
     return True
 
 
-def _write_server_state(*, pid: int, host: str, port: int, model: str | None, log_file: str | None) -> None:
+def _write_server_state(
+    *,
+    pid: int,
+    host: str,
+    port: int,
+    model: str | None,
+    log_file: str | None,
+    profile: str | None = None,
+) -> None:
     ensure_home()
     previous = _load_server_state() or {}
     if log_file is None and previous.get("pid") == pid:
@@ -199,6 +219,7 @@ def _write_server_state(*, pid: int, host: str, port: int, model: str | None, lo
         "host": host,
         "port": port,
         "model": model,
+        "profile": profile,
         "log_file": log_file,
         "started_at": time.time(),
     }
@@ -245,7 +266,16 @@ def _spawn_background_server(*, model: str | None, host: str, port: int) -> None
             env=os.environ.copy(),
         )
 
-    _write_server_state(pid=process.pid, host=host, port=port, model=model, log_file=str(SERVER_LOG_FILE))
+    profile_obj = get_profile(model) if model else None
+    profile_name = profile_obj.name if profile_obj else None
+    _write_server_state(
+        pid=process.pid,
+        host=host,
+        port=port,
+        model=model,
+        log_file=str(SERVER_LOG_FILE),
+        profile=profile_name,
+    )
 
     deadline = time.time() + 3.0
     while time.time() < deadline:
@@ -269,21 +299,32 @@ def _spawn_background_server(*, model: str | None, host: str, port: int) -> None
 
 def start_server(*, model=None, host="127.0.0.1", port=11434, detach: bool = False) -> None:
     """Start the OpenAI-compatible API server."""
-    repo_id = ensure_runtime_model(model, auto_pull=True, register_alias=True) if model else None
+    profile = get_profile(model) if model else None
+    source_model = profile.from_model if profile else model
+    repo_id = ensure_runtime_model(source_model, auto_pull=True, register_alias=True) if source_model else None
 
     if detach:
-        _spawn_background_server(model=repo_id, host=host, port=port)
+        _spawn_background_server(model=profile.name if profile else repo_id, host=host, port=port)
         return
 
-    short = reverse_lookup(repo_id) or model if repo_id else None
-    _write_server_state(pid=os.getpid(), host=host, port=port, model=repo_id, log_file=None)
+    short = profile.name if profile else reverse_lookup(repo_id) or model if repo_id else None
+    _write_server_state(
+        pid=os.getpid(),
+        host=host,
+        port=port,
+        model=repo_id,
+        log_file=None,
+        profile=profile.name if profile else None,
+    )
 
     console.print(f"[bold cyan]Daydream[/] server listening on [bold]http://{host}:{port}[/]")
     if short:
         console.print(f"Model: [bold]{short}[/] ({repo_id})")
+    if profile and profile.system:
+        console.print("[dim]System style in Daydreamfile is CLI-only. API clients should send their own system message.[/dim]")
     console.print(f"API:   [dim]{_api_base_url(host, port)}/chat/completions[/]")
     console.print()
-    _print_client_setup(host, port, repo_id)
+    _print_client_setup(host, port, repo_id, profile_name=profile.name if profile else None)
 
     try:
         if repo_id and is_fixture_model(repo_id):
@@ -292,7 +333,22 @@ def start_server(*, model=None, host="127.0.0.1", port=11434, detach: bool = Fal
 
         from mlx_lm.server import ModelProvider, run as mlx_server_run
 
-        args = _build_server_args(model=repo_id, host=host, port=port)
+        profile_parameters = profile.parameters if profile else {}
+        chat_template_args = {}
+        if profile_parameters.get("effort") == "instant":
+            chat_template_args = {"enable_thinking": False}
+        elif profile_parameters.get("effort") in {"short", "long"}:
+            chat_template_args = {"enable_thinking": True}
+
+        args = _build_server_args(
+            model=repo_id,
+            host=host,
+            port=port,
+            temp=float(profile_parameters.get("temperature", 0.0)),
+            top_p=float(profile_parameters.get("top_p", 1.0)),
+            max_tokens=int(profile_parameters.get("max_tokens", 512)),
+            chat_template_args=chat_template_args,
+        )
         provider = ModelProvider(args)
         mlx_server_run(host, port, provider)
     except KeyboardInterrupt:
@@ -332,6 +388,9 @@ def show_status() -> None:
     log_file = state.get("log_file")
     if log_file:
         console.print(f"  Log: {log_file}")
+    profile = state.get("profile")
+    if profile:
+        console.print(f"  Custom: {profile}")
 
     models_url = f"http://{host}:{port}/v1/models"
     data = _read_json_url(models_url, timeout=2) or {}

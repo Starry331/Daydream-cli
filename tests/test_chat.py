@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import time
 import unittest
 from unittest import mock
 
@@ -13,10 +14,13 @@ from daydream.chat import (
     _build_request_messages,
     _collect_multiline_message,
     _current_command_selection,
+    _drain_pending_escape,
+    _effort_chat_template_kwargs,
     _effort_system_prompt,
     _extract_visible_text,
     _is_down_key,
     _is_up_key,
+    _merge_escape_key,
     _matching_slash_commands,
     _model_supports_effort,
     _normalize_effort,
@@ -124,6 +128,26 @@ class ChatTests(unittest.TestCase):
         self.assertTrue(_is_down_key("\x1b[B"))
         self.assertTrue(_is_down_key("\x1b[1;5B"))
 
+    def test_pending_escape_sequence_merges_fragmented_arrow(self) -> None:
+        key, pending, started = _merge_escape_key("\x1b", "", None)
+        self.assertIsNone(key)
+        self.assertEqual(pending, "\x1b")
+
+        key, pending, started = _merge_escape_key("[", pending, started)
+        self.assertIsNone(key)
+        self.assertEqual(pending, "\x1b[")
+
+        key, pending, started = _merge_escape_key("B", pending, started)
+        self.assertEqual(key, "\x1b[B")
+        self.assertEqual(pending, "")
+        self.assertIsNone(started)
+
+    def test_pending_escape_drains_to_escape_after_timeout(self) -> None:
+        key, pending, started = _drain_pending_escape("\x1b", time.monotonic() - 0.2)
+        self.assertEqual(key, "\x1b")
+        self.assertEqual(pending, "")
+        self.assertIsNone(started)
+
     def test_effort_helpers_only_emit_prompts_for_supported_models(self) -> None:
         self.assertEqual(_normalize_effort("LONG"), "long")
         self.assertIsNone(_normalize_effort("medium"))
@@ -131,6 +155,10 @@ class ChatTests(unittest.TestCase):
         self.assertFalse(_model_supports_effort("mlx-community/SmolLM2-360M-Instruct-4bit"))
         self.assertIsNotNone(_effort_system_prompt("short", "mlx-community/Qwen3-8B-4bit"))
         self.assertIsNone(_effort_system_prompt("short", "mlx-community/SmolLM2-360M-Instruct-4bit"))
+        tokenizer = mock.Mock(has_thinking=True)
+        self.assertEqual(_effort_chat_template_kwargs("instant", tokenizer), {"enable_thinking": False})
+        self.assertEqual(_effort_chat_template_kwargs("long", tokenizer), {"enable_thinking": True})
+        self.assertEqual(_effort_chat_template_kwargs("default", tokenizer), {})
 
     def test_build_request_messages_includes_effort_system_prompt(self) -> None:
         request = _build_request_messages(

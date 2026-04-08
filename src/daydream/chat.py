@@ -7,6 +7,7 @@ import shutil
 import sys
 import re
 import termios
+import time
 import tty
 from contextlib import contextmanager
 from typing import Callable
@@ -174,21 +175,33 @@ def _model_supports_effort(model_name: str) -> bool:
     )
 
 
+def _effort_chat_template_kwargs(effort: str, tokenizer) -> dict:
+    if effort == "default":
+        return {}
+    has_thinking = bool(getattr(tokenizer, "has_thinking", False))
+    if not has_thinking:
+        return {}
+    if effort == "instant":
+        return {"enable_thinking": False}
+    return {"enable_thinking": True}
+
+
 def _effort_system_prompt(effort: str, model_name: str) -> str | None:
     if effort == "default" or not _model_supports_effort(model_name):
         return None
 
     prompts = {
         "instant": (
-            "Reasoning effort: instant. Think only briefly, skip exploratory detours, "
-            "and answer as soon as you have a solid result."
+            "Reasoning effort: instant. Answer directly. Do not emit a thinking block, "
+            "do not spend extra tokens on hidden reasoning, and get to the answer fast."
         ),
         "short": (
-            "Reasoning effort: short. Use a compact reasoning chain, then answer directly."
+            "Reasoning effort: short. If you reason, keep the reasoning compact and minimal "
+            "before answering."
         ),
         "long": (
-            "Reasoning effort: long. Spend more time reasoning, check edge cases, and only "
-            "then produce the final answer."
+            "Reasoning effort: long. Spend noticeably more time reasoning, explore edge cases, "
+            "and use a fuller thinking block before producing the final answer."
         ),
     }
     return prompts.get(effort)
@@ -229,16 +242,17 @@ def _read_key() -> str:
 
     fd = sys.stdin.fileno()
     sequence = first
-    # Arrow / function key escape sequences can arrive in multiple chunks,
-    # especially in Terminal.app. Give them a wider grace window than a lone Esc.
-    wait_until = 0.20
+    deadline = time.monotonic() + 0.35
 
-    if not select.select([fd], [], [], wait_until)[0]:
+    while time.monotonic() < deadline:
+        if select.select([fd], [], [], 0.01)[0]:
+            sequence += sys.stdin.read(1)
+            break
+    if len(sequence) == 1:
         return first
 
-    sequence += sys.stdin.read(1)
-    while True:
-        if select.select([fd], [], [], 0.02)[0]:
+    while time.monotonic() < deadline:
+        if select.select([fd], [], [], 0.03)[0]:
             char = sys.stdin.read(1)
             sequence += char
             if char.isalpha() or char == "~":
@@ -255,6 +269,41 @@ def _is_up_key(key: str) -> bool:
 
 def _is_down_key(key: str) -> bool:
     return key in ("j",) or (key.startswith("\x1b") and key.endswith("B"))
+
+
+def _drain_pending_escape(
+    pending_escape: str,
+    pending_started_at: float | None,
+) -> tuple[str | None, str, float | None]:
+    if not pending_escape or pending_started_at is None:
+        return None, pending_escape, pending_started_at
+    if time.monotonic() - pending_started_at < 0.12:
+        return None, pending_escape, pending_started_at
+    return pending_escape, "", None
+
+
+def _merge_escape_key(
+    raw_key: str,
+    pending_escape: str,
+    pending_started_at: float | None,
+) -> tuple[str | None, str, float | None]:
+    if not pending_escape:
+        if raw_key == "\x1b":
+            return None, raw_key, time.monotonic()
+        return raw_key, "", None
+
+    combined = pending_escape + raw_key
+    if pending_escape == "\x1b":
+        if raw_key in ("[", "O"):
+            return None, combined, pending_started_at
+        return raw_key, "", None
+
+    if pending_escape.startswith(("\x1b[", "\x1bO")):
+        if combined[-1].isalpha() or combined[-1] == "~":
+            return combined, "", None
+        return None, combined, pending_started_at
+
+    return raw_key, "", None
 
 
 def _render_input_state(
@@ -298,6 +347,8 @@ def _read_live_boxed_message() -> str:
     buffer = ""
     multiline = False
     selected_command: str | None = None
+    pending_escape = ""
+    pending_escape_started_at: float | None = None
 
     with _raw_stdin():
         renderer = _InlineTerminalRenderer(sys.stderr)
@@ -315,19 +366,33 @@ def _read_live_boxed_message() -> str:
                 )
             )
             while True:
+                pending_key, pending_escape, pending_escape_started_at = _drain_pending_escape(
+                    pending_escape,
+                    pending_escape_started_at,
+                )
                 matches, selected_command = _current_command_selection(
                     buffer,
                     selected_command,
                     multiline=multiline,
                 )
-                renderer.wait_for_input(
-                    _render_input_state(
-                        buffer,
-                        multiline=multiline,
-                        selected_command=selected_command,
+                if pending_key is None:
+                    renderer.wait_for_input(
+                        _render_input_state(
+                            buffer,
+                            multiline=multiline,
+                            selected_command=selected_command,
+                        )
                     )
-                )
-                key = _read_key()
+                    raw_key = _read_key()
+                    key, pending_escape, pending_escape_started_at = _merge_escape_key(
+                        raw_key,
+                        pending_escape,
+                        pending_escape_started_at,
+                    )
+                    if key is None:
+                        continue
+                else:
+                    key = pending_key
 
                 if _is_up_key(key) and matches:
                     names = [name for name, _ in matches]
@@ -468,16 +533,32 @@ def _select_effort(current: str, *, supported: bool) -> str:
 
     options = list(EFFORT_LEVELS)
     index = options.index(current)
+    pending_escape = ""
+    pending_escape_started_at: float | None = None
 
     with _raw_stdin():
         renderer = _InlineTerminalRenderer(sys.stderr)
         try:
             renderer.render(build_effort_menu_lines(current, options[index], supported=supported))
             while True:
-                renderer.wait_for_input(
-                    build_effort_menu_lines(current, options[index], supported=supported)
+                pending_key, pending_escape, pending_escape_started_at = _drain_pending_escape(
+                    pending_escape,
+                    pending_escape_started_at,
                 )
-                key = _read_key()
+                if pending_key is None:
+                    renderer.wait_for_input(
+                        build_effort_menu_lines(current, options[index], supported=supported)
+                    )
+                    raw_key = _read_key()
+                    key, pending_escape, pending_escape_started_at = _merge_escape_key(
+                        raw_key,
+                        pending_escape,
+                        pending_escape_started_at,
+                    )
+                    if key is None:
+                        continue
+                else:
+                    key = pending_key
                 if key in ("\r", "\n"):
                     break
                 if key in ("\x03",):
@@ -863,7 +944,18 @@ def _might_be_reasoning_line_start(text: str) -> bool:
     return bool(re.match(r"^\d+[\.\)]?$", sample))
 
 
-def _stream_response(model, tokenizer, messages, *, model_label, temp, top_p, max_tokens, verbose):
+def _stream_response(
+    model,
+    tokenizer,
+    messages,
+    *,
+    model_label,
+    temp,
+    top_p,
+    max_tokens,
+    verbose,
+    chat_template_kwargs: dict | None = None,
+):
     """Stream a response, collecting the full text. Returns (full_text, last_response, reasoning_text)."""
     full_text = ""
     last_response = None
@@ -876,6 +968,7 @@ def _stream_response(model, tokenizer, messages, *, model_label, temp, top_p, ma
         for response in engine.generate_stream(
             model, tokenizer, messages,
             max_tokens=max_tokens, temp=temp, top_p=top_p,
+            chat_template_kwargs=chat_template_kwargs,
         ):
             raw_chunk = response.text or ""
             text_chunk, reasoning_chunk, reasoning_closed = parser.feed(raw_chunk)
@@ -933,6 +1026,8 @@ def run_oneshot(
     max_tokens: int = 4096,
     system: str | None = None,
     verbose: bool = False,
+    initial_effort: str = "default",
+    display_name: str | None = None,
 ) -> None:
     """Run a single generation and exit."""
     # Read from stdin if no prompt given
@@ -949,15 +1044,20 @@ def run_oneshot(
     with err_console.status("Preparing model..."):
         model, tokenizer = engine.load_model(resolved_name, ensure_available=False)
 
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
+    base_messages = [{"role": "user", "content": prompt}]
+    request_messages = _build_request_messages(
+        base_messages,
+        system_prompt=system,
+        effort=initial_effort,
+        model_name=resolved_name,
+    )
+    chat_template_kwargs = _effort_chat_template_kwargs(initial_effort, tokenizer)
 
     _stream_response(
-        model, tokenizer, messages,
-        model_label=reverse_lookup(resolved_name) or model_name,
+        model, tokenizer, request_messages,
+        model_label=display_name or reverse_lookup(resolved_name) or model_name,
         temp=temp, top_p=top_p, max_tokens=max_tokens, verbose=verbose,
+        chat_template_kwargs=chat_template_kwargs,
     )
 
 
@@ -969,12 +1069,14 @@ def run_chat(
     max_tokens: int = 4096,
     system: str | None = None,
     verbose: bool = False,
+    initial_effort: str = "default",
+    display_name: str | None = None,
 ) -> None:
     """Run an interactive chat REPL."""
     repo_id = ensure_runtime_model(model_name, auto_pull=True, register_alias=True)
     with err_console.status("Preparing model..."):
         model, tokenizer = engine.load_model(repo_id, ensure_available=False)
-    short = reverse_lookup(repo_id) or model_name
+    short = display_name or reverse_lookup(repo_id) or model_name
 
     err_console.print(f"[bold cyan]{short}[/]")
     err_console.print("[dim]Use / for commands.[/dim]")
@@ -982,7 +1084,7 @@ def run_chat(
 
     messages: list[dict] = []
     last_reasoning = ""
-    effort = "default"
+    effort = initial_effort if initial_effort in EFFORT_LEVELS else "default"
     effort_supported = _model_supports_effort(repo_id)
 
     while True:
@@ -1035,11 +1137,13 @@ def run_chat(
             effort=effort,
             model_name=repo_id,
         )
+        chat_template_kwargs = _effort_chat_template_kwargs(effort, tokenizer)
 
         full_text, _, reasoning_text = _stream_response(
             model, tokenizer, request_messages,
             model_label=short,
             temp=temp, top_p=top_p, max_tokens=max_tokens, verbose=verbose,
+            chat_template_kwargs=chat_template_kwargs,
         )
         last_reasoning = reasoning_text
 
