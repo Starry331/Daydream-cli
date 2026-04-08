@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import io
+import os
 import unittest
 
 from daydream.utils import (
     _strip_ansi,
+    BottomTerminalRenderer,
     build_effort_menu_lines,
     build_input_box_lines,
     render_daydreaming_text,
@@ -55,6 +58,31 @@ class DaydreamingTextTests(unittest.TestCase):
         lines = build_effort_menu_lines("default", "long", supported=True)
         widths = {len(_strip_ansi(line)) for line in lines}
         self.assertEqual(len(widths), 1)
+
+    def test_bottom_terminal_renderer_clears_only_bottom_region_on_resize(self) -> None:
+        stream = io.StringIO()
+
+        class Renderer(BottomTerminalRenderer):
+            def __init__(self, stream):
+                super().__init__(stream, clear_on_finish=False)
+                self.rows = 24
+                self.cols = 96
+
+            def _terminal_size(self):
+                return os.terminal_size((self.cols, self.rows))
+
+        renderer = Renderer(stream)
+        renderer.render(["first", "second", "third"])
+        renderer.cols = 60
+        renderer.rows = 18
+        renderer.render(["first", "second", "third"])
+        renderer.finish()
+
+        output = stream.getvalue()
+        self.assertIn("\x1b[J", output)
+        self.assertNotIn("\x1b[2J", output)
+        self.assertIn("\x1b[22;1H", output)
+        self.assertIn("\x1b[16;1H", output)
 
 
 if __name__ == "__main__":

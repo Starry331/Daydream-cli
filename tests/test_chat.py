@@ -4,6 +4,7 @@ import io
 import os
 import time
 import unittest
+from contextlib import contextmanager
 from unittest import mock
 
 from rich.console import Console
@@ -25,6 +26,8 @@ from daydream.chat import (
     _model_supports_effort,
     _normalize_effort,
     _read_key,
+    _read_live_boxed_message,
+    _select_effort,
     run_oneshot,
 )
 
@@ -122,6 +125,64 @@ class ChatTests(unittest.TestCase):
         ):
             self.assertEqual(_read_key(), "\x1b[B")
 
+    def test_slash_menu_handles_fragmented_down_arrow_without_leaking_b(self) -> None:
+        @contextmanager
+        def fake_raw():
+            yield
+
+        class FakeRenderer:
+            def __init__(self, *_args, **_kwargs):
+                self.lines = []
+
+            def render(self, lines):
+                self.lines = list(lines)
+
+            def wait_for_input(self, _lines):
+                return
+
+            def finish(self):
+                return
+
+        with mock.patch("daydream.chat._raw_stdin", fake_raw), \
+            mock.patch("daydream.chat._InlineTerminalRenderer", FakeRenderer), \
+            mock.patch(
+                "daydream.chat._read_key",
+                side_effect=["/", "\x1b", "[", "B", "\r"],
+            ):
+            result = _read_live_boxed_message()
+
+        self.assertEqual(result, "/help")
+
+    def test_effort_menu_handles_fragmented_down_arrow_without_leaking_b(self) -> None:
+        @contextmanager
+        def fake_raw():
+            yield
+
+        class FakeRenderer:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def render(self, _lines):
+                return
+
+            def wait_for_input(self, _lines):
+                return
+
+            def finish(self):
+                return
+
+        with mock.patch("daydream.chat._raw_stdin", fake_raw), \
+            mock.patch("daydream.chat._InlineTerminalRenderer", FakeRenderer), \
+            mock.patch("daydream.chat.sys.stdin.isatty", return_value=True), \
+            mock.patch("daydream.chat.err_console", mock.Mock(is_terminal=True)), \
+            mock.patch(
+                "daydream.chat._read_key",
+                side_effect=["\x1b", "[", "B", "\r"],
+            ):
+            result = _select_effort("default", supported=True)
+
+        self.assertEqual(result, "long")
+
     def test_arrow_key_helpers_accept_modified_sequences(self) -> None:
         self.assertTrue(_is_up_key("\x1bOA"))
         self.assertTrue(_is_up_key("\x1b[1;2A"))
@@ -143,7 +204,7 @@ class ChatTests(unittest.TestCase):
         self.assertIsNone(started)
 
     def test_pending_escape_drains_to_escape_after_timeout(self) -> None:
-        key, pending, started = _drain_pending_escape("\x1b", time.monotonic() - 0.2)
+        key, pending, started = _drain_pending_escape("\x1b", time.monotonic() - 0.4)
         self.assertEqual(key, "\x1b")
         self.assertEqual(pending, "")
         self.assertIsNone(started)
@@ -193,7 +254,7 @@ class ChatTests(unittest.TestCase):
 
         output = stream.getvalue()
         self.assertIn("\x1b[J", output)
-        self.assertIn("\x1b[2J", output)
+        self.assertNotIn("\x1b[2J", output)
         self.assertIn("\x1b[?7l", output)
         self.assertIn("\x1b[?7h", output)
         self.assertIn("\x1b[22;1H", output)

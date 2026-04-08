@@ -4,6 +4,7 @@ import colorsys
 import math
 import random
 import re
+import select
 import shutil
 import sys
 import threading
@@ -11,9 +12,9 @@ import time
 import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from typing import Iterable
 
 from rich.console import Console, Group
-from rich.live import Live
 from rich.rule import Rule
 from rich.text import Text
 
@@ -634,7 +635,7 @@ class ConversationStatus:
         # Threading
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._live: Live | None = None
+        self._renderer: BottomTerminalRenderer | None = None
         self._lock = threading.Lock()
         self._title_animator = TerminalTitleAnimator("Daydreaming", frames=_TITLE_Z_FRAMES)
         self._rainbow = random.random() < _RAINBOW_PROBABILITY
@@ -687,13 +688,12 @@ class ConversationStatus:
         self._title_animator.start()
         if not self.console.is_terminal:
             return
-        self._live = Live(
-            self._render(),
-            console=self.console,
-            refresh_per_second=12,
-            transient=False,
+        self._renderer = BottomTerminalRenderer(
+            self.console.file,
+            clear_on_finish=False,
+            color_system=self.console.color_system or "truecolor",
         )
-        self._live.start()
+        self._renderer.render(self._render())
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -701,8 +701,8 @@ class ConversationStatus:
         while not self._stop.wait(0.08):
             with self._lock:
                 self._frame += 1
-            if self._live is not None:
-                self._live.update(self._render())
+            if self._renderer is not None:
+                self._renderer.render(self._render())
 
     def update(
         self,
@@ -720,8 +720,8 @@ class ConversationStatus:
                 self._waiting = waiting
                 if not waiting:
                     self._title_animator.stop()
-        if self._live is not None:
-            self._live.update(self._render())
+        if self._renderer is not None:
+            self._renderer.render(self._render())
 
     def ensure_minimum_wait(self, minimum_seconds: float) -> None:
         if self._started_at is None or self._reasoning_active:
@@ -738,8 +738,8 @@ class ConversationStatus:
                 self._reasoning_start = time.monotonic()
             self._had_reasoning = True
             self._phase = "thinking"
-        if self._live is not None:
-            self._live.update(self._render())
+        if self._renderer is not None:
+            self._renderer.render(self._render())
 
     def end_reasoning(self) -> None:
         with self._lock:
@@ -749,33 +749,128 @@ class ConversationStatus:
                 self._reasoning_elapsed = (self._reasoning_elapsed or 0.0) + elapsed
                 self._reasoning_start = None
         self._title_animator.stop()
-        if self._live is not None:
-            self._live.update(self._render())
+        if self._renderer is not None:
+            self._renderer.render(self._render())
 
     def append_reasoning(self, text: str) -> None:
         if not text:
             return
         with self._lock:
             self._reasoning_text += text
-        if self._live is not None:
-            self._live.update(self._render())
+        if self._renderer is not None:
+            self._renderer.render(self._render())
 
     def append_output(self, text: str) -> None:
         if not text:
             return
         with self._lock:
             self._output += text
-        if self._live is not None:
-            self._live.update(self._render())
+        if self._renderer is not None:
+            self._renderer.render(self._render())
 
     def stop(self) -> None:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=0.2)
-        if self._live is not None:
-            self._live.update(self._render())
-            self._live.stop()
+        if self._renderer is not None:
+            self._renderer.render(self._render())
+            self._renderer.finish()
         self._title_animator.stop()
+
+
+class BottomTerminalRenderer:
+    def __init__(
+        self,
+        stream,
+        *,
+        clear_on_finish: bool = True,
+        color_system: str | None = "truecolor",
+    ) -> None:
+        self.stream = stream
+        self._clear_on_finish = clear_on_finish
+        self._color_system = color_system
+        self._line_count = 0
+        self._cursor_hidden = False
+        self._wrap_disabled = False
+        self._start_row: int | None = None
+        self._last_size = shutil.get_terminal_size(fallback=(96, 24))
+
+    def _terminal_size(self):
+        return shutil.get_terminal_size(fallback=(96, 24))
+
+    def _move_to(self, row: int, col: int = 1) -> None:
+        self.stream.write(f"\x1b[{row};{col}H")
+
+    def _clear_from(self, row: int) -> None:
+        self._move_to(max(1, row))
+        self.stream.write("\x1b[J")
+
+    def _renderable_to_lines(self, renderable: list[str] | Iterable[str] | object) -> list[str]:
+        if isinstance(renderable, list) and all(isinstance(line, str) for line in renderable):
+            return renderable or [""]
+
+        size = self._terminal_size()
+        render_console = Console(
+            force_terminal=True,
+            color_system=self._color_system,
+            legacy_windows=False,
+            width=max(20, size.columns),
+        )
+        options = render_console.options.update(width=max(20, size.columns))
+        rendered_lines = render_console.render_lines(renderable, options=options, pad=False, new_lines=False)
+        lines: list[str] = []
+        for line in rendered_lines:
+            lines.append(render_console._render_buffer(line))
+        return lines or [""]
+
+    def render(self, renderable: list[str] | Iterable[str] | object) -> None:
+        if not self._cursor_hidden:
+            self.stream.write("\x1b[?25l")
+            self._cursor_hidden = True
+        if not self._wrap_disabled:
+            self.stream.write("\x1b[?7l")
+            self._wrap_disabled = True
+
+        lines = self._renderable_to_lines(renderable)
+        size = self._terminal_size()
+        start_row = max(1, size.lines - len(lines) + 1)
+        clear_from = start_row if self._start_row is None else min(self._start_row, start_row)
+        self._clear_from(clear_from)
+
+        for index, line in enumerate(lines):
+            self._move_to(start_row + index)
+            self.stream.write("\x1b[2K")
+            self.stream.write(line)
+
+        self.stream.flush()
+        self._start_row = start_row
+        self._line_count = len(lines)
+        self._last_size = size
+
+    def wait_for_input(self, renderable: list[str] | Iterable[str] | object) -> None:
+        fd = sys.stdin.fileno()
+        while True:
+            ready, _, _ = select.select([fd], [], [], 0.05)
+            size = self._terminal_size()
+            if size != self._last_size:
+                self.render(renderable)
+                continue
+            if ready:
+                return
+
+    def finish(self) -> None:
+        if self._line_count and self._start_row is not None and self._clear_on_finish:
+            self._clear_from(self._start_row)
+            self._move_to(self._start_row)
+        if self._cursor_hidden:
+            self.stream.write("\x1b[?25h")
+            self._cursor_hidden = False
+        if self._wrap_disabled:
+            self.stream.write("\x1b[?7h")
+            self._wrap_disabled = False
+        self.stream.flush()
+        self._line_count = 0
+        self._start_row = None
 
 
 @contextmanager

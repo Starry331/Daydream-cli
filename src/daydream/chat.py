@@ -18,6 +18,7 @@ from daydream import engine
 from daydream.models import ensure_runtime_model
 from daydream.registry import reverse_lookup
 from daydream.utils import (
+    BottomTerminalRenderer,
     build_effort_menu_lines,
     build_input_box_lines,
     daydreaming_status,
@@ -242,17 +243,17 @@ def _read_key() -> str:
 
     fd = sys.stdin.fileno()
     sequence = first
-    deadline = time.monotonic() + 0.35
+    deadline = time.monotonic() + 0.65
 
     while time.monotonic() < deadline:
-        if select.select([fd], [], [], 0.01)[0]:
+        if select.select([fd], [], [], 0.04)[0]:
             sequence += sys.stdin.read(1)
             break
     if len(sequence) == 1:
         return first
 
     while time.monotonic() < deadline:
-        if select.select([fd], [], [], 0.03)[0]:
+        if select.select([fd], [], [], 0.12)[0]:
             char = sys.stdin.read(1)
             sequence += char
             if char.isalpha() or char == "~":
@@ -277,7 +278,7 @@ def _drain_pending_escape(
 ) -> tuple[str | None, str, float | None]:
     if not pending_escape or pending_started_at is None:
         return None, pending_escape, pending_started_at
-    if time.monotonic() - pending_started_at < 0.12:
+    if time.monotonic() - pending_started_at < 0.35:
         return None, pending_escape, pending_started_at
     return pending_escape, "", None
 
@@ -492,6 +493,9 @@ def _read_live_boxed_message() -> str:
                 if key.startswith("\x1b"):
                     continue
 
+                if matches and key in ("A", "B", "C", "D", "[", "O"):
+                    continue
+
                 if key == "\t":
                     if matches and selected_command is not None:
                         buffer = selected_command
@@ -571,6 +575,8 @@ def _select_effort(current: str, *, supported: bool) -> str:
                     index = (index - 1) % len(options)
                 elif _is_down_key(key):
                     index = (index + 1) % len(options)
+                elif key in ("A", "B", "C", "D", "[", "O"):
+                    continue
                 elif key in ("1", "2", "3", "4"):
                     index = int(key) - 1
                 renderer.render(build_effort_menu_lines(current, options[index], supported=supported))
@@ -581,94 +587,9 @@ def _select_effort(current: str, *, supported: bool) -> str:
     return options[index]
 
 
-class _InlineTerminalRenderer:
+class _InlineTerminalRenderer(BottomTerminalRenderer):
     def __init__(self, stream) -> None:
-        self.stream = stream
-        self._line_count = 0
-        self._cursor_hidden = False
-        self._wrap_disabled = False
-        self._start_row: int | None = None
-        self._last_size = shutil.get_terminal_size(fallback=(96, 24))
-
-    def _terminal_size(self):
-        return shutil.get_terminal_size(fallback=(96, 24))
-
-    def _terminal_rows(self) -> int:
-        return self._terminal_size().lines
-
-    def _clear_screen_from(self, start_row: int) -> None:
-        self._move_to(start_row)
-        self.stream.write("\x1b[J")
-
-    def _move_to(self, row: int, col: int = 1) -> None:
-        self.stream.write(f"\x1b[{row};{col}H")
-
-    def _clear_region(self, start_row: int, count: int) -> None:
-        if count <= 0:
-            return
-        terminal_rows = self._terminal_rows()
-        for offset in range(count):
-            row = start_row + offset
-            if row < 1 or row > terminal_rows:
-                continue
-            self._move_to(row)
-            self.stream.write("\x1b[2K")
-
-    def render(self, lines: list[str]) -> None:
-        if not self._cursor_hidden:
-            self.stream.write("\x1b[?25l")
-            self._cursor_hidden = True
-        if not self._wrap_disabled:
-            self.stream.write("\x1b[?7l")
-            self._wrap_disabled = True
-
-        size = self._terminal_size()
-        rows = size.lines
-        start_row = max(1, rows - len(lines) + 1)
-        width_shrank = size.columns < self._last_size.columns
-        height_shrank = size.lines < self._last_size.lines
-        if width_shrank or height_shrank:
-            self._move_to(1)
-            self.stream.write("\x1b[2J")
-        clear_from = start_row if self._start_row is None else min(self._start_row, start_row)
-        clear_from = max(1, clear_from - 2)
-        self._clear_screen_from(clear_from)
-
-        for index, line in enumerate(lines):
-            self._move_to(start_row + index)
-            self.stream.write("\x1b[2K")
-            self.stream.write(line)
-        self.stream.flush()
-        self._start_row = start_row
-        self._line_count = len(lines)
-        self._last_size = size
-
-    def wait_for_input(self, lines: list[str]) -> None:
-        fd = sys.stdin.fileno()
-        while True:
-            ready, _, _ = select.select([fd], [], [], 0.05)
-            size = self._terminal_size()
-            if size != self._last_size:
-                self.render(lines)
-                continue
-            if ready:
-                return
-
-    def finish(self) -> None:
-        if self._line_count:
-            if self._start_row is not None:
-                self._clear_screen_from(self._start_row)
-                self._move_to(self._start_row)
-            self.stream.flush()
-            self._line_count = 0
-            self._start_row = None
-        if self._cursor_hidden:
-            self.stream.write("\x1b[?25h")
-            if self._wrap_disabled:
-                self.stream.write("\x1b[?7h")
-                self._wrap_disabled = False
-            self.stream.flush()
-            self._cursor_hidden = False
+        super().__init__(stream, clear_on_finish=True)
 
 
 class _ReasoningParser:
