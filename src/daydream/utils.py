@@ -35,6 +35,7 @@ _C_GLOW = "#b8e6ff"
 _C_WHITE = "#e0f2ff"
 _C_REASON = "#6b7b8d"
 _RAINBOW_PROBABILITY = 0.33
+_DREAM_WORDS = ("Daydreaming", "Imagining", "Floating", "Wandering", "Rêvant")
 
 # Title Z frames (single cluster)
 _TITLE_Z_FRAMES = ("z", "zz", "zzz", "zz", "z", "zz", "zzz", "zz")
@@ -309,10 +310,20 @@ def _brightness_to_color(b: float) -> str:
     return _mix_color(_C_BRIGHT, _C_GLOW, (b - 0.75) / 0.25)
 
 
+def choose_dream_word() -> str:
+    """Pick the animated dream word with equal probability."""
+    return random.choice(_DREAM_WORDS)
+
+
 # ── Render functions ───────────────────────────────────────────────────
 
-def render_daydreaming_text(frame: int = 0, *, rainbow: bool = False) -> Text:
-    """Render a dreamy Z cluster, a sweeping Daydreaming glow, and pulsing dots."""
+def render_daydreaming_text(
+    frame: int = 0,
+    *,
+    rainbow: bool = False,
+    label: str = "Daydreaming",
+) -> Text:
+    """Render a dreamy Z cluster, a sweeping glow word, and pulsing dots."""
     text = Text()
     text.append("  ")
 
@@ -350,8 +361,8 @@ def render_daydreaming_text(frame: int = 0, *, rainbow: bool = False) -> Text:
 
     text.append("  ")
 
-    # ── "Daydreaming" with left-to-right sweep glow ──
-    word = "Daydreaming"
+    # ── animated word with left-to-right sweep glow ──
+    word = label
     sweep_cycle = 22.0
     trail_width = 4.4
     core_width = 1.6
@@ -418,7 +429,13 @@ def render_frame_rule(title=None) -> Rule:
     return Rule(title, style="grey27")
 
 
-def render_reasoning_box(reasoning_text: str, frame: int, *, rainbow: bool = False) -> Group:
+def render_reasoning_box(
+    reasoning_text: str,
+    frame: int,
+    *,
+    rainbow: bool = False,
+    label: str = "Daydreaming",
+) -> Group:
     """Render a framed reasoning box with animated header and clipped body."""
     normalized = reasoning_text.replace("\r\n", "\n").replace("\r", "\n")
     lines = normalized.split("\n")
@@ -432,7 +449,7 @@ def render_reasoning_box(reasoning_text: str, frame: int, *, rainbow: bool = Fal
 
     body = Text("\n".join(visible_lines), style=f"dim {_C_REASON}")
     return Group(
-        render_frame_rule(render_daydreaming_text(frame, rainbow=rainbow)),
+        render_frame_rule(render_daydreaming_text(frame, rainbow=rainbow, label=label)),
         body,
         render_frame_rule(),
     )
@@ -637,7 +654,8 @@ class ConversationStatus:
         self._thread: threading.Thread | None = None
         self._renderer: BottomTerminalRenderer | None = None
         self._lock = threading.Lock()
-        self._title_animator = TerminalTitleAnimator("Daydreaming", frames=_TITLE_Z_FRAMES)
+        self._dream_word = choose_dream_word()
+        self._title_animator = TerminalTitleAnimator(self._dream_word, frames=_TITLE_Z_FRAMES)
         self._rainbow = random.random() < _RAINBOW_PROBABILITY
 
     def _reasoning_time(self) -> float:
@@ -655,10 +673,11 @@ class ConversationStatus:
                     self._reasoning_text,
                     self._frame,
                     rainbow=self._rainbow,
+                    label=self._dream_word,
                 ))
                 parts.append(Text())
             elif self._waiting and not self._had_reasoning:
-                parts.append(render_reasoning_box("", self._frame, rainbow=self._rainbow))
+                parts.append(render_reasoning_box("", self._frame, rainbow=self._rainbow, label=self._dream_word))
                 parts.append(Text())
             else:
                 # ── Reasoning summary (if model used thinking) ──

@@ -7,8 +7,10 @@ import unittest
 from daydream.utils import (
     _strip_ansi,
     BottomTerminalRenderer,
+    _DREAM_WORDS,
     build_effort_menu_lines,
     build_input_box_lines,
+    choose_dream_word,
     render_daydreaming_text,
     render_status_footer,
     render_title_text,
@@ -18,14 +20,23 @@ from daydream.utils import (
 class DaydreamingTextTests(unittest.TestCase):
     def test_render_daydreaming_text_contains_label(self) -> None:
         rendered = render_daydreaming_text(2)
-        self.assertIn("Daydreaming", rendered.plain)
+        self.assertTrue(any(word in rendered.plain for word in _DREAM_WORDS))
 
     def test_render_daydreaming_text_cycles_z_cluster(self) -> None:
         counts = []
         for frame in (0, 12, 24, 36):
-            rendered = render_daydreaming_text(frame)
-            counts.append(rendered.plain.split("Daydreaming", 1)[0].count("Z"))
+            rendered = render_daydreaming_text(frame, label="Imagining")
+            counts.append(rendered.plain.split("Imagining", 1)[0].count("Z"))
         self.assertEqual(counts, [1, 2, 3, 0])
+
+    def test_choose_dream_word_returns_supported_values(self) -> None:
+        for _ in range(20):
+            self.assertIn(choose_dream_word(), _DREAM_WORDS)
+
+    def test_render_daydreaming_text_keeps_dots_when_label_changes(self) -> None:
+        rendered = render_daydreaming_text(6, label="Rêvant")
+        self.assertIn("Rêvant", rendered.plain)
+        self.assertTrue(rendered.plain.endswith("···"))
 
     def test_render_title_text_contains_label(self) -> None:
         rendered = render_title_text("Downloading model", 3)
