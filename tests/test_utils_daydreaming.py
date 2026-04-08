@@ -12,6 +12,7 @@ class DaydreamingTextTests(unittest.TestCase):
 
     def test_render_title_text_contains_label(self) -> None:
         rendered = render_title_text("Downloading model", 3)
+        self.assertIn("Daydream CLI", rendered)
         self.assertIn("Downloading model", rendered)
 
 

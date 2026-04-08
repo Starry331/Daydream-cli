@@ -12,7 +12,7 @@ from rich.live import Live
 from rich.text import Text
 
 SPINNER_FRAMES = ("◜", "◠", "◝", "◞", "◡", "◟")
-DEFAULT_TERMINAL_TITLE = "Daydream"
+DEFAULT_TERMINAL_TITLE = "Daydream CLI"
 
 
 def format_size(size_bytes: int) -> str:
@@ -120,7 +120,7 @@ def render_daydreaming_text(frame: int = 0, *, rainbow: bool = False) -> Text:
 
 def render_title_text(label: str, frame: int = 0) -> str:
     spinner = SPINNER_FRAMES[frame % len(SPINNER_FRAMES)]
-    return f"{spinner} {label}"
+    return f"{spinner} Daydream CLI — {label}"
 
 
 def _title_stream():
