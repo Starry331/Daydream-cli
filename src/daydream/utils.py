@@ -166,17 +166,15 @@ def _wrap_display_text(text: str, width: int) -> list[str]:
 
 def _chat_frame_width() -> tuple[int, int]:
     columns = shutil.get_terminal_size(fallback=(96, 24)).columns
-    frame_width = min(92, max(56, columns - 8))
+    frame_width = min(88, max(52, columns - 12))
     indent = max(0, (columns - frame_width) // 2)
     return frame_width, indent
 
 
-def _frame_line(label: str, frame_width: int, indent: int, *, top: bool) -> str:
-    left_corner = "╭" if top else "╰"
-    right_corner = "╮" if top else "╯"
-    prefix = f"{left_corner}─ {label} "
-    fill = max(0, frame_width - _display_width(prefix) - 1)
-    return (" " * indent) + prefix + ("─" * fill) + right_corner
+def _frame_line(label: str, frame_width: int, indent: int) -> str:
+    prefix = f"── {label} "
+    fill = max(0, frame_width - _display_width(prefix))
+    return (" " * indent) + prefix + ("─" * fill)
 
 
 def build_input_box_lines(
@@ -187,34 +185,34 @@ def build_input_box_lines(
     multiline: bool = False,
 ) -> list[str]:
     frame_width, indent = _chat_frame_width()
-    text_width = frame_width - 4
+    text_width = frame_width
     pad = " " * indent
 
-    rendered = [_frame_line("Chat", frame_width, indent, top=True)]
+    rendered = [_frame_line("Chat", frame_width, indent)]
     source_lines = lines or [""]
 
     for index, line in enumerate(source_lines):
         if index == 0 and not line:
             content = _fit_display_width(placeholder, text_width)
-            rendered.append(f"{pad}│ {_DIM}{content}{_RESET} │")
+            rendered.append(f"{pad}{_DIM}{content}{_RESET}")
             continue
 
         wrapped = _wrap_display_text(line or "", text_width)
         for segment in wrapped:
-            rendered.append(f"{pad}│ {_fit_display_width(segment, text_width)} │")
+            rendered.append(f"{pad}{_fit_display_width(segment, text_width)}")
 
     if command_rows:
-        rendered.append(f"{pad}│ {_fit_display_width('', text_width)} │")
-        rendered.append(f"{pad}│ {_DIM}{_fit_display_width('Commands', text_width)}{_RESET} │")
+        rendered.append(f"{pad}{' ' * text_width}")
+        rendered.append(f"{pad}{_DIM}{_fit_display_width('Commands', text_width)}{_RESET}")
         for name, description in command_rows:
             row = _fit_display_width(f"{name:<9} {description}", text_width)
-            rendered.append(f"{pad}│ {_DIM}{row}{_RESET} │")
+            rendered.append(f"{pad}{_DIM}{row}{_RESET}")
     elif multiline:
-        rendered.append(f"{pad}│ {_fit_display_width('', text_width)} │")
+        rendered.append(f"{pad}{' ' * text_width}")
         hint = _fit_display_width('Multiline mode · End with """', text_width)
-        rendered.append(f"{pad}│ {_DIM}{hint}{_RESET} │")
+        rendered.append(f"{pad}{_DIM}{hint}{_RESET}")
 
-    rendered.append(_frame_line("Send", frame_width, indent, top=False))
+    rendered.append(_frame_line("Send", frame_width, indent))
     return rendered
 
 
@@ -225,9 +223,9 @@ def build_effort_menu_lines(
     supported: bool,
 ) -> list[str]:
     frame_width, indent = _chat_frame_width()
-    text_width = frame_width - 4
+    text_width = frame_width
     pad = " " * indent
-    lines = [_frame_line("Reasoning Effort", frame_width, indent, top=True)]
+    lines = [_frame_line("Reasoning Effort", frame_width, indent)]
 
     for option in ("instant", "short", "default", "long"):
         marker = "› " if option == selected else "  "
@@ -237,32 +235,34 @@ def build_effort_menu_lines(
             content = f"{_BOLD}{content}{_RESET}"
         elif option == current:
             content = f"{_DIM}{content}{_RESET}"
-        lines.append(f"{pad}│ {content} │")
+        lines.append(f"{pad}{content}")
 
-    lines.append(f"{pad}│ {_fit_display_width('', text_width)} │")
+    lines.append(f"{pad}{' ' * text_width}")
     hint = _fit_display_width("Use ↑/↓ or j/k · Enter to apply · Esc to cancel", text_width)
-    lines.append(f"{pad}│ {_DIM}{hint}{_RESET} │")
+    lines.append(f"{pad}{_DIM}{hint}{_RESET}")
     if not supported:
         note = _fit_display_width("This model may ignore effort controls.", text_width)
-        lines.append(f"{pad}│ {_DIM}{note}{_RESET} │")
-    lines.append(_frame_line("Apply", frame_width, indent, top=False))
+        lines.append(f"{pad}{_DIM}{note}{_RESET}")
+    lines.append(_frame_line("Apply", frame_width, indent))
     return lines
 
 
 def _z_length_value(frame: int) -> float:
-    """Animated visible cluster length in [1, 3]."""
+    """Animated cluster length in [0, 3] with Z -> ZZ -> ZZZ -> blank."""
     phase = (frame % _Z_CYCLE) / _Z_CYCLE
+    if phase < 0.25:
+        return 1.0
     if phase < 0.5:
-        t = _smoothstep(phase / 0.5)
-        return 1.0 + 2.0 * t
-    t = _smoothstep((phase - 0.5) / 0.5)
-    return 3.0 - 2.0 * t
+        return 2.0
+    if phase < 0.75:
+        return 3.0
+    return 0.0
 
 
 def _z_slot_brightness(frame: int, slot: int) -> float:
     """Brightness [0, 1] for a single Z slot in the evolving cluster."""
     length_value = _z_length_value(frame)
-    activation = max(0.0, min(1.0, length_value - slot))
+    activation = 1.0 if slot < int(length_value) else 0.0
     if activation <= 0.0:
         return 0.0
 
@@ -270,7 +270,7 @@ def _z_slot_brightness(frame: int, slot: int) -> float:
     breathe = 0.08 * _smoothstep(breathe_wave)
     shimmer_wave = 0.5 + 0.5 * math.sin((frame / 5.4) + slot * 1.15)
     shimmer = 0.06 * (_smoothstep(shimmer_wave) - 0.5)
-    brightness = 0.62 + 0.28 * activation + breathe + shimmer
+    brightness = 0.58 + 0.32 * activation + breathe + shimmer
     return max(0.0, min(1.0, brightness))
 
 
