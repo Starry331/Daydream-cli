@@ -360,44 +360,50 @@ class _InlineTerminalRenderer:
         self.stream = stream
         self._line_count = 0
         self._cursor_hidden = False
+        self._anchor_set = False
 
     def render(self, lines: list[str]) -> None:
         if not self._cursor_hidden:
             self.stream.write("\x1b[?25l")
             self._cursor_hidden = True
-        if self._line_count:
-            self.stream.write("\r")
-            if self._line_count > 1:
-                self.stream.write(f"\x1b[{self._line_count - 1}A")
-            for index in range(self._line_count):
-                self.stream.write("\x1b[2K")
-                if index < self._line_count - 1:
-                    self.stream.write("\n")
-            self.stream.write("\r")
-            if self._line_count > 1:
-                self.stream.write(f"\x1b[{self._line_count - 1}A")
-        self.stream.write("\n".join(lines))
+        if not self._anchor_set:
+            self.stream.write("\x1b7")
+            self._anchor_set = True
+        else:
+            self.stream.write("\x1b8")
+
+        clear_count = max(self._line_count, len(lines))
+        for index in range(clear_count):
+            self.stream.write("\r\x1b[2K")
+            if index < clear_count - 1:
+                self.stream.write("\r\n")
+
+        self.stream.write("\x1b8")
+        for index, line in enumerate(lines):
+            self.stream.write("\r\x1b[2K")
+            self.stream.write(line)
+            if index < len(lines) - 1:
+                self.stream.write("\r\n")
         self.stream.flush()
         self._line_count = len(lines)
 
     def finish(self) -> None:
         if self._line_count:
-            self.stream.write("\r")
-            if self._line_count > 1:
-                self.stream.write(f"\x1b[{self._line_count - 1}A")
+            if self._anchor_set:
+                self.stream.write("\x1b8")
             for index in range(self._line_count):
-                self.stream.write("\x1b[2K")
+                self.stream.write("\r\x1b[2K")
                 if index < self._line_count - 1:
-                    self.stream.write("\n")
-            self.stream.write("\r")
-            if self._line_count > 1:
-                self.stream.write(f"\x1b[{self._line_count - 1}A")
+                    self.stream.write("\r\n")
+            if self._anchor_set:
+                self.stream.write("\x1b8")
             self.stream.flush()
             self._line_count = 0
         if self._cursor_hidden:
             self.stream.write("\x1b[?25h")
             self.stream.flush()
             self._cursor_hidden = False
+        self._anchor_set = False
 
 
 class _ReasoningParser:
