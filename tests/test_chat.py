@@ -129,6 +129,18 @@ class ChatTests(unittest.TestCase):
         ):
             self.assertEqual(_read_key(), "\x1b[B")
 
+    def test_read_key_decodes_utf8_multibyte_input(self) -> None:
+        stdin = mock.Mock()
+        stdin.fileno.return_value = 0
+        with mock.patch("daydream.chat.sys.stdin", stdin), mock.patch(
+            "daydream.chat.os.read",
+            side_effect=[b"\xe4", b"\xbd\xa0"],
+        ), mock.patch(
+            "daydream.chat.select.select",
+            side_effect=[([0], [], [])],
+        ):
+            self.assertEqual(_read_key(), "你")
+
     def test_slash_menu_handles_fragmented_down_arrow_without_leaking_b(self) -> None:
         @contextmanager
         def fake_raw():

@@ -239,7 +239,32 @@ def _raw_stdin():
 
 def _read_key() -> str:
     fd = sys.stdin.fileno()
-    first = os.read(fd, 1).decode("utf-8", errors="ignore")
+    first_byte = os.read(fd, 1)
+    if not first_byte:
+        return ""
+
+    if first_byte != b"\x1b":
+        expected_length = 1
+        value = first_byte[0]
+        if value & 0b11110000 == 0b11110000:
+            expected_length = 4
+        elif value & 0b11100000 == 0b11100000:
+            expected_length = 3
+        elif value & 0b11000000 == 0b11000000:
+            expected_length = 2
+
+        data = bytearray(first_byte)
+        deadline = time.monotonic() + 0.1
+        while len(data) < expected_length and time.monotonic() < deadline:
+            if not select.select([fd], [], [], 0.01)[0]:
+                continue
+            chunk = os.read(fd, expected_length - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+        return data.decode("utf-8", errors="ignore")
+
+    first = "\x1b"
     if first != "\x1b":
         return first
 
