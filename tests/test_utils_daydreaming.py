@@ -17,6 +17,13 @@ class DaydreamingTextTests(unittest.TestCase):
         rendered = render_daydreaming_text(2)
         self.assertIn("Daydreaming", rendered.plain)
 
+    def test_render_daydreaming_text_cycles_z_cluster(self) -> None:
+        counts = []
+        for frame in (0, 12, 24, 36):
+            rendered = render_daydreaming_text(frame)
+            counts.append(rendered.plain.split("Daydreaming", 1)[0].count("Z"))
+        self.assertEqual(counts, [1, 2, 3, 0])
+
     def test_render_title_text_contains_label(self) -> None:
         rendered = render_title_text("Downloading model", 3)
         self.assertIn("Daydream CLI", rendered)
@@ -33,10 +40,15 @@ class DaydreamingTextTests(unittest.TestCase):
         self.assertIn("prefill", rendered.plain)
 
     def test_build_input_box_lines_have_consistent_width(self) -> None:
-        lines = build_input_box_lines(["/"], command_rows=[("/effort", "adjust reasoning depth")])
+        lines = build_input_box_lines(
+            ["/"],
+            command_rows=[("/effort", "adjust reasoning depth")],
+            selected_command="/effort",
+        )
         widths = {len(_strip_ansi(line)) for line in lines}
         self.assertEqual(len(widths), 1)
-        self.assertTrue(lines[-1].startswith("━"))
+        self.assertIn("› /effort", _strip_ansi("".join(lines)))
+        self.assertTrue(lines[-1].startswith("_"))
         self.assertNotIn("Send", "".join(lines))
 
     def test_build_effort_menu_lines_have_consistent_width(self) -> None:

@@ -21,6 +21,7 @@ from daydream.utils import (
     build_input_box_lines,
     daydreaming_status,
     render_expanded_reasoning,
+    render_input_box,
 )
 
 console = Console()
@@ -230,15 +231,23 @@ def _read_key() -> str:
     if not select.select([fd], [], [], 0.02)[0]:
         return first
     second = sys.stdin.read(1)
-    if second != "[":
+    if second not in ("[", "O"):
         return first + second
-    if not select.select([fd], [], [], 0.02)[0]:
-        return first + second
-    third = sys.stdin.read(1)
-    return f"\x1b[{third}"
+    sequence = first + second
+    while select.select([fd], [], [], 0.02)[0]:
+        char = sys.stdin.read(1)
+        sequence += char
+        if char.isalpha() or char == "~":
+            break
+    return sequence
 
 
-def _render_input_state(buffer: str, *, multiline: bool) -> object:
+def _render_input_state(
+    buffer: str,
+    *,
+    multiline: bool,
+    selected_command: str | None = None,
+) -> object:
     normalized = buffer.replace("\r\n", "\n").replace("\r", "\n")
     lines = normalized.split("\n")
     if normalized.endswith("\n"):
@@ -247,24 +256,94 @@ def _render_input_state(buffer: str, *, multiline: bool) -> object:
     return build_input_box_lines(
         lines,
         command_rows=command_rows,
+        selected_command=selected_command,
         placeholder="Type a message or / for commands",
         multiline=multiline,
     )
 
 
+def _current_command_selection(
+    buffer: str,
+    current_selection: str | None,
+    *,
+    multiline: bool,
+) -> tuple[list[tuple[str, str]], str | None]:
+    if multiline:
+        return [], None
+    matches = _matching_slash_commands(buffer)
+    if not matches:
+        return [], None
+    names = [name for name, _ in matches]
+    if current_selection in names:
+        return matches, current_selection
+    return matches, names[0]
+
+
 def _read_live_boxed_message() -> str:
     buffer = ""
     multiline = False
+    selected_command: str | None = None
 
     with _raw_stdin():
         renderer = _InlineTerminalRenderer(sys.stderr)
         try:
-            renderer.render(_render_input_state(buffer, multiline=multiline))
+            matches, selected_command = _current_command_selection(
+                buffer,
+                selected_command,
+                multiline=multiline,
+            )
+            renderer.render(
+                _render_input_state(
+                    buffer,
+                    multiline=multiline,
+                    selected_command=selected_command,
+                )
+            )
             while True:
-                renderer.wait_for_input(_render_input_state(buffer, multiline=multiline))
+                matches, selected_command = _current_command_selection(
+                    buffer,
+                    selected_command,
+                    multiline=multiline,
+                )
+                renderer.wait_for_input(
+                    _render_input_state(
+                        buffer,
+                        multiline=multiline,
+                        selected_command=selected_command,
+                    )
+                )
                 key = _read_key()
 
+                if key in ("\x1b[A", "\x1bOA", "k") and matches:
+                    names = [name for name, _ in matches]
+                    index = names.index(selected_command) if selected_command in names else 0
+                    selected_command = names[(index - 1) % len(names)]
+                    renderer.render(
+                        _render_input_state(
+                            buffer,
+                            multiline=multiline,
+                            selected_command=selected_command,
+                        )
+                    )
+                    continue
+
+                if key in ("\x1b[B", "\x1bOB", "j") and matches:
+                    names = [name for name, _ in matches]
+                    index = names.index(selected_command) if selected_command in names else 0
+                    selected_command = names[(index + 1) % len(names)]
+                    renderer.render(
+                        _render_input_state(
+                            buffer,
+                            multiline=multiline,
+                            selected_command=selected_command,
+                        )
+                    )
+                    continue
+
                 if key in ("\r", "\n"):
+                    if not multiline and matches and selected_command is not None:
+                        buffer = selected_command
+                        break
                     current_line = buffer.split("\n")[-1]
                     if multiline:
                         if current_line.strip() == MULTILINE_SENTINEL:
@@ -272,19 +351,39 @@ def _read_live_boxed_message() -> str:
                             buffer = "\n".join(parts[:-1]).strip()
                             break
                         buffer += "\n"
-                        renderer.render(_render_input_state(buffer, multiline=multiline))
+                        renderer.render(
+                            _render_input_state(
+                                buffer,
+                                multiline=multiline,
+                                selected_command=None,
+                            )
+                        )
                         continue
 
                     if buffer.strip() == MULTILINE_SENTINEL:
                         buffer = ""
                         multiline = True
-                        renderer.render(_render_input_state(buffer, multiline=multiline))
+                        selected_command = None
+                        renderer.render(
+                            _render_input_state(
+                                buffer,
+                                multiline=multiline,
+                                selected_command=None,
+                            )
+                        )
                         continue
 
                     if current_line.endswith("\\"):
                         buffer = buffer[:-1].rstrip() + "\n"
                         multiline = True
-                        renderer.render(_render_input_state(buffer, multiline=multiline))
+                        selected_command = None
+                        renderer.render(
+                            _render_input_state(
+                                buffer,
+                                multiline=multiline,
+                                selected_command=None,
+                            )
+                        )
                         continue
 
                     buffer = buffer.strip()
@@ -293,7 +392,13 @@ def _read_live_boxed_message() -> str:
                 if key in ("\x7f", "\b"):
                     if buffer:
                         buffer = buffer[:-1]
-                        renderer.render(_render_input_state(buffer, multiline=multiline))
+                        renderer.render(
+                            _render_input_state(
+                                buffer,
+                                multiline=multiline,
+                                selected_command=selected_command,
+                            )
+                        )
                     continue
 
                 if key == "\x03":
@@ -308,13 +413,33 @@ def _read_live_boxed_message() -> str:
                     continue
 
                 if key == "\t":
-                    buffer += "    "
-                    renderer.render(_render_input_state(buffer, multiline=multiline))
+                    if matches and selected_command is not None:
+                        buffer = selected_command
+                    else:
+                        buffer += "    "
+                    renderer.render(
+                        _render_input_state(
+                            buffer,
+                            multiline=multiline,
+                            selected_command=selected_command,
+                        )
+                    )
                     continue
 
                 if key.isprintable():
                     buffer += key
-                    renderer.render(_render_input_state(buffer, multiline=multiline))
+                    matches, selected_command = _current_command_selection(
+                        buffer,
+                        selected_command,
+                        multiline=multiline,
+                    )
+                    renderer.render(
+                        _render_input_state(
+                            buffer,
+                            multiline=multiline,
+                            selected_command=selected_command,
+                        )
+                    )
         finally:
             renderer.finish()
 
@@ -346,9 +471,9 @@ def _select_effort(current: str, *, supported: bool) -> str:
                     renderer.finish()
                     err_console.print()
                     return current
-                if key in ("\x1b[A", "k"):
+                if key in ("\x1b[A", "\x1bOA", "k"):
                     index = (index - 1) % len(options)
-                elif key in ("\x1b[B", "j"):
+                elif key in ("\x1b[B", "\x1bOB", "j"):
                     index = (index + 1) % len(options)
                 elif key in ("1", "2", "3", "4"):
                     index = int(key) - 1
@@ -404,7 +529,13 @@ class _InlineTerminalRenderer:
         size = self._terminal_size()
         rows = size.lines
         start_row = max(1, rows - len(lines) + 1)
+        width_shrank = size.columns < self._last_size.columns
+        height_shrank = size.lines < self._last_size.lines
+        if width_shrank or height_shrank:
+            self._move_to(1)
+            self.stream.write("\x1b[2J")
         clear_from = start_row if self._start_row is None else min(self._start_row, start_row)
+        clear_from = max(1, clear_from - 2)
         self._clear_screen_from(clear_from)
 
         for index, line in enumerate(lines):
@@ -749,6 +880,7 @@ def _stream_response(model, tokenizer, messages, *, model_label, temp, top_p, ma
 
             # First visible token → switch from animation to output mode
             if text_chunk and not wrote_output:
+                status.ensure_minimum_wait(0.28)
                 status.update(waiting=False, phase=None)
 
             full_text += text_chunk

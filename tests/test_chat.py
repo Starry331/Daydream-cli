@@ -12,11 +12,13 @@ from daydream.chat import (
     _ReasoningParser,
     _build_request_messages,
     _collect_multiline_message,
+    _current_command_selection,
     _effort_system_prompt,
     _extract_visible_text,
     _matching_slash_commands,
     _model_supports_effort,
     _normalize_effort,
+    _read_key,
     run_oneshot,
 )
 
@@ -85,6 +87,25 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(matches[0][0], "/effort")
         self.assertTrue(any(name == "/help" for name, _ in _matching_slash_commands("/")))
 
+    def test_current_command_selection_defaults_and_preserves(self) -> None:
+        matches, selected = _current_command_selection("/", None, multiline=False)
+        self.assertEqual(selected, "/effort")
+        self.assertTrue(matches)
+
+        matches, selected = _current_command_selection("/e", "/effort", multiline=False)
+        self.assertEqual(selected, "/effort")
+        self.assertEqual(matches[0][0], "/effort")
+
+    def test_read_key_supports_ss3_arrow_sequences(self) -> None:
+        stdin = mock.Mock()
+        stdin.read.side_effect = ["\x1b", "O", "A"]
+        stdin.fileno.return_value = 0
+        with mock.patch("daydream.chat.sys.stdin", stdin), mock.patch(
+            "daydream.chat.select.select",
+            side_effect=[([0], [], []), ([0], [], []), ([], [], [])],
+        ):
+            self.assertEqual(_read_key(), "\x1bOA")
+
     def test_effort_helpers_only_emit_prompts_for_supported_models(self) -> None:
         self.assertEqual(_normalize_effort("LONG"), "long")
         self.assertIsNone(_normalize_effort("medium"))
@@ -119,12 +140,14 @@ class ChatTests(unittest.TestCase):
 
         renderer = Renderer(stream)
         renderer.render(["top", "mid", "bot"])
+        renderer.cols = 72
         renderer.rows = 30
         renderer.render(["top", "mid", "bot"])
         renderer.finish()
 
         output = stream.getvalue()
         self.assertIn("\x1b[J", output)
+        self.assertIn("\x1b[2J", output)
         self.assertIn("\x1b[?7l", output)
         self.assertIn("\x1b[?7h", output)
         self.assertIn("\x1b[22;1H", output)

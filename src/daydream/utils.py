@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import colorsys
 import math
+import random
 import re
 import shutil
 import sys
@@ -20,8 +22,8 @@ from rich.text import Text
 SPINNER_FRAMES = ("◜", "◠", "◝", "◞", "◡", "◟")
 DEFAULT_TERMINAL_TITLE = "Daydream CLI"
 
-# Z animation: single evolving cluster Z → ZZ → ZZZ → ZZ → Z
-_Z_CYCLE = 32
+# Z animation: single evolving cluster Z → ZZ → ZZZ → blank
+_Z_CYCLE = 48
 
 # Dream color palette (dark → glow)
 _C_DARK = "#1e3a5f"
@@ -31,6 +33,7 @@ _C_BRIGHT = "#7ec8e3"
 _C_GLOW = "#b8e6ff"
 _C_WHITE = "#e0f2ff"
 _C_REASON = "#6b7b8d"
+_RAINBOW_PROBABILITY = 0.33
 
 # Title Z frames (single cluster)
 _TITLE_Z_FRAMES = ("z", "zz", "zzz", "zz", "z", "zz", "zzz", "zz")
@@ -41,7 +44,7 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _DIM = "\x1b[2m"
 _BOLD = "\x1b[1m"
 _RESET = "\x1b[0m"
-_FRAME_CHAR = "━"
+_FRAME_CHAR = "_"
 
 
 # ── Generic utilities ──────────────────────────────────────────────────
@@ -99,6 +102,14 @@ def _mix_color(start: str, end: str, ratio: float) -> str:
     g = int(sg + (eg - sg) * ratio)
     b = int(sb + (eb - sb) * ratio)
     return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _rainbow_color(position: float, brightness: float) -> str:
+    hue = position % 1.0
+    saturation = 0.62
+    value = 0.24 + 0.56 * max(0.0, min(1.0, brightness))
+    r, g, b = colorsys.hsv_to_rgb(hue, saturation, value)
+    return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
 
 
 def _smoothstep(t: float) -> float:
@@ -176,7 +187,7 @@ def _frame_line(label: str, frame_width: int, indent: int, *, bottom: bool = Fal
     if bottom:
         return (" " * indent) + (_FRAME_CHAR * frame_width)
 
-    prefix = f"── {label} "
+    prefix = f"{_FRAME_CHAR * 2} {label} "
     fill = max(0, frame_width - _display_width(prefix))
     return (" " * indent) + prefix + (_FRAME_CHAR * fill)
 
@@ -185,6 +196,7 @@ def build_input_box_lines(
     lines: list[str],
     *,
     command_rows: list[tuple[str, str]] | None = None,
+    selected_command: str | None = None,
     placeholder: str = "Type a message",
     multiline: bool = False,
 ) -> list[str]:
@@ -209,8 +221,12 @@ def build_input_box_lines(
         rendered.append(f"{pad}{' ' * text_width}")
         rendered.append(f"{pad}{_DIM}{_fit_display_width('Commands', text_width)}{_RESET}")
         for name, description in command_rows:
-            row = _fit_display_width(f"{name:<9} {description}", text_width)
-            rendered.append(f"{pad}{_DIM}{row}{_RESET}")
+            marker = "› " if name == selected_command else "  "
+            row = _fit_display_width(f"{marker}{name:<9} {description}", text_width)
+            if name == selected_command:
+                rendered.append(f"{pad}{_BOLD}{row}{_RESET}")
+            else:
+                rendered.append(f"{pad}{_DIM}{row}{_RESET}")
     elif multiline:
         rendered.append(f"{pad}{' ' * text_width}")
         hint = _fit_display_width('Multiline mode · End with """', text_width)
@@ -252,29 +268,30 @@ def build_effort_menu_lines(
 
 
 def _z_length_value(frame: int) -> float:
-    """Animated cluster length in [0, 3] with Z -> ZZ -> ZZZ -> blank."""
+    """Animated cluster length in [0, 3] with smooth Z -> ZZ -> ZZZ -> blank transitions."""
+    stage_values = (1.0, 2.0, 3.0, 0.0, 1.0)
+    stage_count = len(stage_values) - 1
     phase = (frame % _Z_CYCLE) / _Z_CYCLE
-    if phase < 0.25:
-        return 1.0
-    if phase < 0.5:
-        return 2.0
-    if phase < 0.75:
-        return 3.0
-    return 0.0
+    stage = min(stage_count - 1, int(phase * stage_count))
+    stage_phase = (phase * stage_count) - stage
+    eased = _smoothstep(stage_phase)
+    start = stage_values[stage]
+    end = stage_values[stage + 1]
+    return start + (end - start) * eased
 
 
 def _z_slot_brightness(frame: int, slot: int) -> float:
     """Brightness [0, 1] for a single Z slot in the evolving cluster."""
     length_value = _z_length_value(frame)
-    activation = 1.0 if slot < int(length_value) else 0.0
-    if activation <= 0.0:
+    activation = max(0.0, min(1.0, length_value - slot))
+    if activation <= 0.02:
         return 0.0
 
-    breathe_wave = 0.5 + 0.5 * math.sin((frame / 16.0 + slot * 0.11) * math.tau)
-    breathe = 0.08 * _smoothstep(breathe_wave)
-    shimmer_wave = 0.5 + 0.5 * math.sin((frame / 5.4) + slot * 1.15)
-    shimmer = 0.06 * (_smoothstep(shimmer_wave) - 0.5)
-    brightness = 0.58 + 0.32 * activation + breathe + shimmer
+    breathe_wave = 0.5 + 0.5 * math.sin((frame / 20.0 + slot * 0.13) * math.tau)
+    breathe = 0.05 * _smoothstep(breathe_wave)
+    shimmer_wave = 0.5 + 0.5 * math.sin((frame / 7.4) + slot * 1.07)
+    shimmer = 0.03 * (_smoothstep(shimmer_wave) - 0.5)
+    brightness = 0.14 + 0.42 * activation + breathe + shimmer
     return max(0.0, min(1.0, brightness))
 
 
@@ -293,14 +310,17 @@ def _brightness_to_color(b: float) -> str:
 
 # ── Render functions ───────────────────────────────────────────────────
 
-def render_daydreaming_text(frame: int = 0) -> Text:
+def render_daydreaming_text(frame: int = 0, *, rainbow: bool = False) -> Text:
     """Render a dreamy Z cluster, a sweeping Daydreaming glow, and pulsing dots."""
     text = Text()
     text.append("  ")
 
-    def dreamy_color(brightness: float) -> str:
+    def dreamy_color(brightness: float, *, hue_position: float | None = None) -> str:
         level = max(0.0, min(1.0, brightness))
-        color = _brightness_to_color(level)
+        if rainbow and hue_position is not None:
+            color = _rainbow_color(hue_position, level)
+        else:
+            color = _brightness_to_color(level)
         if level < 0.18:
             color = _mix_color("#08111a", color, _smoothstep(level / 0.18))
         if level > 0.82:
@@ -319,7 +339,11 @@ def render_daydreaming_text(frame: int = 0) -> Text:
     for slot in range(3):
         char_brightness = _z_slot_brightness(frame, slot)
         if char_brightness > 0.01:
-            text.append("Z", style=dreamy_style(char_brightness))
+            if rainbow:
+                color = dreamy_color(char_brightness, hue_position=0.02 + slot * 0.08)
+                text.append("Z", style=f"bold {color}" if char_brightness > 0.74 else color)
+            else:
+                text.append("Z", style=dreamy_style(char_brightness))
         else:
             text.append(" ")
 
@@ -340,7 +364,10 @@ def render_daydreaming_text(frame: int = 0) -> Text:
         ambient_wave = 0.5 + 0.5 * math.sin((frame / 18.0 + idx * 0.08) * math.tau)
         ambient = 0.03 * _smoothstep(ambient_wave)
         brightness = min(1.0, 0.18 + ambient + 0.28 * trail + 0.46 * core)
-        color = dreamy_color(brightness)
+        color = dreamy_color(
+            brightness,
+            hue_position=0.12 + (idx / max(1, len(word) - 1)) * 0.72,
+        )
         if core > 0.0:
             color = _mix_color(color, _C_WHITE, 0.35 * core)
         r, g, b = _hex_to_rgb(color)
@@ -354,7 +381,11 @@ def render_daydreaming_text(frame: int = 0) -> Text:
         wave = 0.5 + 0.5 * math.sin((frame / 18.0 + i * 0.18) * math.tau)
         pulse = _smoothstep(wave)
         dot_brightness = 0.22 + 0.30 * pulse
-        text.append("·", style=dreamy_style(dot_brightness))
+        if rainbow:
+            color = dreamy_color(dot_brightness, hue_position=0.86 + i * 0.05)
+            text.append("·", style=color)
+        else:
+            text.append("·", style=dreamy_style(dot_brightness))
 
     return text
 
@@ -386,7 +417,7 @@ def render_frame_rule(title=None) -> Rule:
     return Rule(title, style="grey27")
 
 
-def render_reasoning_box(reasoning_text: str, frame: int) -> Group:
+def render_reasoning_box(reasoning_text: str, frame: int, *, rainbow: bool = False) -> Group:
     """Render a framed reasoning box with animated header and clipped body."""
     normalized = reasoning_text.replace("\r\n", "\n").replace("\r", "\n")
     lines = normalized.split("\n")
@@ -400,7 +431,7 @@ def render_reasoning_box(reasoning_text: str, frame: int) -> Group:
 
     body = Text("\n".join(visible_lines), style=f"dim {_C_REASON}")
     return Group(
-        render_frame_rule(render_daydreaming_text(frame)),
+        render_frame_rule(render_daydreaming_text(frame, rainbow=rainbow)),
         body,
         render_frame_rule(),
     )
@@ -598,6 +629,7 @@ class ConversationStatus:
         self._reasoning_start: float | None = None
         self._reasoning_elapsed: float | None = None
         self._had_reasoning = False
+        self._started_at: float | None = None
 
         # Threading
         self._stop = threading.Event()
@@ -605,6 +637,7 @@ class ConversationStatus:
         self._live: Live | None = None
         self._lock = threading.Lock()
         self._title_animator = TerminalTitleAnimator("Daydreaming", frames=_TITLE_Z_FRAMES)
+        self._rainbow = random.random() < _RAINBOW_PROBABILITY
 
     def _reasoning_time(self) -> float:
         elapsed = self._reasoning_elapsed or 0.0
@@ -617,10 +650,14 @@ class ConversationStatus:
             parts: list = []
 
             if self._reasoning_active:
-                parts.append(render_reasoning_box(self._reasoning_text, self._frame))
+                parts.append(render_reasoning_box(
+                    self._reasoning_text,
+                    self._frame,
+                    rainbow=self._rainbow,
+                ))
                 parts.append(Text())
             elif self._waiting and not self._had_reasoning:
-                parts.append(render_reasoning_box("", self._frame))
+                parts.append(render_reasoning_box("", self._frame, rainbow=self._rainbow))
                 parts.append(Text())
             else:
                 # ── Reasoning summary (if model used thinking) ──
@@ -646,6 +683,7 @@ class ConversationStatus:
             return Group(*parts)
 
     def start(self) -> None:
+        self._started_at = time.monotonic()
         self._title_animator.start()
         if not self.console.is_terminal:
             return
@@ -684,6 +722,14 @@ class ConversationStatus:
                     self._title_animator.stop()
         if self._live is not None:
             self._live.update(self._render())
+
+    def ensure_minimum_wait(self, minimum_seconds: float) -> None:
+        if self._started_at is None or self._reasoning_active:
+            return
+        elapsed = time.monotonic() - self._started_at
+        remaining = minimum_seconds - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
 
     def start_reasoning(self) -> None:
         with self._lock:
