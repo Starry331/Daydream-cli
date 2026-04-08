@@ -37,6 +37,32 @@ _C_REASON = "#6b7b8d"
 _RAINBOW_PROBABILITY = 0.33
 _DREAM_WORDS = ("Daydreaming", "Imagining", "Floating", "Wandering", "Rêvant")
 
+# Sleep phase palettes
+_C_N3_DARK = "#0d1b2a"    # Deep navy — deep sleep
+_C_N3_MID = "#1b3a5c"
+_C_N3_GLOW = "#2e5f8a"
+_C_N2_DARK = "#2d1b4e"    # Purple — spindle processing
+_C_N2_MID = "#5c3d8f"
+_C_N2_GLOW = "#8b5cf6"
+_C_REM_DARK = "#3b1029"   # Crimson/warm — REM integration
+_C_REM_MID = "#7c2d5c"
+_C_REM_GLOW = "#d4507a"
+
+SLEEP_PHASE_PALETTES = {
+    "reming": (_C_MID, _C_BRIGHT, _C_GLOW),
+    "n3":     (_C_N3_DARK, _C_N3_MID, _C_N3_GLOW),
+    "n2":     (_C_N2_DARK, _C_N2_MID, _C_N2_GLOW),
+    "rem":    (_C_REM_DARK, _C_REM_MID, _C_REM_GLOW),
+}
+
+SLEEP_PHASE_LABELS = {
+    "reming": "REMing",
+    "n3": "N3 \u00b7 Deep Sleep",
+    "n2": "N2 \u00b7 Core Sleep",
+    "rem": "REM \u00b7 Integration",
+}
+REFLECTING_LABEL = "Reflecting"
+
 # Title Z frames (single cluster)
 _TITLE_Z_FRAMES = ("z", "zz", "zzz", "zz", "z", "zz", "zzz", "zz")
 
@@ -895,6 +921,250 @@ class BottomTerminalRenderer:
 @contextmanager
 def daydreaming_status(console: Console, model_label: str):
     status = ConversationStatus(console, model_label)
+    status.start()
+    try:
+        yield status
+    finally:
+        status.stop()
+
+
+def build_dreaming_menu_lines(selected: str) -> list[str]:
+    """Arrow-key menu for /dreaming mode selection."""
+    frame_width, indent = _chat_frame_width()
+    text_width = frame_width
+    pad = " " * indent
+    lines = [_frame_line("Dreaming Mode", frame_width, indent)]
+
+    options = [
+        ("reming", "REMing", "Quick memory extraction"),
+        ("daydream", "Daydream", "Full sleep cycle (N3\u2192N2\u2192REM)"),
+    ]
+    for key, label, desc in options:
+        marker = "\u203a " if key == selected else "  "
+        content = _fit_display_width(f"{marker}{label:<12} {desc}", text_width)
+        if key == selected:
+            content = f"{_BOLD}{content}{_RESET}"
+        else:
+            content = f"{_DIM}{content}{_RESET}"
+        lines.append(f"{pad}{content}")
+
+    lines.append(f"{pad}{' ' * text_width}")
+    hint = _fit_display_width("Use \u2191/\u2193 or j/k \u00b7 Enter to start \u00b7 Esc to cancel", text_width)
+    lines.append(f"{pad}{_DIM}{hint}{_RESET}")
+    lines.append(_frame_line("", frame_width, indent, bottom=True))
+    return lines
+
+
+def build_session_list_lines(sessions: list, selected_index: int) -> list[str]:
+    """Arrow-key menu for /resume session selection."""
+    frame_width, indent = _chat_frame_width()
+    text_width = frame_width
+    pad = " " * indent
+    lines = [_frame_line("Resume Session", frame_width, indent)]
+
+    visible = sessions[:10]
+    for i, session in enumerate(visible):
+        marker = "\u203a " if i == selected_index else "  "
+        title = session.title or "(untitled)"
+        if len(title) > 30:
+            title = title[:27] + "..."
+        model = session.model or ""
+        msg_count = len(session.messages)
+        date_str = format_time_ago(session.updated_at) if session.updated_at else ""
+        row = f"{marker}{title:<32} {model:<12} {date_str:<14} {msg_count} msgs"
+        content = _fit_display_width(row, text_width)
+        if i == selected_index:
+            content = f"{_BOLD}{content}{_RESET}"
+        else:
+            content = f"{_DIM}{content}{_RESET}"
+        lines.append(f"{pad}{content}")
+
+    lines.append(f"{pad}{' ' * text_width}")
+    hint = _fit_display_width("Use \u2191/\u2193 or j/k \u00b7 Enter to resume \u00b7 Esc to cancel", text_width)
+    lines.append(f"{pad}{_DIM}{hint}{_RESET}")
+    lines.append(_frame_line("", frame_width, indent, bottom=True))
+    return lines
+
+
+def build_memory_display_lines(memories: list) -> list[str]:
+    """Display for /memory command."""
+    frame_width, indent = _chat_frame_width()
+    text_width = frame_width
+    pad = " " * indent
+    lines = [_frame_line("Session Memories", frame_width, indent)]
+
+    category_icons = {
+        "fact": "[F]",
+        "preference": "[P]",
+        "context": "[C]",
+        "insight": "[I]",
+        "pattern": "[X]",
+    }
+
+    for mem in memories:
+        icon = category_icons.get(mem.category, "[?]")
+        importance = mem.importance if hasattr(mem, "importance") else 0.5
+        bar_len = int(importance * 10)
+        bar = "\u2588" * bar_len + "\u2591" * (10 - bar_len)
+        row = f"  {icon} {mem.content}"
+        if len(row) > text_width - 14:
+            row = row[:text_width - 17] + "..."
+        content = _fit_display_width(f"{row:<{text_width - 13}} {bar}", text_width)
+        lines.append(f"{pad}{_DIM}{content}{_RESET}")
+
+    if not memories:
+        content = _fit_display_width("  No memories extracted yet.", text_width)
+        lines.append(f"{pad}{_DIM}{content}{_RESET}")
+
+    lines.append(_frame_line("", frame_width, indent, bottom=True))
+    return lines
+
+
+def render_sleep_phase_box(
+    phase: str,
+    text: str,
+    frame: int,
+    *,
+    label: str | None = None,
+) -> Group:
+    """Animated box during dreaming phases.
+
+    Similar to render_reasoning_box() but uses SLEEP_PHASE_PALETTES[phase].
+    Shows phase label + streamed model output in a dim scrolling box.
+    """
+    palette = SLEEP_PHASE_PALETTES.get(phase, (_C_MID, _C_BRIGHT, _C_GLOW))
+    dark, mid, glow = palette
+    header_label = label or REFLECTING_LABEL
+    phase_label = SLEEP_PHASE_LABELS.get(phase, phase)
+
+    header = render_daydreaming_text(frame, label=header_label)
+    header.append("  ")
+    header.append(phase_label, style=f"bold {mid}")
+
+    # Body: last 5 lines of output
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    body_lines = normalized.split("\n")
+    if normalized.endswith("\n"):
+        body_lines.append("")
+    visible = body_lines[-5:] if body_lines else [""]
+    if not any(line.strip() for line in visible):
+        visible = [""] * 4 + [" "]
+    while len(visible) < 5:
+        visible.insert(0, "")
+
+    body = Text("\n".join(visible), style=f"dim {dark}")
+
+    return Group(
+        render_frame_rule(header),
+        body,
+        render_frame_rule(),
+    )
+
+
+class DreamingStatus:
+    """Thread-safe animated status for /dreaming.
+
+    Shows current phase label with phase-colored Z animation,
+    scrolling box of model output, and phase progress indicator.
+    Uses BottomTerminalRenderer.
+    """
+
+    def __init__(self, console: Console, model_label: str):
+        self.console = console
+        self.model_label = model_label
+        self._frame = 0
+        self._phase = "reming"
+        self._phase_text = ""
+        self._status_text = ""
+        self._phase_number = 0
+        self._total_phases = 1
+
+        # Threading
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._renderer: BottomTerminalRenderer | None = None
+        self._lock = threading.Lock()
+        self._title_animator = TerminalTitleAnimator(REFLECTING_LABEL, frames=_TITLE_Z_FRAMES)
+
+    def _render(self) -> Group:
+        with self._lock:
+            parts: list = []
+
+            parts.append(render_sleep_phase_box(
+                self._phase,
+                self._phase_text,
+                self._frame,
+                label=REFLECTING_LABEL,
+            ))
+            parts.append(Text())
+
+            phase_label = SLEEP_PHASE_LABELS.get(self._phase, self._phase)
+            if self._total_phases > 1 and self._phase_number:
+                phase_footer = f"{phase_label}  {self._phase_number}/{self._total_phases}"
+            else:
+                phase_footer = phase_label
+
+            footer = render_status_footer(
+                self.model_label,
+                phase=phase_footer,
+                hint=self._status_text or None,
+            )
+            parts.append(footer)
+
+            return Group(*parts)
+
+    def start(self) -> None:
+        self._title_animator.start()
+        if not self.console.is_terminal:
+            return
+        self._renderer = BottomTerminalRenderer(
+            self.console.file,
+            clear_on_finish=False,
+            color_system=self.console.color_system or "truecolor",
+        )
+        self._renderer.render(self._render())
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(0.08):
+            with self._lock:
+                self._frame += 1
+            if self._renderer is not None:
+                self._renderer.render(self._render())
+
+    def set_phase(self, name: str, status_text: str = "", *, number: int = 0, total: int = 1) -> None:
+        with self._lock:
+            self._phase = name
+            self._status_text = status_text
+            self._phase_text = ""
+            self._phase_number = number
+            self._total_phases = total
+        if self._renderer is not None:
+            self._renderer.render(self._render())
+
+    def append_text(self, text: str) -> None:
+        if not text:
+            return
+        with self._lock:
+            self._phase_text += text
+        if self._renderer is not None:
+            self._renderer.render(self._render())
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.2)
+        if self._renderer is not None:
+            self._renderer.render(self._render())
+            self._renderer.finish()
+        self._title_animator.stop()
+
+
+@contextmanager
+def dreaming_status(console: Console, model_label: str):
+    """Context manager for DreamingStatus."""
+    status = DreamingStatus(console, model_label)
     status.start()
     try:
         yield status

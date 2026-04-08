@@ -20,12 +20,27 @@ from daydream.models import ensure_runtime_model
 from daydream.registry import reverse_lookup
 from daydream.utils import (
     BottomTerminalRenderer,
+    build_dreaming_menu_lines,
     build_effort_menu_lines,
     build_input_box_lines,
+    build_memory_display_lines,
+    build_session_list_lines,
     daydreaming_status,
+    DreamingStatus,
     render_expanded_reasoning,
     render_input_box,
 )
+from daydream.storage import (
+    ChatSession,
+    ChatMessage,
+    Memory,
+    save_session,
+    load_session,
+    list_sessions,
+    save_memories,
+    load_memories,
+)
+from daydream.dreaming import run_reming, run_dreaming
 
 console = Console()
 err_console = Console(stderr=True)
@@ -37,6 +52,10 @@ EFFORT_LEVELS = ("instant", "short", "default", "long")
 SLASH_COMMANDS = (
     ("/effort", "adjust reasoning depth"),
     ("/help", "show available commands"),
+    ("/new", "start a persistent chat session"),
+    ("/resume", "resume a saved session"),
+    ("/dreaming", "consolidate memories from conversation"),
+    ("/memory", "view extracted memories"),
     ("/reset", "clear conversation history"),
     ("/clear", "alias for /reset"),
     ("/t", "expand the last reasoning trace"),
@@ -215,15 +234,63 @@ def _build_request_messages(
     system_prompt: str | None,
     effort: str,
     model_name: str,
+    session_memories: list[Memory] | None = None,
 ) -> list[dict]:
     request_messages: list[dict] = []
     if system_prompt:
         request_messages.append({"role": "system", "content": system_prompt})
+    memory_prompt = _build_session_memory_prompt(session_memories or [])
+    if memory_prompt:
+        request_messages.append({"role": "system", "content": memory_prompt})
     effort_prompt = _effort_system_prompt(effort, model_name)
     if effort_prompt:
         request_messages.append({"role": "system", "content": effort_prompt})
     request_messages.extend(history)
     return request_messages
+
+
+def _build_session_memory_prompt(memories: list[Memory]) -> str | None:
+    if not memories:
+        return None
+
+    unique: dict[str, Memory] = {}
+    ordered = sorted(
+        memories,
+        key=lambda memory: (-memory.importance, memory.created_at, memory.content),
+    )
+    for memory in ordered:
+        key = memory.content.strip().lower()
+        if key and key not in unique:
+            unique[key] = memory
+
+    lines = [
+        "Session memory for this persistent chat only.",
+        "Use these memories when relevant, but do not mention this memory block unless it helps answer the user.",
+    ]
+    for memory in list(unique.values())[:12]:
+        content = memory.content.strip().replace("\n", " ")
+        if len(content) > 180:
+            content = content[:177] + "..."
+        lines.append(f"- [{memory.category} | {memory.importance:.2f}] {content}")
+
+    return "\n".join(lines)
+
+
+def _confirm_memory_import(memories: list[Memory]) -> bool:
+    if not memories:
+        return False
+
+    count = len(memories)
+    noun = "memory" if count == 1 else "memories"
+    while True:
+        reply = err_console.input(
+            f"[dim]Add {count} extracted {noun} to this session memory only? [Y/n][/dim] "
+        ).strip().lower()
+        if reply in ("", "y", "yes"):
+            return True
+        if reply in ("n", "no"):
+            return False
+        err_console.print("[dim]Please answer Y or n.[/dim]")
 
 
 @contextmanager
@@ -966,6 +1033,227 @@ def _stream_response(
     return full_text, last_response, parser.reasoning_text
 
 
+def _select_dreaming_mode() -> str | None:
+    """Arrow-key menu to choose REMing or Daydream.
+
+    Pattern: copy _select_effort() structure exactly.
+    Returns selected mode string or None on Esc.
+    """
+    if not sys.stdin.isatty() or not err_console.is_terminal:
+        return None
+
+    options = ["reming", "daydream"]
+    index = 0
+    pending_escape = ""
+    pending_escape_started_at: float | None = None
+
+    with _raw_stdin():
+        renderer = _InlineTerminalRenderer(sys.stderr)
+        try:
+            renderer.render(build_dreaming_menu_lines(options[index]))
+            while True:
+                pending_key, pending_escape, pending_escape_started_at = _drain_pending_escape(
+                    pending_escape,
+                    pending_escape_started_at,
+                )
+                if pending_key is None:
+                    renderer.wait_for_input(
+                        build_dreaming_menu_lines(options[index])
+                    )
+                    raw_key = _read_key()
+                    key, pending_escape, pending_escape_started_at = _merge_escape_key(
+                        raw_key,
+                        pending_escape,
+                        pending_escape_started_at,
+                    )
+                    if key is None:
+                        continue
+                else:
+                    key = pending_key
+                if key in ("\r", "\n"):
+                    break
+                if key in ("\x03",):
+                    raise KeyboardInterrupt
+                if key == "\x1b":
+                    renderer.finish()
+                    err_console.print()
+                    return None
+                if _is_up_key(key):
+                    index = (index - 1) % len(options)
+                elif _is_down_key(key):
+                    index = (index + 1) % len(options)
+                elif key in ("A", "B", "C", "D", "[", "O"):
+                    continue
+                renderer.render(build_dreaming_menu_lines(options[index]))
+        finally:
+            renderer.finish()
+
+    err_console.print()
+    return options[index]
+
+
+def _select_session(sessions: list) -> object | None:
+    """Arrow-key menu to choose a session to resume.
+
+    Pattern: copy _select_effort() structure exactly.
+    Returns selected ChatSession or None on Esc.
+    """
+    if not sys.stdin.isatty() or not err_console.is_terminal:
+        return None
+
+    if not sessions:
+        return None
+
+    index = 0
+    pending_escape = ""
+    pending_escape_started_at: float | None = None
+
+    with _raw_stdin():
+        renderer = _InlineTerminalRenderer(sys.stderr)
+        try:
+            window = _session_window(sessions, index)
+            renderer.render(
+                build_session_list_lines(
+                    window,
+                    index - _session_window_start(sessions, index),
+                )
+            )
+            while True:
+                pending_key, pending_escape, pending_escape_started_at = _drain_pending_escape(
+                    pending_escape,
+                    pending_escape_started_at,
+                )
+                if pending_key is None:
+                    window = _session_window(sessions, index)
+                    renderer.wait_for_input(
+                        build_session_list_lines(
+                            window,
+                            index - _session_window_start(sessions, index),
+                        )
+                    )
+                    raw_key = _read_key()
+                    key, pending_escape, pending_escape_started_at = _merge_escape_key(
+                        raw_key,
+                        pending_escape,
+                        pending_escape_started_at,
+                    )
+                    if key is None:
+                        continue
+                else:
+                    key = pending_key
+                if key in ("\r", "\n"):
+                    break
+                if key in ("\x03",):
+                    raise KeyboardInterrupt
+                if key == "\x1b":
+                    renderer.finish()
+                    err_console.print()
+                    return None
+                if _is_up_key(key):
+                    index = (index - 1) % len(sessions)
+                elif _is_down_key(key):
+                    index = (index + 1) % len(sessions)
+                elif key in ("A", "B", "C", "D", "[", "O"):
+                    continue
+                window = _session_window(sessions, index)
+                renderer.render(
+                    build_session_list_lines(
+                        window,
+                        index - _session_window_start(sessions, index),
+                    )
+                )
+        finally:
+            renderer.finish()
+
+    err_console.print()
+    return sessions[index]
+
+
+def _session_window_start(sessions: list, index: int, *, window_size: int = 10) -> int:
+    if len(sessions) <= window_size:
+        return 0
+    start = max(0, index - (window_size // 2))
+    return min(start, len(sessions) - window_size)
+
+
+def _session_window(sessions: list, index: int, *, window_size: int = 10) -> list:
+    start = _session_window_start(sessions, index, window_size=window_size)
+    return sessions[start:start + window_size]
+
+
+def _run_dreaming(
+    model,
+    tokenizer,
+    messages,
+    session,
+    mode,
+    *,
+    model_label,
+    session_memories: list[Memory],
+    temp,
+    max_tokens,
+) -> list:
+    """Execute the selected dreaming mode with animated status.
+
+    1. Create DreamingStatus instance
+    2. Convert messages to ChatMessage list
+    3. Call run_reming() or run_dreaming() from dreaming.py
+       with on_phase/on_token callbacks that update DreamingStatus
+    4. Stop status, return memories
+    """
+    from daydream.utils import dreaming_status as _dreaming_status_ctx
+
+    # Convert messages dicts to ChatMessage objects
+    chat_messages = [
+        ChatMessage(
+            role=m["role"],
+            content=m["content"],
+            timestamp=time.time(),
+        )
+        for m in messages
+    ]
+
+    session_id = session.session_id if session is not None else ""
+
+    with _dreaming_status_ctx(err_console, model_label) as status:
+        if mode == "daydream":
+            total = 3
+            phase_num = [0]
+
+            def on_phase(name: str, text: str) -> None:
+                phase_num[0] += 1
+                status.set_phase(name, text, number=phase_num[0], total=total)
+
+            def on_token(text: str) -> None:
+                status.append_text(text)
+
+            memories = run_dreaming(
+                model, tokenizer, chat_messages, session_id,
+                existing_memories=session_memories,
+                temp=temp, max_tokens=max_tokens,
+                on_phase=on_phase, on_token=on_token,
+            )
+        else:
+            def on_phase(name: str, text: str) -> None:
+                status.set_phase(name, text, number=1, total=1)
+
+            def on_token(text: str) -> None:
+                status.append_text(text)
+
+            memories = run_reming(
+                model, tokenizer, chat_messages,
+                temp=temp, max_tokens=max_tokens,
+                on_phase=on_phase, on_token=on_token,
+            )
+
+    # Tag memories with session_id if we have one
+    if session is not None:
+        for mem in memories:
+            mem.session_id = session.session_id
+
+    return memories
+
+
 def run_oneshot(
     model_name: str,
     *,
@@ -1036,6 +1324,10 @@ def run_chat(
     effort = initial_effort if initial_effort in EFFORT_LEVELS else "default"
     effort_supported = _model_supports_effort(repo_id)
 
+    # Persistence state
+    session: ChatSession | None = None  # None = memoryless mode (default)
+    session_memories: list[Memory] = []
+
     while True:
         try:
             user_input = _read_boxed_message()
@@ -1051,17 +1343,25 @@ def run_chat(
             break
         if stripped in ("/reset", "/clear", "/r"):
             messages = []
+            if session is not None:
+                session.messages = []
+                session.updated_at = time.time()
+                save_session(session)
             err_console.print("[dim]Chat history cleared.[/dim]")
             continue
         if stripped in ("/help", "/h", "/?"):
             err_console.print(f"[dim]{MULTILINE_SENTINEL}      — start/end multiline input[/dim]")
             err_console.print("[dim]\\        — continue input on the next line[/dim]")
-            err_console.print("[dim]/effort  — pick instant / short / default / long[/dim]")
-            err_console.print("[dim]/reset  — clear conversation history[/dim]")
-            err_console.print("[dim]/clear  — alias for /reset[/dim]")
-            err_console.print("[dim]/t      — show last captured reasoning[/dim]")
-            err_console.print("[dim]/quit   — exit chat[/dim]")
-            err_console.print("[dim]/help   — show this help[/dim]")
+            err_console.print("[dim]/new      — start a persistent chat session[/dim]")
+            err_console.print("[dim]/resume   — resume a saved session[/dim]")
+            err_console.print("[dim]/dreaming — consolidate memories from conversation[/dim]")
+            err_console.print("[dim]/memory   — view extracted memories[/dim]")
+            err_console.print("[dim]/effort   — pick instant / short / default / long[/dim]")
+            err_console.print("[dim]/reset    — clear conversation history[/dim]")
+            err_console.print("[dim]/clear    — alias for /reset[/dim]")
+            err_console.print("[dim]/t        — show last captured reasoning[/dim]")
+            err_console.print("[dim]/quit     — exit chat[/dim]")
+            err_console.print("[dim]/help     — show this help[/dim]")
             continue
         if stripped == "/":
             err_console.print("[dim]Type /effort, /reset, /clear, /t, /help, or /quit.[/dim]")
@@ -1078,6 +1378,82 @@ def run_chat(
         if stripped in ("/t", "/thoughts"):
             err_console.print(render_expanded_reasoning(last_reasoning))
             continue
+        if stripped == "/new":
+            import uuid
+            session = ChatSession(
+                session_id=uuid.uuid4().hex,
+                model=short,
+                title="",
+                created_at=time.time(),
+                updated_at=time.time(),
+                messages=[],
+                memories=[],
+            )
+            session_memories = []
+            # Copy existing messages into session if any
+            for msg in messages:
+                session.messages.append(ChatMessage(
+                    role=msg["role"], content=msg["content"], timestamp=time.time(),
+                ))
+            save_session(session)
+            err_console.print(f"[dim]Persistent session started ({session.session_id[:8]}...)[/dim]")
+            continue
+        if stripped == "/resume":
+            available_sessions = list_sessions()
+            if not available_sessions:
+                err_console.print("[dim]No saved sessions.[/dim]")
+                continue
+            selected_session = _select_session(available_sessions)
+            if selected_session is None:
+                continue
+            session = selected_session
+            messages = [{"role": m.role, "content": m.content} for m in session.messages]
+            session_memories = load_memories(session.session_id)
+            err_console.print(f"[dim]Resumed: {session.title} ({len(messages)} messages)[/dim]")
+            continue
+        if stripped == "/dreaming":
+            if session is None:
+                err_console.print("[dim]Start a persistent session with /new before dreaming.[/dim]")
+                continue
+            if len(messages) < 2:
+                err_console.print("[dim]Need at least one exchange to dream about.[/dim]")
+                continue
+            mode = _select_dreaming_mode()
+            if mode is None:
+                continue
+            new_memories = _run_dreaming(
+                model, tokenizer, messages, session, mode,
+                model_label=short,
+                session_memories=session_memories,
+                temp=0.3,
+                max_tokens=2048,
+            )
+            if not new_memories:
+                err_console.print("[dim]No memories extracted.[/dim]")
+                continue
+            for mem_line in build_memory_display_lines(new_memories):
+                err_console.print(mem_line)
+            if _confirm_memory_import(new_memories):
+                session_memories.extend(new_memories)
+                session.memories = session_memories
+                session.updated_at = time.time()
+                save_memories(session.session_id, session_memories)
+                save_session(session)
+                err_console.print(f"[dim]Added {len(new_memories)} memories to this session.[/dim]")
+            else:
+                err_console.print("[dim]Discarded extracted memories.[/dim]")
+            continue
+        if stripped == "/memory":
+            if session is None:
+                err_console.print("[dim]No session memory is active. Start with /new or /resume.[/dim]")
+                continue
+            if not session_memories:
+                err_console.print("[dim]No memories yet. Use /dreaming to extract memories.[/dim]")
+                continue
+            mem_lines = build_memory_display_lines(session_memories)
+            for mem_line in mem_lines:
+                err_console.print(mem_line)
+            continue
 
         messages.append({"role": "user", "content": user_input})
         request_messages = _build_request_messages(
@@ -1085,6 +1461,7 @@ def run_chat(
             system_prompt=system,
             effort=effort,
             model_name=repo_id,
+            session_memories=session_memories if session is not None else None,
         )
         chat_template_kwargs = _effort_chat_template_kwargs(effort, tokenizer)
 
@@ -1097,3 +1474,17 @@ def run_chat(
         last_reasoning = reasoning_text
 
         messages.append({"role": "assistant", "content": full_text})
+
+        if session is not None:
+            session.messages.append(ChatMessage(
+                role="user", content=user_input, timestamp=time.time(),
+                reasoning="",
+            ))
+            session.messages.append(ChatMessage(
+                role="assistant", content=full_text, timestamp=time.time(),
+                reasoning=last_reasoning,
+            ))
+            session.updated_at = time.time()
+            if not session.title:
+                session.title = user_input[:50].strip()
+            save_session(session)

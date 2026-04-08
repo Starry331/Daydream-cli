@@ -48,6 +48,22 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(config.get_default_host(), "0.0.0.0")
                 self.assertEqual(config.get_default_port(), 8080)
 
+    def test_ensure_home_creates_chat_and_memory_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "daydream-home"
+
+            with mock.patch.dict(
+                os.environ,
+                {"DAYDREAM_HOME": str(home)},
+                clear=False,
+            ):
+                config = reload_module("daydream.config")
+                config.ensure_home()
+
+                self.assertTrue(config.DAYDREAM_HOME.exists())
+                self.assertTrue(config.CHATS_DIR.exists())
+                self.assertTrue(config.MEMORIES_DIR.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

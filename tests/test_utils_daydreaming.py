@@ -4,13 +4,17 @@ import io
 import os
 import unittest
 
+from rich.console import Console
+
 from daydream.utils import (
     _strip_ansi,
     BottomTerminalRenderer,
     _DREAM_WORDS,
+    REFLECTING_LABEL,
     build_effort_menu_lines,
     build_input_box_lines,
     choose_dream_word,
+    render_sleep_phase_box,
     render_daydreaming_text,
     render_status_footer,
     render_title_text,
@@ -37,6 +41,13 @@ class DaydreamingTextTests(unittest.TestCase):
         rendered = render_daydreaming_text(6, label="Rêvant")
         self.assertIn("Rêvant", rendered.plain)
         self.assertTrue(rendered.plain.endswith("···"))
+
+    def test_render_sleep_phase_box_uses_reflecting_label(self) -> None:
+        stream = io.StringIO()
+        console = Console(file=stream, record=True, force_terminal=False, width=80)
+        console.print(render_sleep_phase_box("n3", "line one", 3))
+        exported = console.export_text()
+        self.assertIn(REFLECTING_LABEL, exported)
 
     def test_render_title_text_contains_label(self) -> None:
         rendered = render_title_text("Downloading model", 3)

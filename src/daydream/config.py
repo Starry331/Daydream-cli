@@ -12,6 +12,8 @@ CONFIG_FILE = DAYDREAM_HOME / "config.yaml"
 PROFILES_FILE = DAYDREAM_HOME / "profiles.yaml"
 SERVER_STATE_FILE = DAYDREAM_HOME / "server.json"
 SERVER_LOG_FILE = DAYDREAM_HOME / "server.log"
+CHATS_DIR = DAYDREAM_HOME / "chats"
+MEMORIES_DIR = DAYDREAM_HOME / "memories"
 
 HF_HOME = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser()
 MODEL_CACHE_DIR = Path(
@@ -33,8 +35,10 @@ DEFAULT_HOST = "127.0.0.1"
 
 
 def ensure_home() -> None:
-    """Create ~/.daydream if it doesn't exist."""
+    """Create ~/.daydream and subdirectories if they don't exist."""
     DAYDREAM_HOME.mkdir(parents=True, exist_ok=True)
+    CHATS_DIR.mkdir(parents=True, exist_ok=True)
+    MEMORIES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _load_config() -> dict[str, Any]:

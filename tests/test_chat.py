@@ -13,7 +13,9 @@ from daydream.chat import (
     _InlineTerminalRenderer,
     _ReasoningParser,
     _build_request_messages,
+    _build_session_memory_prompt,
     _collect_multiline_message,
+    _confirm_memory_import,
     _current_command_selection,
     _drain_pending_escape,
     _effort_chat_template_kwargs,
@@ -248,6 +250,46 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(request[1]["role"], "system")
         self.assertIn("Reasoning effort: long", request[1]["content"])
         self.assertEqual(request[2]["content"], "hello")
+
+    def test_build_request_messages_includes_session_memory_prompt(self) -> None:
+        from daydream.storage import Memory
+
+        request = _build_request_messages(
+            [{"role": "user", "content": "hello"}],
+            system_prompt="base",
+            effort="default",
+            model_name="mlx-community/Qwen3-8B-4bit",
+            session_memories=[
+                Memory(
+                    content="User prefers terse answers.",
+                    category="preference",
+                    importance=0.9,
+                    source_phase="reming",
+                )
+            ],
+        )
+        self.assertEqual(request[0]["content"], "base")
+        self.assertIn("Session memory for this persistent chat only.", request[1]["content"])
+        self.assertIn("User prefers terse answers.", request[1]["content"])
+        self.assertEqual(request[-1]["content"], "hello")
+
+    def test_build_session_memory_prompt_deduplicates_and_limits(self) -> None:
+        from daydream.storage import Memory
+
+        prompt = _build_session_memory_prompt([
+            Memory(content="User likes Python.", category="fact", importance=0.4, source_phase="rem"),
+            Memory(content="User likes Python.", category="fact", importance=0.9, source_phase="rem"),
+        ])
+        self.assertIsNotNone(prompt)
+        self.assertEqual(prompt.count("User likes Python."), 1)
+
+    def test_confirm_memory_import_defaults_yes(self) -> None:
+        with mock.patch("daydream.chat.err_console.input", return_value=""):
+            self.assertTrue(_confirm_memory_import([mock.Mock()]))
+
+    def test_confirm_memory_import_respects_no(self) -> None:
+        with mock.patch("daydream.chat.err_console.input", return_value="n"):
+            self.assertFalse(_confirm_memory_import([mock.Mock()]))
 
     def test_inline_terminal_renderer_tracks_bottom_rows_across_resize(self) -> None:
         stream = io.StringIO()
