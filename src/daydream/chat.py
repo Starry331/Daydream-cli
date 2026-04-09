@@ -1140,6 +1140,8 @@ def _reserve_bottom_rows(count: int) -> None:
     stream = getattr(err_console, "file", sys.stderr)
     if not getattr(stream, "isatty", lambda: False)():
         return
+    rows = shutil.get_terminal_size(fallback=(96, 24)).lines
+    stream.write(f"\x1b[{rows};1H")
     stream.write("\n" * count)
     stream.flush()
 
