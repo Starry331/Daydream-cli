@@ -33,6 +33,7 @@ from daydream.storage import (
     ChatSession,
     ChatMessage,
     Memory,
+    delete_session,
     save_session,
     list_sessions,
     save_memories,
@@ -52,6 +53,7 @@ SLASH_COMMANDS = (
     ("/help", "show available commands"),
     ("/new", "start a persistent chat session"),
     ("/resume", "resume a saved session"),
+    ("/forget", "delete a saved session"),
     ("/dreaming", "consolidate memories from conversation"),
     ("/memory", "view extracted memories"),
     ("/reset", "clear conversation history"),
@@ -289,6 +291,21 @@ def _confirm_memory_import(memories: list[Memory]) -> bool:
         if reply in ("n", "no"):
             return False
         err_console.print("[dim]Please answer Y or n.[/dim]")
+
+
+def _confirm_session_delete(session: ChatSession) -> bool:
+    if not sys.stdin.isatty():
+        return True
+    while True:
+        err_console.print(
+            f"[dim]Delete saved session '{session.title or '(untitled)'}'? (y/n)[/dim]"
+        )
+        reply = err_console.input("[dim]> [/dim]").strip().lower()
+        if reply in ("y", "yes"):
+            return True
+        if reply in ("n", "no"):
+            return False
+        err_console.print("[dim]Please answer y or n.[/dim]")
 
 
 @contextmanager
@@ -1090,11 +1107,15 @@ def _select_dreaming_mode() -> str | None:
     return options[index]
 
 
-def _select_session(sessions: list) -> object | None:
-    """Arrow-key menu to choose a session to resume.
+def _select_session_action(
+    sessions: list,
+    *,
+    allow_delete: bool = False,
+) -> tuple[str, object] | None:
+    """Arrow-key menu to choose a session action.
 
     Pattern: copy _select_effort() structure exactly.
-    Returns selected ChatSession or None on Esc.
+    Returns (action, ChatSession) or None on Esc.
     """
     if not sys.stdin.isatty() or not err_console.is_terminal:
         return None
@@ -1114,6 +1135,7 @@ def _select_session(sessions: list) -> object | None:
                 build_session_list_lines(
                     window,
                     index - _session_window_start(sessions, index),
+                    allow_delete=allow_delete,
                 )
             )
             while True:
@@ -1127,6 +1149,7 @@ def _select_session(sessions: list) -> object | None:
                         build_session_list_lines(
                             window,
                             index - _session_window_start(sessions, index),
+                            allow_delete=allow_delete,
                         )
                     )
                     raw_key = _read_key()
@@ -1140,7 +1163,7 @@ def _select_session(sessions: list) -> object | None:
                 else:
                     key = pending_key
                 if key in ("\r", "\n"):
-                    break
+                    return ("resume", sessions[index])
                 if key in ("\x03",):
                     raise KeyboardInterrupt
                 if key == "\x1b":
@@ -1151,6 +1174,8 @@ def _select_session(sessions: list) -> object | None:
                     index = (index - 1) % len(sessions)
                 elif _is_down_key(key):
                     index = (index + 1) % len(sessions)
+                elif allow_delete and key.lower() == "d":
+                    return ("delete", sessions[index])
                 elif key in ("A", "B", "C", "D", "[", "O"):
                     continue
                 window = _session_window(sessions, index)
@@ -1158,13 +1183,14 @@ def _select_session(sessions: list) -> object | None:
                     build_session_list_lines(
                         window,
                         index - _session_window_start(sessions, index),
+                        allow_delete=allow_delete,
                     )
                 )
         finally:
             renderer.finish()
 
     err_console.print()
-    return sessions[index]
+    return ("resume", sessions[index])
 
 
 def _session_window_start(sessions: list, index: int, *, window_size: int = 10) -> int:
@@ -1352,6 +1378,7 @@ def run_chat(
             err_console.print("[dim]\\        — continue input on the next line[/dim]")
             err_console.print("[dim]/new      — start a persistent chat session[/dim]")
             err_console.print("[dim]/resume   — resume a saved session[/dim]")
+            err_console.print("[dim]/forget   — delete a saved session[/dim]")
             err_console.print("[dim]/dreaming — consolidate memories from conversation[/dim]")
             err_console.print("[dim]/memory   — view extracted memories[/dim]")
             err_console.print("[dim]/effort   — pick instant / short / default / long[/dim]")
@@ -1396,18 +1423,40 @@ def run_chat(
             save_session(session)
             err_console.print(f"[dim]Persistent session started ({session.session_id[:8]}...)[/dim]")
             continue
-        if stripped == "/resume":
-            available_sessions = list_sessions()
-            if not available_sessions:
-                err_console.print("[dim]No saved sessions.[/dim]")
-                continue
-            selected_session = _select_session(available_sessions)
-            if selected_session is None:
-                continue
-            session = selected_session
-            messages = [{"role": m.role, "content": m.content} for m in session.messages]
-            session_memories = load_memories(session.session_id)
-            err_console.print(f"[dim]Resumed: {session.title} ({len(messages)} messages)[/dim]")
+        if stripped in ("/resume", "/forget"):
+            while True:
+                available_sessions = list_sessions()
+                if not available_sessions:
+                    err_console.print("[dim]No saved sessions.[/dim]")
+                    break
+                selection = _select_session_action(
+                    available_sessions,
+                    allow_delete=(stripped == "/forget"),
+                )
+                if selection is None:
+                    break
+                action, selected_session = selection
+                if stripped == "/forget":
+                    action = "delete"
+                if action == "delete":
+                    if not _confirm_session_delete(selected_session):
+                        continue
+                    deleted = delete_session(selected_session.session_id)
+                    if deleted:
+                        if session is not None and session.session_id == selected_session.session_id:
+                            session = None
+                            session_memories = []
+                        err_console.print(
+                            f"[dim]Deleted saved session: {selected_session.title or selected_session.session_id[:8]}[/dim]"
+                        )
+                    else:
+                        err_console.print("[dim]Session was already removed.[/dim]")
+                    continue
+                session = selected_session
+                messages = [{"role": m.role, "content": m.content} for m in session.messages]
+                session_memories = load_memories(session.session_id)
+                err_console.print(f"[dim]Resumed: {session.title} ({len(messages)} messages)[/dim]")
+                break
             continue
         if stripped == "/dreaming":
             if session is None:

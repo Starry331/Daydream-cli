@@ -955,7 +955,12 @@ def build_dreaming_menu_lines(selected: str) -> list[str]:
     return lines
 
 
-def build_session_list_lines(sessions: list, selected_index: int) -> list[str]:
+def build_session_list_lines(
+    sessions: list,
+    selected_index: int,
+    *,
+    allow_delete: bool = False,
+) -> list[str]:
     """Arrow-key menu for /resume session selection."""
     frame_width, indent = _chat_frame_width()
     text_width = frame_width
@@ -980,7 +985,11 @@ def build_session_list_lines(sessions: list, selected_index: int) -> list[str]:
         lines.append(f"{pad}{content}")
 
     lines.append(f"{pad}{' ' * text_width}")
-    hint = _fit_display_width("Use \u2191/\u2193 or j/k \u00b7 Enter to resume \u00b7 Esc to cancel", text_width)
+    hint_text = "Use \u2191/\u2193 or j/k \u00b7 Enter to resume"
+    if allow_delete:
+        hint_text += " \u00b7 d to delete"
+    hint_text += " \u00b7 Esc to cancel"
+    hint = _fit_display_width(hint_text, text_width)
     lines.append(f"{pad}{_DIM}{hint}{_RESET}")
     lines.append(_frame_line("", frame_width, indent, bottom=True))
     return lines

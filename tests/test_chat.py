@@ -16,6 +16,7 @@ from daydream.chat import (
     _build_session_memory_prompt,
     _collect_multiline_message,
     _confirm_memory_import,
+    _confirm_session_delete,
     _current_command_selection,
     _drain_pending_escape,
     _effort_chat_template_kwargs,
@@ -30,6 +31,7 @@ from daydream.chat import (
     _read_key,
     _read_live_boxed_message,
     _select_effort,
+    _select_session_action,
     run_oneshot,
 )
 
@@ -290,6 +292,82 @@ class ChatTests(unittest.TestCase):
     def test_confirm_memory_import_respects_no(self) -> None:
         with mock.patch("daydream.chat.err_console.input", return_value="n"):
             self.assertFalse(_confirm_memory_import([mock.Mock()]))
+
+    def test_confirm_session_delete_requires_explicit_choice(self) -> None:
+        session = mock.Mock(title="session one")
+        with mock.patch("daydream.chat.sys.stdin.isatty", return_value=True), \
+            mock.patch("daydream.chat.err_console.input", side_effect=["", "n"]):
+            self.assertFalse(_confirm_session_delete(session))
+
+    def test_confirm_session_delete_accepts_yes(self) -> None:
+        session = mock.Mock(title="session one")
+        with mock.patch("daydream.chat.sys.stdin.isatty", return_value=True), \
+            mock.patch("daydream.chat.err_console.input", return_value="y"):
+            self.assertTrue(_confirm_session_delete(session))
+
+    def test_session_menu_delete_shortcut_returns_delete_action(self) -> None:
+        @contextmanager
+        def fake_raw():
+            yield
+
+        class FakeRenderer:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def render(self, _lines):
+                return
+
+            def wait_for_input(self, _lines):
+                return
+
+            def finish(self):
+                return
+
+        sessions = [
+            mock.Mock(title="First", model="qwen", updated_at=1.0, messages=[]),
+            mock.Mock(title="Second", model="qwen", updated_at=2.0, messages=[]),
+        ]
+        with mock.patch("daydream.chat._raw_stdin", fake_raw), \
+            mock.patch("daydream.chat._InlineTerminalRenderer", FakeRenderer), \
+            mock.patch("daydream.chat.sys.stdin.isatty", return_value=True), \
+            mock.patch("daydream.chat.err_console", mock.Mock(is_terminal=True)), \
+            mock.patch("daydream.chat._read_key", side_effect=["d"]):
+            action, chosen = _select_session_action(sessions, allow_delete=True)
+
+        self.assertEqual(action, "delete")
+        self.assertIs(chosen, sessions[0])
+
+    def test_session_menu_ignores_delete_shortcut_when_not_allowed(self) -> None:
+        @contextmanager
+        def fake_raw():
+            yield
+
+        class FakeRenderer:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def render(self, _lines):
+                return
+
+            def wait_for_input(self, _lines):
+                return
+
+            def finish(self):
+                return
+
+        sessions = [
+            mock.Mock(title="First", model="qwen", updated_at=1.0, messages=[]),
+            mock.Mock(title="Second", model="qwen", updated_at=2.0, messages=[]),
+        ]
+        with mock.patch("daydream.chat._raw_stdin", fake_raw), \
+            mock.patch("daydream.chat._InlineTerminalRenderer", FakeRenderer), \
+            mock.patch("daydream.chat.sys.stdin.isatty", return_value=True), \
+            mock.patch("daydream.chat.err_console", mock.Mock(is_terminal=True)), \
+            mock.patch("daydream.chat._read_key", side_effect=["d", "\r"]):
+            action, chosen = _select_session_action(sessions, allow_delete=False)
+
+        self.assertEqual(action, "resume")
+        self.assertIs(chosen, sessions[0])
 
     def test_inline_terminal_renderer_tracks_bottom_rows_across_resize(self) -> None:
         stream = io.StringIO()
