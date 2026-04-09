@@ -1109,6 +1109,9 @@ def _stream_response(
         if full_text:
             err_console.print(full_text, markup=False, highlight=False)
             err_console.print()
+        if status.had_reasoning:
+            err_console.print("[dim]Use /t to expand reasoning[/dim]")
+            err_console.print()
 
     if wrote_output and stream_to_stdout:
         print()
@@ -1143,6 +1146,21 @@ def _reserve_bottom_rows(count: int) -> None:
 
 def _prepare_status_overlay_space() -> None:
     _reserve_bottom_rows(_STATUS_OVERLAY_RESERVE_LINES)
+
+
+def _print_resumed_history(messages: list[ChatMessage], assistant_label: str) -> None:
+    visible_messages = [message for message in messages if message.role in {"user", "assistant"}]
+    if not visible_messages:
+        return
+
+    err_console.print()
+    for message in visible_messages:
+        if message.role == "user":
+            err_console.print("[bold]You[/]")
+        else:
+            err_console.print(f"[bold cyan]{assistant_label}[/]")
+        err_console.print(message.content, markup=False, highlight=False)
+        err_console.print()
 
 
 def _select_dreaming_mode() -> str | None:
@@ -1553,6 +1571,7 @@ def run_chat(
                 messages = [{"role": m.role, "content": m.content} for m in session.messages]
                 session_memories = load_memories(session.session_id)
                 err_console.print(f"[dim]Resumed: {session.title} ({len(messages)} messages)[/dim]")
+                _print_resumed_history(session.messages, short)
                 break
             continue
         if stripped == "/dreaming":

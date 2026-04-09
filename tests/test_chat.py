@@ -599,6 +599,7 @@ class ChatTests(unittest.TestCase):
             if call.args
         )
         self.assertIn("Hello from Daydream.", printed)
+        self.assertIn("Use /t to expand reasoning", printed)
 
     def test_run_chat_keeps_output_after_reasoning_in_persistent_session(self) -> None:
         captured_statuses: list[object] = []
@@ -684,8 +685,48 @@ class ChatTests(unittest.TestCase):
             if call.args
         )
         self.assertIn("Hello from persistent memory.", printed)
+        self.assertIn("Use /t to expand reasoning", printed)
         self.assertTrue(saved_sessions)
         self.assertEqual(saved_sessions[-1].messages[-1].content, "Hello from persistent memory.")
+
+    def test_run_chat_resume_prints_saved_history(self) -> None:
+        from daydream.storage import ChatMessage, ChatSession
+
+        fake_err_console = mock.Mock(is_terminal=True)
+        fake_err_console.print = mock.Mock()
+        fake_err_console.status = contextmanager(lambda _msg: iter([None]))  # type: ignore[arg-type]
+
+        session = ChatSession(
+            session_id="abc123",
+            model="qwen3.5-9b",
+            title="Saved chat",
+            created_at=1.0,
+            updated_at=2.0,
+            messages=[
+                ChatMessage(role="user", content="Earlier question", timestamp=1.0),
+                ChatMessage(role="assistant", content="Earlier answer", timestamp=2.0, reasoning="hidden chain"),
+            ],
+            memories=[],
+        )
+
+        with mock.patch("daydream.chat.err_console", fake_err_console), \
+            mock.patch("daydream.chat._read_boxed_message", side_effect=["/resume", "/quit"]), \
+            mock.patch("daydream.chat.ensure_runtime_model", return_value="mlx-community/Qwen3.5-9B-4bit"), \
+            mock.patch("daydream.chat.engine.load_model", return_value=("model", mock.Mock(has_thinking=True))), \
+            mock.patch("daydream.chat.list_sessions", return_value=[session]), \
+            mock.patch("daydream.chat.load_memories", return_value=[]), \
+            mock.patch("daydream.chat._select_session_action", return_value=("resume", session)):
+            run_chat("foo", display_name="qwen3.5-9b")
+
+        printed = " ".join(
+            str(call.args[0])
+            for call in fake_err_console.print.call_args_list
+            if call.args
+        )
+        self.assertIn("Resumed: Saved chat", printed)
+        self.assertIn("Earlier question", printed)
+        self.assertIn("Earlier answer", printed)
+        self.assertNotIn("hidden chain", printed)
 
 
 if __name__ == "__main__":
