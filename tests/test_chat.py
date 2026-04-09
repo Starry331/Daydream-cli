@@ -13,7 +13,6 @@ from rich.console import Console
 from daydream.chat import (
     _InlineTerminalRenderer,
     _ReasoningParser,
-    _STATUS_OVERLAY_RESERVE_LINES,
     _build_request_messages,
     _build_session_memory_prompt,
     _collect_multiline_message,
@@ -32,8 +31,10 @@ from daydream.chat import (
     _normalize_effort,
     _read_key,
     _read_live_boxed_message,
+    _select_dreaming_mode,
     _select_effort,
     _select_session_action,
+    _status_overlay_reserve_lines,
     run_chat,
     run_oneshot,
 )
@@ -136,6 +137,19 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(delta, "Hello! How can I help you today?")
         self.assertEqual(reasoning_delta, "")
         self.assertTrue(closed)
+
+    def test_reasoning_parser_switches_to_reasoning_after_visible_output_on_strong_marker(self) -> None:
+        parser = _ReasoningParser()
+
+        delta, reasoning_delta, closed = parser.feed("Hello there.\n\n")
+        self.assertEqual(delta, "Hello there.\n\n")
+        self.assertEqual(reasoning_delta, "")
+        self.assertFalse(closed)
+
+        delta, reasoning_delta, closed = parser.feed("*Refinement:* Keep it conversational.\n")
+        self.assertEqual(delta, "")
+        self.assertIn("*Refinement:* Keep it conversational.", reasoning_delta)
+        self.assertFalse(closed)
 
     def test_matching_slash_commands_filters_by_prefix(self) -> None:
         matches = _matching_slash_commands("/e")
@@ -245,6 +259,60 @@ class ChatTests(unittest.TestCase):
 
         self.assertEqual(result, "long")
 
+    def test_effort_menu_escape_cancels_immediately(self) -> None:
+        @contextmanager
+        def fake_raw():
+            yield
+
+        class FakeRenderer:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def render(self, _lines):
+                return
+
+            def wait_for_input(self, _lines):
+                return
+
+            def finish(self):
+                return
+
+        with mock.patch("daydream.chat._raw_stdin", fake_raw), \
+            mock.patch("daydream.chat._InlineTerminalRenderer", FakeRenderer), \
+            mock.patch("daydream.chat.sys.stdin.isatty", return_value=True), \
+            mock.patch("daydream.chat.err_console", mock.Mock(is_terminal=True)), \
+            mock.patch("daydream.chat._read_key", return_value="\x1b"):
+            result = _select_effort("default", supported=True)
+
+        self.assertEqual(result, "default")
+
+    def test_dreaming_menu_escape_cancels_immediately(self) -> None:
+        @contextmanager
+        def fake_raw():
+            yield
+
+        class FakeRenderer:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def render(self, _lines):
+                return
+
+            def wait_for_input(self, _lines):
+                return
+
+            def finish(self):
+                return
+
+        with mock.patch("daydream.chat._raw_stdin", fake_raw), \
+            mock.patch("daydream.chat._InlineTerminalRenderer", FakeRenderer), \
+            mock.patch("daydream.chat.sys.stdin.isatty", return_value=True), \
+            mock.patch("daydream.chat.err_console", mock.Mock(is_terminal=True)), \
+            mock.patch("daydream.chat._read_key", return_value="\x1b"):
+            result = _select_dreaming_mode()
+
+        self.assertIsNone(result)
+
     def test_arrow_key_helpers_accept_modified_sequences(self) -> None:
         self.assertTrue(_is_up_key("\x1bOA"))
         self.assertTrue(_is_up_key("\x1b[1;2A"))
@@ -280,6 +348,7 @@ class ChatTests(unittest.TestCase):
         self.assertIsNone(_effort_system_prompt("short", "mlx-community/SmolLM2-360M-Instruct-4bit"))
         tokenizer = mock.Mock(has_thinking=True)
         self.assertEqual(_effort_chat_template_kwargs("instant", tokenizer), {"enable_thinking": False})
+        self.assertEqual(_effort_chat_template_kwargs("short", tokenizer), {"enable_thinking": True})
         self.assertEqual(_effort_chat_template_kwargs("long", tokenizer), {"enable_thinking": True})
         self.assertEqual(_effort_chat_template_kwargs("default", tokenizer), {})
 
@@ -437,6 +506,37 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(action, "resume")
         self.assertIs(chosen, sessions[0])
 
+    def test_session_menu_escape_cancels_immediately(self) -> None:
+        @contextmanager
+        def fake_raw():
+            yield
+
+        class FakeRenderer:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def render(self, _lines):
+                return
+
+            def wait_for_input(self, _lines):
+                return
+
+            def finish(self):
+                return
+
+        sessions = [
+            mock.Mock(title="First", model="qwen", updated_at=1.0, messages=[]),
+            mock.Mock(title="Second", model="qwen", updated_at=2.0, messages=[]),
+        ]
+        with mock.patch("daydream.chat._raw_stdin", fake_raw), \
+            mock.patch("daydream.chat._InlineTerminalRenderer", FakeRenderer), \
+            mock.patch("daydream.chat.sys.stdin.isatty", return_value=True), \
+            mock.patch("daydream.chat.err_console", mock.Mock(is_terminal=True)), \
+            mock.patch("daydream.chat._read_key", return_value="\x1b"):
+            result = _select_session_action(sessions, allow_delete=False)
+
+        self.assertIsNone(result)
+
     def test_inline_terminal_renderer_tracks_bottom_rows_across_resize(self) -> None:
         stream = io.StringIO()
 
@@ -588,17 +688,16 @@ class ChatTests(unittest.TestCase):
             run_chat("foo")
 
         self.assertEqual(len(captured_statuses), 1)
-        self.assertIn("Hello from Daydream.", captured_statuses[0].output)
-        self.assertNotIn("</think>", captured_statuses[0].output)
+        self.assertEqual(captured_statuses[0].output, "")
         raw = fake_err_console.file.getvalue()
-        self.assertTrue(raw.startswith(f"\x1b[24;1H{chr(10) * _STATUS_OVERLAY_RESERVE_LINES}"))
+        self.assertTrue(raw.startswith(f"\x1b[24;1H{chr(10) * _status_overlay_reserve_lines('foo')}"))
         self.assertGreaterEqual(raw.count("\x1b[24;1H\n"), 1)
+        self.assertIn("Hello from Daydream.", raw)
         printed = " ".join(
             str(call.args[0])
             for call in fake_err_console.print.call_args_list
             if call.args
         )
-        self.assertIn("Hello from Daydream.", printed)
         self.assertIn("Use /t to expand reasoning", printed)
 
     def test_run_chat_keeps_output_after_reasoning_in_persistent_session(self) -> None:
@@ -674,17 +773,16 @@ class ChatTests(unittest.TestCase):
             run_chat("foo")
 
         self.assertEqual(len(captured_statuses), 1)
-        self.assertIn("Hello from persistent memory.", captured_statuses[0].output)
-        self.assertNotIn("</think>", captured_statuses[0].output)
+        self.assertEqual(captured_statuses[0].output, "")
         raw = fake_err_console.file.getvalue()
-        self.assertTrue(raw.startswith(f"\x1b[24;1H{chr(10) * _STATUS_OVERLAY_RESERVE_LINES}"))
+        self.assertTrue(raw.startswith(f"\x1b[24;1H{chr(10) * _status_overlay_reserve_lines('foo')}"))
         self.assertGreaterEqual(raw.count("\x1b[24;1H\n"), 1)
+        self.assertIn("Hello from persistent memory.", raw)
         printed = " ".join(
             str(call.args[0])
             for call in fake_err_console.print.call_args_list
             if call.args
         )
-        self.assertIn("Hello from persistent memory.", printed)
         self.assertIn("Use /t to expand reasoning", printed)
         self.assertTrue(saved_sessions)
         self.assertEqual(saved_sessions[-1].messages[-1].content, "Hello from persistent memory.")
@@ -727,6 +825,257 @@ class ChatTests(unittest.TestCase):
         self.assertIn("Earlier question", printed)
         self.assertIn("Earlier answer", printed)
         self.assertNotIn("hidden chain", printed)
+
+    def test_run_chat_resume_prints_only_last_ten_visible_messages(self) -> None:
+        from daydream.storage import ChatMessage, ChatSession
+
+        fake_err_console = mock.Mock(is_terminal=True)
+        fake_err_console.print = mock.Mock()
+        fake_err_console.status = contextmanager(lambda _msg: iter([None]))  # type: ignore[arg-type]
+
+        saved_messages = [
+            ChatMessage(role="user", content=f"Question-{index:02d}", timestamp=float(index))
+            if index % 2 == 0
+            else ChatMessage(role="assistant", content=f"Answer-{index:02d}", timestamp=float(index))
+            for index in range(12)
+        ]
+        session = ChatSession(
+            session_id="many123",
+            model="qwen3.5-9b",
+            title="Long chat",
+            created_at=1.0,
+            updated_at=2.0,
+            messages=saved_messages,
+            memories=[],
+        )
+
+        with mock.patch("daydream.chat.err_console", fake_err_console), \
+            mock.patch("daydream.chat._read_boxed_message", side_effect=["/resume", "/quit"]), \
+            mock.patch("daydream.chat.ensure_runtime_model", return_value="mlx-community/Qwen3.5-9B-4bit"), \
+            mock.patch("daydream.chat.engine.load_model", return_value=("model", mock.Mock(has_thinking=True))), \
+            mock.patch("daydream.chat.list_sessions", return_value=[session]), \
+            mock.patch("daydream.chat.load_memories", return_value=[]), \
+            mock.patch("daydream.chat._select_session_action", return_value=("resume", session)):
+            run_chat("foo", display_name="qwen3.5-9b")
+
+        printed = " ".join(
+            str(call.args[0])
+            for call in fake_err_console.print.call_args_list
+            if call.args
+        )
+        self.assertNotIn("Question-00", printed)
+        self.assertNotIn("Answer-01", printed)
+        self.assertIn("Question-02", printed)
+        self.assertIn("Answer-11", printed)
+
+    def test_run_chat_strips_reasoning_leak_from_final_output(self) -> None:
+        captured_statuses: list[object] = []
+
+        class FakeStatus:
+            def __init__(self):
+                self.output = ""
+                self.had_reasoning = False
+                self.reasoning_elapsed = None
+
+            def start_reasoning(self):
+                self.had_reasoning = True
+                self.reasoning_elapsed = 1.0
+
+            def append_reasoning(self, _text):
+                return
+
+            def end_reasoning(self):
+                return
+
+            def update(self, **_kwargs):
+                return
+
+            def ensure_minimum_wait(self, _seconds):
+                return
+
+            def append_output(self, text):
+                self.output += text
+
+        @contextmanager
+        def fake_daydreaming_status(_console, _label):
+            status = FakeStatus()
+            captured_statuses.append(status)
+            yield status
+
+        fake_err_console = mock.Mock(is_terminal=True)
+        fake_err_console.print = mock.Mock()
+        fake_err_console.status = contextmanager(lambda _msg: iter([None]))  # type: ignore[arg-type]
+        fake_err_console.file = io.StringIO()
+        fake_err_console.file.isatty = lambda: True
+
+        responses = iter([
+            SimpleNamespace(
+                text="你好！很高兴为您服务。\n我可以用中文和您交流。有什么我可以帮您的吗？\n\n",
+                prompt_tps=12.0,
+                generation_tps=18.0,
+                finish_reason=None,
+            ),
+            SimpleNamespace(
+                text="*Refinement:* Keep it conversational.\n\"你好！很高兴见到你。有什么我可以帮助你的吗？\"\n\n",
+                prompt_tps=12.0,
+                generation_tps=18.0,
+                finish_reason=None,
+            ),
+            SimpleNamespace(
+                text="*Final Output:*\n你好！很高兴和你打招呼。有什么我可以帮你的吗？",
+                prompt_tps=12.0,
+                generation_tps=18.0,
+                finish_reason="stop",
+            ),
+        ])
+
+        with mock.patch("daydream.chat.err_console", fake_err_console), \
+            mock.patch("daydream.chat._read_boxed_message", side_effect=["你好", "/quit"]), \
+            mock.patch("daydream.chat.ensure_runtime_model", return_value="mlx-community/Foo-4bit"), \
+            mock.patch("daydream.chat.engine.load_model", return_value=("model", mock.Mock(has_thinking=True))), \
+            mock.patch("daydream.chat.engine.generate_stream", side_effect=lambda *args, **kwargs: responses), \
+            mock.patch("daydream.chat.daydreaming_status", fake_daydreaming_status):
+            run_chat("foo")
+
+        printed = " ".join(
+            str(call.args[0])
+            for call in fake_err_console.print.call_args_list
+            if call.args
+        )
+        self.assertIn("你好！很高兴和你打招呼。有什么我可以帮你的吗？", printed)
+        self.assertNotIn("Refinement", printed)
+        self.assertNotIn("Final Output", printed)
+        self.assertNotIn("我可以用中文和您交流", printed)
+
+    def test_run_chat_does_not_duplicate_final_output_after_reasoning(self) -> None:
+        class FakeStatus:
+            def __init__(self):
+                self.output = ""
+                self.had_reasoning = False
+                self.reasoning_elapsed = None
+
+            def start_reasoning(self):
+                self.had_reasoning = True
+                self.reasoning_elapsed = 1.0
+
+            def append_reasoning(self, _text):
+                return
+
+            def end_reasoning(self):
+                return
+
+            def update(self, **_kwargs):
+                return
+
+            def ensure_minimum_wait(self, _seconds):
+                return
+
+            def append_output(self, text):
+                self.output += text
+
+            def clear_output(self):
+                self.output = ""
+
+        @contextmanager
+        def fake_daydreaming_status(_console, _label):
+            yield FakeStatus()
+
+        fake_err_console = mock.Mock(is_terminal=True)
+        fake_err_console.print = mock.Mock()
+        fake_err_console.status = contextmanager(lambda _msg: iter([None]))  # type: ignore[arg-type]
+        fake_err_console.file = io.StringIO()
+        fake_err_console.file.isatty = lambda: True
+
+        responses = iter([
+            SimpleNamespace(
+                text="<think>analysis</think>\n好的，随时待命！接下来你想聊些什么，或者有什么具体的问题需要我协助吗？",
+                prompt_tps=12.0,
+                generation_tps=18.0,
+                finish_reason="stop",
+            ),
+        ])
+
+        with mock.patch("daydream.chat.err_console", fake_err_console), \
+            mock.patch("daydream.chat._read_boxed_message", side_effect=["你好", "/quit"]), \
+            mock.patch("daydream.chat.ensure_runtime_model", return_value="mlx-community/Foo-4bit"), \
+            mock.patch("daydream.chat.engine.load_model", return_value=("model", mock.Mock(has_thinking=True))), \
+            mock.patch("daydream.chat.engine.generate_stream", side_effect=lambda *args, **kwargs: responses), \
+            mock.patch("daydream.chat.daydreaming_status", fake_daydreaming_status):
+            run_chat("foo")
+
+        raw_terminal = fake_err_console.file.getvalue()
+        self.assertEqual(
+            raw_terminal.count("好的，随时待命！接下来你想聊些什么，或者有什么具体的问题需要我协助吗？"),
+            1,
+        )
+
+    def test_run_chat_streams_visible_text_after_reasoning_to_console(self) -> None:
+        class FakeStatus:
+            def __init__(self):
+                self.output = ""
+                self.had_reasoning = False
+                self.reasoning_elapsed = None
+
+            def start_reasoning(self):
+                self.had_reasoning = True
+                self.reasoning_elapsed = 1.0
+
+            def append_reasoning(self, _text):
+                return
+
+            def end_reasoning(self):
+                return
+
+            def update(self, **_kwargs):
+                return
+
+            def ensure_minimum_wait(self, _seconds):
+                return
+
+            def append_output(self, text):
+                self.output += text
+
+            def clear_output(self):
+                self.output = ""
+
+            def stop(self):
+                return
+
+        @contextmanager
+        def fake_daydreaming_status(_console, _label):
+            yield FakeStatus()
+
+        fake_err_console = mock.Mock(is_terminal=True)
+        fake_err_console.print = mock.Mock()
+        fake_err_console.status = contextmanager(lambda _msg: iter([None]))  # type: ignore[arg-type]
+        fake_err_console.file = io.StringIO()
+        fake_err_console.file.isatty = lambda: True
+
+        responses = iter([
+            SimpleNamespace(
+                text="<think>analysis</think>\nFirst line.",
+                prompt_tps=12.0,
+                generation_tps=18.0,
+                finish_reason=None,
+            ),
+            SimpleNamespace(
+                text=" Second line.",
+                prompt_tps=12.0,
+                generation_tps=18.0,
+                finish_reason="stop",
+            ),
+        ])
+
+        with mock.patch("daydream.chat.err_console", fake_err_console), \
+            mock.patch("daydream.chat._read_boxed_message", side_effect=["你好", "/quit"]), \
+            mock.patch("daydream.chat.ensure_runtime_model", return_value="mlx-community/Foo-4bit"), \
+            mock.patch("daydream.chat.engine.load_model", return_value=("model", mock.Mock(has_thinking=True))), \
+            mock.patch("daydream.chat.engine.generate_stream", side_effect=lambda *args, **kwargs: responses), \
+            mock.patch("daydream.chat.daydreaming_status", fake_daydreaming_status):
+            run_chat("foo")
+
+        raw_terminal = fake_err_console.file.getvalue()
+        self.assertIn("First line. Second line.", raw_terminal)
 
 
 if __name__ == "__main__":

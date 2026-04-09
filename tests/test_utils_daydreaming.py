@@ -9,6 +9,7 @@ from rich.console import Console
 from daydream.utils import (
     _strip_ansi,
     BottomTerminalRenderer,
+    ConversationStatus,
     _DREAM_WORDS,
     REFLECTING_LABEL,
     build_effort_menu_lines,
@@ -106,6 +107,52 @@ class DaydreamingTextTests(unittest.TestCase):
         self.assertIn("\x1b[22;1H", output)
         self.assertIn("\x1b[16;1H", output)
         self.assertIn("\x1b[18;1H\n\n\n\n\n\n", output)
+
+    def test_bottom_terminal_renderer_scrolls_cleanly_when_overlay_grows(self) -> None:
+        stream = io.StringIO()
+
+        class Renderer(BottomTerminalRenderer):
+            def __init__(self, stream):
+                super().__init__(stream, clear_on_finish=False)
+                self.rows = 24
+                self.cols = 96
+
+            def _terminal_size(self):
+                return os.terminal_size((self.cols, self.rows))
+
+        renderer = Renderer(stream)
+        renderer.render(["line one", "line two", "line three"])
+        before_growth = len(stream.getvalue())
+        renderer.render([
+            "line one",
+            "line two",
+            "line three",
+            "line four",
+            "line five",
+            "line six",
+        ])
+
+        growth_output = stream.getvalue()[before_growth:]
+        self.assertIn("\x1b[22;1H\x1b[J", growth_output)
+        self.assertIn("\x1b[24;1H\n\n\n", growth_output)
+        self.assertLess(
+            growth_output.index("\x1b[22;1H\x1b[J"),
+            growth_output.index("\x1b[24;1H\n\n\n"),
+        )
+
+    def test_conversation_status_stop_disables_future_overlay_renders(self) -> None:
+        stream = io.StringIO()
+        stream.isatty = lambda: True
+        console = Console(file=stream, force_terminal=True, color_system="truecolor")
+        status = ConversationStatus(console, "qwen3.5-9b")
+        status.start()
+        status.start_reasoning()
+        status.append_reasoning("thinking")
+        status.stop()
+        snapshot = stream.getvalue()
+        status.update(tokens_per_second=42.0)
+        status.append_output("visible text")
+        self.assertEqual(stream.getvalue(), snapshot)
 
 
 if __name__ == "__main__":

@@ -204,6 +204,26 @@ def _wrap_display_text(text: str, width: int) -> list[str]:
     return lines or [""]
 
 
+def measure_renderable_lines(
+    renderable: list[str] | Iterable[str] | object,
+    *,
+    color_system: str | None = "truecolor",
+) -> int:
+    if isinstance(renderable, list) and all(isinstance(line, str) for line in renderable):
+        return len(renderable or [""])
+
+    size = shutil.get_terminal_size(fallback=(96, 24))
+    render_console = Console(
+        force_terminal=True,
+        color_system=color_system,
+        legacy_windows=False,
+        width=max(20, size.columns),
+    )
+    options = render_console.options.update(width=max(20, size.columns))
+    rendered_lines = render_console.render_lines(renderable, options=options, pad=False, new_lines=False)
+    return max(1, len(rendered_lines))
+
+
 def _chat_frame_width() -> tuple[int, int]:
     columns = shutil.get_terminal_size(fallback=(96, 24)).columns
     indent = 0
@@ -683,6 +703,7 @@ class ConversationStatus:
         self._dream_word = choose_dream_word()
         self._title_animator = TerminalTitleAnimator(self._dream_word, frames=_TITLE_Z_FRAMES)
         self._rainbow = random.random() < _RAINBOW_PROBABILITY
+        self._stopped = False
 
     def _reasoning_time(self) -> float:
         elapsed = self._reasoning_elapsed or 0.0
@@ -776,7 +797,7 @@ class ConversationStatus:
                 self._waiting = waiting
                 if not waiting:
                     self._title_animator.stop()
-        if self._renderer is not None:
+        if self._renderer is not None and not self._stopped:
             self._renderer.render(self._render())
 
     def ensure_minimum_wait(self, minimum_seconds: float) -> None:
@@ -794,7 +815,7 @@ class ConversationStatus:
                 self._reasoning_start = time.monotonic()
             self._had_reasoning = True
             self._phase = "thinking"
-        if self._renderer is not None:
+        if self._renderer is not None and not self._stopped:
             self._renderer.render(self._render())
 
     def end_reasoning(self) -> None:
@@ -805,7 +826,7 @@ class ConversationStatus:
                 self._reasoning_elapsed = (self._reasoning_elapsed or 0.0) + elapsed
                 self._reasoning_start = None
         self._title_animator.stop()
-        if self._renderer is not None:
+        if self._renderer is not None and not self._stopped:
             self._renderer.render(self._render())
 
     def append_reasoning(self, text: str) -> None:
@@ -813,7 +834,7 @@ class ConversationStatus:
             return
         with self._lock:
             self._reasoning_text += text
-        if self._renderer is not None:
+        if self._renderer is not None and not self._stopped:
             self._renderer.render(self._render())
 
     def append_output(self, text: str) -> None:
@@ -821,16 +842,26 @@ class ConversationStatus:
             return
         with self._lock:
             self._output += text
-        if self._renderer is not None:
+        if self._renderer is not None and not self._stopped:
+            self._renderer.render(self._render())
+
+    def clear_output(self) -> None:
+        with self._lock:
+            self._output = ""
+        if self._renderer is not None and not self._stopped:
             self._renderer.render(self._render())
 
     def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=0.2)
         if self._renderer is not None:
             self._renderer.render(self._render())
             self._renderer.finish()
+            self._renderer = None
         self._title_animator.stop()
 
 
@@ -896,13 +927,18 @@ class BottomTerminalRenderer:
         lines = self._renderable_to_lines(renderable)
         size = self._terminal_size()
         start_row = max(1, size.lines - len(lines) + 1)
-        size_shrank = (
-            size.lines < self._last_size.lines
-            or size.columns < self._last_size.columns
-        )
-        if self._start_row is not None and start_row < self._start_row and size_shrank:
+        grows_upward = self._start_row is not None and start_row < self._start_row
+
+        # When a bottom-pinned overlay needs more rows than the previous frame,
+        # clear the old overlay first, then scroll blank space into view.
+        # This keeps prior chat history in scrollback instead of letting the
+        # growing overlay wipe lines that were already printed above it.
+        if grows_upward:
+            self._clear_from(self._start_row)
             self._scroll_up(self._start_row - start_row, rows=size.lines)
-        clear_from = start_row if self._start_row is None else min(self._start_row, start_row)
+            clear_from = start_row
+        else:
+            clear_from = start_row if self._start_row is None else min(self._start_row, start_row)
         self._clear_from(clear_from)
 
         for index, line in enumerate(lines):
