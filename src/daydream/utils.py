@@ -690,6 +690,17 @@ class ConversationStatus:
             return elapsed + (time.monotonic() - self._reasoning_start)
         return elapsed
 
+    @property
+    def had_reasoning(self) -> bool:
+        return self._had_reasoning
+
+    @property
+    def reasoning_elapsed(self) -> float | None:
+        value = self._reasoning_time()
+        if value <= 0.0:
+            return None
+        return value
+
     def _render(self) -> Group:
         with self._lock:
             parts: list = []
@@ -735,7 +746,7 @@ class ConversationStatus:
             return
         self._renderer = BottomTerminalRenderer(
             self.console.file,
-            clear_on_finish=False,
+            clear_on_finish=True,
             color_system=self.console.color_system or "truecolor",
         )
         self._renderer.render(self._render())

@@ -26,6 +26,7 @@ from daydream.utils import (
     build_memory_display_lines,
     build_session_list_lines,
     daydreaming_status,
+    render_reasoning_line,
     render_expanded_reasoning,
     render_input_box,
 )
@@ -719,11 +720,6 @@ class _ReasoningParser:
 
         while self._buffer:
             if self.in_reasoning:
-                if self._implicit_reasoning and _should_end_implicit_reasoning(self.reasoning_text, self._buffer):
-                    self.in_reasoning = False
-                    self._implicit_reasoning = False
-                    just_closed = True
-                    continue
                 if self._buffer.startswith(CLOSE_THINK_TAG):
                     self._buffer = self._buffer[len(CLOSE_THINK_TAG):]
                     self.in_reasoning = False
@@ -732,6 +728,11 @@ class _ReasoningParser:
                     continue
                 if _starts_with_partial_tag(self._buffer, CLOSE_THINK_TAG):
                     break
+                if self._implicit_reasoning and _should_end_implicit_reasoning(self.reasoning_text, self._buffer):
+                    self.in_reasoning = False
+                    self._implicit_reasoning = False
+                    just_closed = True
+                    continue
                 char = self._buffer[0]
                 reasoning_parts.append(char)
                 self.reasoning_text += char
@@ -764,11 +765,20 @@ class _ReasoningParser:
 
             if _starts_with_partial_tag(self._buffer, OPEN_THINK_TAG):
                 break
+            if self.saw_reasoning and self._buffer.startswith(CLOSE_THINK_TAG):
+                self._buffer = self._buffer[len(CLOSE_THINK_TAG):]
+                just_closed = True
+                continue
+            if just_closed and self.saw_reasoning and self._buffer[:1] in ("\n", "\r"):
+                self._buffer = self._buffer[1:]
+                continue
             if (
                 not self.saw_reasoning
                 and not self._emitted_any_visible
                 and _starts_with_partial_tag(self._buffer, CLOSE_THINK_TAG)
             ):
+                break
+            if self.saw_reasoning and _starts_with_partial_tag(self._buffer, CLOSE_THINK_TAG):
                 break
             if (
                 not self.saw_reasoning
@@ -1039,6 +1049,17 @@ def _stream_response(
             if response.finish_reason:
                 break
 
+    if not stream_to_stdout:
+        _promote_terminal_output_to_scrollback()
+        if getattr(status, "had_reasoning", False):
+            elapsed = getattr(status, "reasoning_elapsed", None)
+            if elapsed is not None:
+                err_console.print(render_reasoning_line(elapsed, active=False))
+                err_console.print()
+        if full_text:
+            err_console.print(full_text, markup=False, highlight=False)
+            err_console.print()
+
     if wrote_output and stream_to_stdout:
         print()
 
@@ -1046,6 +1067,18 @@ def _stream_response(
         _print_stats(last_response)
 
     return full_text, last_response, parser.reasoning_text
+
+
+def _promote_terminal_output_to_scrollback() -> None:
+    if not err_console.is_terminal:
+        return
+    stream = getattr(err_console, "file", None)
+    if stream is None or not getattr(stream, "isatty", lambda: False)():
+        return
+    rows = shutil.get_terminal_size(fallback=(96, 24)).lines
+    stream.write(f"\x1b[{rows};1H")
+    stream.write("\n")
+    stream.flush()
 
 
 def _select_dreaming_mode() -> str | None:

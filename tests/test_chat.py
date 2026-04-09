@@ -5,6 +5,7 @@ import os
 import time
 import unittest
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest import mock
 
 from rich.console import Console
@@ -32,6 +33,7 @@ from daydream.chat import (
     _read_live_boxed_message,
     _select_effort,
     _select_session_action,
+    run_chat,
     run_oneshot,
 )
 
@@ -92,6 +94,19 @@ class ChatTests(unittest.TestCase):
 
         delta, reasoning_delta, closed = parser.feed("你好")
         self.assertEqual(delta, "你好")
+        self.assertEqual(reasoning_delta, "")
+        self.assertTrue(closed)
+
+    def test_reasoning_parser_hides_close_tag_after_implicit_reasoning(self) -> None:
+        parser = _ReasoningParser()
+
+        delta, reasoning_delta, closed = parser.feed("Here's a thinking process:\n1. Analyze.\n")
+        self.assertEqual(delta, "")
+        self.assertTrue(reasoning_delta)
+        self.assertFalse(closed)
+
+        delta, reasoning_delta, closed = parser.feed("</think>\nHello")
+        self.assertEqual(delta, "Hello")
         self.assertEqual(reasoning_delta, "")
         self.assertTrue(closed)
 
@@ -411,6 +426,169 @@ class ChatTests(unittest.TestCase):
             register_alias=True,
         )
         load_model.assert_called_once_with("mlx-community/Foo-4bit", ensure_available=False)
+
+    def test_run_chat_keeps_output_after_reasoning_in_memoryless_mode(self) -> None:
+        captured_statuses: list[object] = []
+
+        class FakeStatus:
+            def __init__(self):
+                self.output = ""
+                self.had_reasoning = False
+                self.reasoning_elapsed = None
+
+            def start_reasoning(self):
+                self.had_reasoning = True
+                self.reasoning_elapsed = 1.0
+
+            def append_reasoning(self, _text):
+                return
+
+            def end_reasoning(self):
+                return
+
+            def update(self, **_kwargs):
+                return
+
+            def ensure_minimum_wait(self, _seconds):
+                return
+
+            def append_output(self, text):
+                self.output += text
+
+        @contextmanager
+        def fake_daydreaming_status(_console, _label):
+            status = FakeStatus()
+            captured_statuses.append(status)
+            yield status
+
+        @contextmanager
+        def fake_status(_message):
+            yield
+
+        fake_err_console = mock.Mock(is_terminal=True)
+        fake_err_console.status = fake_status
+        fake_err_console.print = mock.Mock()
+        fake_err_console.file = io.StringIO()
+        fake_err_console.file.isatty = lambda: True
+
+        responses = iter([
+            SimpleNamespace(
+                text="Here's a thinking process:\n1. Analyze.\n",
+                prompt_tps=12.0,
+                generation_tps=None,
+                finish_reason=None,
+            ),
+            SimpleNamespace(
+                text="</think>\nHello from Daydream.",
+                prompt_tps=12.0,
+                generation_tps=34.0,
+                finish_reason="stop",
+            ),
+        ])
+
+        with mock.patch("daydream.chat.err_console", fake_err_console), \
+            mock.patch("daydream.chat._read_boxed_message", side_effect=["hello", "/quit"]), \
+            mock.patch("daydream.chat.ensure_runtime_model", return_value="mlx-community/Foo-4bit"), \
+            mock.patch("daydream.chat.engine.load_model", return_value=("model", mock.Mock(has_thinking=True))), \
+            mock.patch("daydream.chat.engine.generate_stream", side_effect=lambda *args, **kwargs: responses), \
+            mock.patch("daydream.chat.daydreaming_status", fake_daydreaming_status):
+            run_chat("foo")
+
+        self.assertEqual(len(captured_statuses), 1)
+        self.assertIn("Hello from Daydream.", captured_statuses[0].output)
+        self.assertNotIn("</think>", captured_statuses[0].output)
+        self.assertIn("\x1b[24;1H\n", fake_err_console.file.getvalue())
+        printed = " ".join(
+            str(call.args[0])
+            for call in fake_err_console.print.call_args_list
+            if call.args
+        )
+        self.assertIn("Hello from Daydream.", printed)
+
+    def test_run_chat_keeps_output_after_reasoning_in_persistent_session(self) -> None:
+        captured_statuses: list[object] = []
+        saved_sessions: list[object] = []
+
+        class FakeStatus:
+            def __init__(self):
+                self.output = ""
+                self.had_reasoning = False
+                self.reasoning_elapsed = None
+
+            def start_reasoning(self):
+                self.had_reasoning = True
+                self.reasoning_elapsed = 1.0
+
+            def append_reasoning(self, _text):
+                return
+
+            def end_reasoning(self):
+                return
+
+            def update(self, **_kwargs):
+                return
+
+            def ensure_minimum_wait(self, _seconds):
+                return
+
+            def append_output(self, text):
+                self.output += text
+
+        @contextmanager
+        def fake_daydreaming_status(_console, _label):
+            status = FakeStatus()
+            captured_statuses.append(status)
+            yield status
+
+        @contextmanager
+        def fake_status(_message):
+            yield
+
+        def fake_save_session(session):
+            saved_sessions.append(session)
+
+        fake_err_console = mock.Mock(is_terminal=True)
+        fake_err_console.status = fake_status
+        fake_err_console.print = mock.Mock()
+        fake_err_console.file = io.StringIO()
+        fake_err_console.file.isatty = lambda: True
+
+        responses = iter([
+            SimpleNamespace(
+                text="Here's a thinking process:\n1. Analyze.\n",
+                prompt_tps=12.0,
+                generation_tps=None,
+                finish_reason=None,
+            ),
+            SimpleNamespace(
+                text="</think>\nHello from persistent memory.",
+                prompt_tps=12.0,
+                generation_tps=34.0,
+                finish_reason="stop",
+            ),
+        ])
+
+        with mock.patch("daydream.chat.err_console", fake_err_console), \
+            mock.patch("daydream.chat._read_boxed_message", side_effect=["/new", "hello", "/quit"]), \
+            mock.patch("daydream.chat.ensure_runtime_model", return_value="mlx-community/Foo-4bit"), \
+            mock.patch("daydream.chat.engine.load_model", return_value=("model", mock.Mock(has_thinking=True))), \
+            mock.patch("daydream.chat.engine.generate_stream", side_effect=lambda *args, **kwargs: responses), \
+            mock.patch("daydream.chat.daydreaming_status", fake_daydreaming_status), \
+            mock.patch("daydream.chat.save_session", side_effect=fake_save_session):
+            run_chat("foo")
+
+        self.assertEqual(len(captured_statuses), 1)
+        self.assertIn("Hello from persistent memory.", captured_statuses[0].output)
+        self.assertNotIn("</think>", captured_statuses[0].output)
+        self.assertIn("\x1b[24;1H\n", fake_err_console.file.getvalue())
+        printed = " ".join(
+            str(call.args[0])
+            for call in fake_err_console.print.call_args_list
+            if call.args
+        )
+        self.assertIn("Hello from persistent memory.", printed)
+        self.assertTrue(saved_sessions)
+        self.assertEqual(saved_sessions[-1].messages[-1].content, "Hello from persistent memory.")
 
 
 if __name__ == "__main__":
