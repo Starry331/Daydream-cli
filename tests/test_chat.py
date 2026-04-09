@@ -289,10 +289,11 @@ class ChatTests(unittest.TestCase):
             effort="long",
             model_name="mlx-community/Qwen3-8B-4bit",
         )
-        self.assertEqual(request[0]["content"], "base")
-        self.assertEqual(request[1]["role"], "system")
-        self.assertIn("Reasoning effort: long", request[1]["content"])
-        self.assertEqual(request[2]["content"], "hello")
+        self.assertEqual(len(request), 2)
+        self.assertEqual(request[0]["role"], "system")
+        self.assertIn("base", request[0]["content"])
+        self.assertIn("Reasoning effort: long", request[0]["content"])
+        self.assertEqual(request[1]["content"], "hello")
 
     def test_build_request_messages_includes_session_memory_prompt(self) -> None:
         from daydream.storage import Memory
@@ -311,10 +312,11 @@ class ChatTests(unittest.TestCase):
                 )
             ],
         )
-        self.assertEqual(request[0]["content"], "base")
-        self.assertIn("Session memory for this persistent chat only.", request[1]["content"])
-        self.assertIn("User prefers terse answers.", request[1]["content"])
-        self.assertEqual(request[-1]["content"], "hello")
+        self.assertEqual(len(request), 2)
+        self.assertIn("base", request[0]["content"])
+        self.assertIn("Session memory for this persistent chat only.", request[0]["content"])
+        self.assertIn("User prefers terse answers.", request[0]["content"])
+        self.assertEqual(request[1]["content"], "hello")
 
     def test_build_session_memory_prompt_deduplicates_and_limits(self) -> None:
         from daydream.storage import Memory
@@ -325,6 +327,30 @@ class ChatTests(unittest.TestCase):
         ])
         self.assertIsNotNone(prompt)
         self.assertEqual(prompt.count("User likes Python."), 1)
+
+    def test_build_request_messages_merges_memory_and_effort_into_one_system_message(self) -> None:
+        from daydream.storage import Memory
+
+        request = _build_request_messages(
+            [{"role": "user", "content": "hello"}],
+            system_prompt="base system",
+            effort="instant",
+            model_name="mlx-community/Qwen3-8B-4bit",
+            session_memories=[
+                Memory(
+                    content="User prefers terse answers.",
+                    category="preference",
+                    importance=0.9,
+                    source_phase="reming",
+                )
+            ],
+        )
+
+        self.assertEqual(len(request), 2)
+        self.assertEqual(request[0]["role"], "system")
+        self.assertIn("base system", request[0]["content"])
+        self.assertIn("User prefers terse answers.", request[0]["content"])
+        self.assertIn("Reasoning effort: instant", request[0]["content"])
 
     def test_confirm_memory_import_defaults_yes(self) -> None:
         with mock.patch("daydream.chat.err_console.input", return_value=""):
@@ -452,6 +478,46 @@ class ChatTests(unittest.TestCase):
             register_alias=True,
         )
         load_model.assert_called_once_with("mlx-community/Foo-4bit", ensure_available=False)
+
+    def test_run_chat_applies_effort_after_new_session(self) -> None:
+        captured_calls = []
+
+        def fake_stream_response(_model, _tokenizer, request_messages, **kwargs):
+            captured_calls.append((request_messages, kwargs))
+            return ("hello", None, "")
+
+        with mock.patch("daydream.chat._read_boxed_message", side_effect=["/new", "/effort long", "hello", "/quit"]), \
+            mock.patch("daydream.chat.ensure_runtime_model", return_value="mlx-community/Qwen3-8B-4bit"), \
+            mock.patch("daydream.chat.engine.load_model", return_value=("model", mock.Mock(has_thinking=True))), \
+            mock.patch("daydream.chat._stream_response", side_effect=fake_stream_response), \
+            mock.patch("daydream.chat.save_session"):
+            run_chat("foo")
+
+        self.assertEqual(len(captured_calls), 1)
+        request_messages, kwargs = captured_calls[0]
+        self.assertEqual(request_messages[0]["role"], "system")
+        self.assertIn("Reasoning effort: long", request_messages[0]["content"])
+        self.assertEqual(kwargs["chat_template_kwargs"], {"enable_thinking": True})
+
+    def test_run_chat_applies_instant_effort_after_new_session(self) -> None:
+        captured_calls = []
+
+        def fake_stream_response(_model, _tokenizer, request_messages, **kwargs):
+            captured_calls.append((request_messages, kwargs))
+            return ("hello", None, "")
+
+        with mock.patch("daydream.chat._read_boxed_message", side_effect=["/new", "/effort instant", "hello", "/quit"]), \
+            mock.patch("daydream.chat.ensure_runtime_model", return_value="mlx-community/Qwen3-8B-4bit"), \
+            mock.patch("daydream.chat.engine.load_model", return_value=("model", mock.Mock(has_thinking=True))), \
+            mock.patch("daydream.chat._stream_response", side_effect=fake_stream_response), \
+            mock.patch("daydream.chat.save_session"):
+            run_chat("foo")
+
+        self.assertEqual(len(captured_calls), 1)
+        request_messages, kwargs = captured_calls[0]
+        self.assertEqual(request_messages[0]["role"], "system")
+        self.assertIn("Reasoning effort: instant", request_messages[0]["content"])
+        self.assertEqual(kwargs["chat_template_kwargs"], {"enable_thinking": False})
 
     def test_run_chat_keeps_output_after_reasoning_in_memoryless_mode(self) -> None:
         captured_statuses: list[object] = []

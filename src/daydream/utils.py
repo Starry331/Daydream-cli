@@ -861,6 +861,12 @@ class BottomTerminalRenderer:
         self._move_to(max(1, row))
         self.stream.write("\x1b[J")
 
+    def _scroll_up(self, count: int, *, rows: int) -> None:
+        if count <= 0:
+            return
+        self._move_to(max(1, rows))
+        self.stream.write("\n" * count)
+
     def _renderable_to_lines(self, renderable: list[str] | Iterable[str] | object) -> list[str]:
         if isinstance(renderable, list) and all(isinstance(line, str) for line in renderable):
             return renderable or [""]
@@ -890,6 +896,8 @@ class BottomTerminalRenderer:
         lines = self._renderable_to_lines(renderable)
         size = self._terminal_size()
         start_row = max(1, size.lines - len(lines) + 1)
+        if self._start_row is not None and start_row < self._start_row:
+            self._scroll_up(self._start_row - start_row, rows=size.lines)
         clear_from = start_row if self._start_row is None else min(self._start_row, start_row)
         self._clear_from(clear_from)
 
@@ -1139,7 +1147,7 @@ class DreamingStatus:
             return
         self._renderer = BottomTerminalRenderer(
             self.console.file,
-            clear_on_finish=False,
+            clear_on_finish=True,
             color_system=self.console.color_system or "truecolor",
         )
         self._renderer.render(self._render())

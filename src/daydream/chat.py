@@ -252,14 +252,17 @@ def _build_request_messages(
     session_memories: list[Memory] | None = None,
 ) -> list[dict]:
     request_messages: list[dict] = []
+    system_sections: list[str] = []
     if system_prompt:
-        request_messages.append({"role": "system", "content": system_prompt})
+        system_sections.append(system_prompt.strip())
     memory_prompt = _build_session_memory_prompt(session_memories or [])
     if memory_prompt:
-        request_messages.append({"role": "system", "content": memory_prompt})
+        system_sections.append(memory_prompt)
     effort_prompt = _effort_system_prompt(effort, model_name)
     if effort_prompt:
-        request_messages.append({"role": "system", "content": effort_prompt})
+        system_sections.append(effort_prompt)
+    if system_sections:
+        request_messages.append({"role": "system", "content": "\n\n".join(system_sections)})
     request_messages.extend(history)
     return request_messages
 
@@ -1093,14 +1096,13 @@ def _stream_response(
 
     if not stream_to_stdout:
         _promote_terminal_output_to_scrollback()
-        if getattr(status, "had_reasoning", False):
-            elapsed = getattr(status, "reasoning_elapsed", None)
-            if elapsed is not None:
-                err_console.print(render_reasoning_line(elapsed, active=False))
-                err_console.print()
+        if status.had_reasoning and status.reasoning_elapsed is not None:
+            err_console.print(render_reasoning_line(status.reasoning_elapsed, active=False))
+            err_console.print()
         if full_text:
             err_console.print(full_text, markup=False, highlight=False)
             err_console.print()
+        _reserve_bottom_rows(4)
 
     if wrote_output and stream_to_stdout:
         print()
@@ -1114,12 +1116,22 @@ def _stream_response(
 def _promote_terminal_output_to_scrollback() -> None:
     if not err_console.is_terminal:
         return
-    stream = getattr(err_console, "file", None)
-    if stream is None or not getattr(stream, "isatty", lambda: False)():
+    stream = getattr(err_console, "file", sys.stderr)
+    if not getattr(stream, "isatty", lambda: False)():
         return
     rows = shutil.get_terminal_size(fallback=(96, 24)).lines
     stream.write(f"\x1b[{rows};1H")
     stream.write("\n")
+    stream.flush()
+
+
+def _reserve_bottom_rows(count: int) -> None:
+    if count <= 0 or not err_console.is_terminal:
+        return
+    stream = getattr(err_console, "file", sys.stderr)
+    if not getattr(stream, "isatty", lambda: False)():
+        return
+    stream.write("\n" * count)
     stream.flush()
 
 
@@ -1464,7 +1476,7 @@ def run_chat(
             err_console.print("[dim]/help     — show this help[/dim]")
             continue
         if stripped == "/":
-            err_console.print("[dim]Type /effort, /reset, /clear, /t, /help, or /quit.[/dim]")
+            err_console.print("[dim]Type /effort, /new, /resume, /dreaming, /memory, /t, /reset, or /help.[/dim]")
             continue
         if stripped.startswith("/effort"):
             parts = stripped.split(maxsplit=1)

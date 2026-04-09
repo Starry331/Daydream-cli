@@ -105,6 +105,7 @@ class DaydreamingTextTests(unittest.TestCase):
         self.assertNotIn("\x1b[2J", output)
         self.assertIn("\x1b[22;1H", output)
         self.assertIn("\x1b[16;1H", output)
+        self.assertIn("\x1b[18;1H\n\n\n\n\n\n", output)
 
 
 if __name__ == "__main__":
