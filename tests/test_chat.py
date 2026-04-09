@@ -110,6 +110,32 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(reasoning_delta, "")
         self.assertTrue(closed)
 
+    def test_reasoning_parser_hides_emphasized_reasoning_labels(self) -> None:
+        parser = _ReasoningParser()
+
+        delta, reasoning_delta, closed = parser.feed(
+            "Here's a thinking process that leads to the suggested response:\n"
+        )
+        self.assertEqual(delta, "")
+        self.assertTrue(reasoning_delta)
+        self.assertFalse(closed)
+
+        delta, reasoning_delta, closed = parser.feed(
+            "*Simpler:* Hello! How can I help you?\n"
+            "*Let's make it friendly:* Hello there! How can I assist you today?\n"
+            "*Final Choice:* Hello! How can I help you today? (Classic, effective).\n"
+            "*Wait, I should check if there are any specific constraints.* No constraints.\n"
+            "*Okay, let's respond.*\n"
+        )
+        self.assertEqual(delta, "")
+        self.assertTrue(reasoning_delta)
+        self.assertFalse(closed)
+
+        delta, reasoning_delta, closed = parser.feed("\nHello! How can I help you today?")
+        self.assertEqual(delta, "Hello! How can I help you today?")
+        self.assertEqual(reasoning_delta, "")
+        self.assertTrue(closed)
+
     def test_matching_slash_commands_filters_by_prefix(self) -> None:
         matches = _matching_slash_commands("/e")
         self.assertEqual(matches[0][0], "/effort")

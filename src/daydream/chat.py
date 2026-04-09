@@ -101,6 +101,20 @@ REASONING_PREFIX_CANDIDATES = (
     "总结",
     "总结：",
 )
+EMPHASIZED_REASONING_PREFIX_CANDIDATES = (
+    "*simpler",
+    "*friendly",
+    "*let's",
+    "*final",
+    "*wait",
+    "*okay",
+    "*draft",
+    "*review",
+    "*analyze",
+    "*determine",
+    "*option",
+    "*self-correction",
+)
 
 
 def _print_stats(response):
@@ -879,6 +893,8 @@ def _looks_like_reasoning_line_start(text: str) -> bool:
     lowered = sample.lower()
     if sample.startswith(("**", "* ", "- ", "• ", "> ")):
         return True
+    if _looks_like_emphasized_reasoning_label(sample):
+        return True
     if re.match(r"^\d+[\.\)]\s", sample):
         return True
     markers = (
@@ -933,6 +949,8 @@ def _might_be_reasoning_line_start(text: str) -> bool:
         return False
     if len(sample) > 48:
         return False
+    if any(candidate.startswith(sample) for candidate in EMPHASIZED_REASONING_PREFIX_CANDIDATES):
+        return True
     candidates = (
         "input:",
         "language:",
@@ -983,6 +1001,30 @@ def _might_be_reasoning_line_start(text: str) -> bool:
     if any(candidate.startswith(sample) for candidate in candidates):
         return True
     return bool(re.match(r"^\d+[\.\)]?$", sample))
+
+
+def _looks_like_emphasized_reasoning_label(text: str) -> bool:
+    match = re.match(r"^\*([^*\n]{1,80})\*\s*", text)
+    if not match:
+        return False
+    inner = match.group(1).strip().lower()
+    if inner.endswith(":"):
+        return True
+    markers = (
+        "simpler",
+        "friendly",
+        "let's",
+        "final",
+        "wait",
+        "okay",
+        "draft",
+        "review",
+        "analyze",
+        "determine",
+        "option",
+        "self-correction",
+    )
+    return any(inner.startswith(marker) for marker in markers)
 
 
 def _stream_response(
