@@ -49,6 +49,7 @@ MULTILINE_SENTINEL = '"""'
 OPEN_THINK_TAG = "<think>"
 CLOSE_THINK_TAG = "</think>"
 EFFORT_LEVELS = ("instant", "short", "default", "long")
+_BOTTOM_OVERLAY_RESERVE_LINES = 11
 SLASH_COMMANDS = (
     ("/effort", "adjust reasoning depth"),
     ("/help", "show available commands"),
@@ -1102,7 +1103,7 @@ def _stream_response(
         if full_text:
             err_console.print(full_text, markup=False, highlight=False)
             err_console.print()
-        _reserve_bottom_rows(4)
+        _reserve_bottom_rows(_BOTTOM_OVERLAY_RESERVE_LINES)
 
     if wrote_output and stream_to_stdout:
         print()
