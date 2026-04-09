@@ -49,7 +49,8 @@ MULTILINE_SENTINEL = '"""'
 OPEN_THINK_TAG = "<think>"
 CLOSE_THINK_TAG = "</think>"
 EFFORT_LEVELS = ("instant", "short", "default", "long")
-_BOTTOM_OVERLAY_RESERVE_LINES = 11
+_INPUT_BOX_RESERVE_LINES = 3
+_STATUS_OVERLAY_RESERVE_LINES = 9
 SLASH_COMMANDS = (
     ("/effort", "adjust reasoning depth"),
     ("/help", "show available commands"),
@@ -474,6 +475,8 @@ def _current_command_selection(
 
 
 def _read_live_boxed_message() -> str:
+    _reserve_bottom_rows(_INPUT_BOX_RESERVE_LINES)
+
     buffer = ""
     multiline = False
     selected_command: str | None = None
@@ -1051,6 +1054,9 @@ def _stream_response(
     parser = _ReasoningParser()
     prev_reasoning = False
 
+    if not stream_to_stdout:
+        _prepare_status_overlay_space()
+
     with daydreaming_status(err_console, model_label) as status:
         for response in engine.generate_stream(
             model, tokenizer, messages,
@@ -1103,7 +1109,6 @@ def _stream_response(
         if full_text:
             err_console.print(full_text, markup=False, highlight=False)
             err_console.print()
-        _reserve_bottom_rows(_BOTTOM_OVERLAY_RESERVE_LINES)
 
     if wrote_output and stream_to_stdout:
         print()
@@ -1134,6 +1139,10 @@ def _reserve_bottom_rows(count: int) -> None:
         return
     stream.write("\n" * count)
     stream.flush()
+
+
+def _prepare_status_overlay_space() -> None:
+    _reserve_bottom_rows(_STATUS_OVERLAY_RESERVE_LINES)
 
 
 def _select_dreaming_mode() -> str | None:

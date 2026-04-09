@@ -896,7 +896,11 @@ class BottomTerminalRenderer:
         lines = self._renderable_to_lines(renderable)
         size = self._terminal_size()
         start_row = max(1, size.lines - len(lines) + 1)
-        if self._start_row is not None and start_row < self._start_row:
+        size_shrank = (
+            size.lines < self._last_size.lines
+            or size.columns < self._last_size.columns
+        )
+        if self._start_row is not None and start_row < self._start_row and size_shrank:
             self._scroll_up(self._start_row - start_row, rows=size.lines)
         clear_from = start_row if self._start_row is None else min(self._start_row, start_row)
         self._clear_from(clear_from)

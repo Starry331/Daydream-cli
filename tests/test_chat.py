@@ -11,9 +11,9 @@ from unittest import mock
 from rich.console import Console
 
 from daydream.chat import (
-    _BOTTOM_OVERLAY_RESERVE_LINES,
     _InlineTerminalRenderer,
     _ReasoningParser,
+    _STATUS_OVERLAY_RESERVE_LINES,
     _build_request_messages,
     _build_session_memory_prompt,
     _collect_multiline_message,
@@ -591,8 +591,8 @@ class ChatTests(unittest.TestCase):
         self.assertIn("Hello from Daydream.", captured_statuses[0].output)
         self.assertNotIn("</think>", captured_statuses[0].output)
         raw = fake_err_console.file.getvalue()
+        self.assertTrue(raw.startswith("\n" * _STATUS_OVERLAY_RESERVE_LINES))
         self.assertIn("\x1b[24;1H\n", raw)
-        self.assertTrue(raw.endswith("\n" * (_BOTTOM_OVERLAY_RESERVE_LINES + 1)))
         printed = " ".join(
             str(call.args[0])
             for call in fake_err_console.print.call_args_list
@@ -676,8 +676,8 @@ class ChatTests(unittest.TestCase):
         self.assertIn("Hello from persistent memory.", captured_statuses[0].output)
         self.assertNotIn("</think>", captured_statuses[0].output)
         raw = fake_err_console.file.getvalue()
+        self.assertTrue(raw.startswith("\n" * _STATUS_OVERLAY_RESERVE_LINES))
         self.assertIn("\x1b[24;1H\n", raw)
-        self.assertTrue(raw.endswith("\n" * (_BOTTOM_OVERLAY_RESERVE_LINES + 1)))
         printed = " ".join(
             str(call.args[0])
             for call in fake_err_console.print.call_args_list
