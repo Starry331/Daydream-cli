@@ -1,3 +1,3 @@
 """Daydream — Apple Silicon local model CLI, powered by MLX."""
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"

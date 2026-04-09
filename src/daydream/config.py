@@ -32,6 +32,7 @@ DEFAULT_TOP_P = 0.9
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_PORT = 11434
 DEFAULT_HOST = "127.0.0.1"
+DEFAULT_CLI_PAGE_MODE = "loose"
 
 
 def ensure_home() -> None:
@@ -52,6 +53,12 @@ def _load_config() -> dict[str, Any]:
         return {}
 
     return data if isinstance(data, dict) else {}
+
+
+def _write_config(config: dict[str, Any]) -> None:
+    ensure_home()
+    with CONFIG_FILE.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(config, handle, sort_keys=False)
 
 
 def _get_nested(config: dict[str, Any], *keys: str) -> Any:
@@ -114,6 +121,29 @@ def get_default_host() -> str:
 def get_default_port() -> int:
     config = _load_config()
     return _coerce_int(_get_nested(config, "serve", "port"), DEFAULT_PORT)
+
+
+def get_default_cli_page_mode() -> str:
+    config = _load_config()
+    value = _coerce_str(_get_nested(config, "chat", "cli_page_mode"), DEFAULT_CLI_PAGE_MODE).strip().lower()
+    if value in {"tight", "loose"}:
+        return value
+    return DEFAULT_CLI_PAGE_MODE
+
+
+def set_default_cli_page_mode(mode: str) -> str:
+    normalized = str(mode).strip().lower()
+    if normalized not in {"tight", "loose"}:
+        normalized = DEFAULT_CLI_PAGE_MODE
+
+    config = _load_config()
+    chat = config.get("chat")
+    if not isinstance(chat, dict):
+        chat = {}
+        config["chat"] = chat
+    chat["cli_page_mode"] = normalized
+    _write_config(config)
+    return normalized
 
 
 def get_local_model_roots() -> list[Path]:

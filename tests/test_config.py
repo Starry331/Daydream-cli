@@ -47,6 +47,7 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(config.get_default_max_tokens(), 1024)
                 self.assertEqual(config.get_default_host(), "0.0.0.0")
                 self.assertEqual(config.get_default_port(), 8080)
+                self.assertEqual(config.get_default_cli_page_mode(), "loose")
 
     def test_ensure_home_creates_chat_and_memory_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -63,6 +64,32 @@ class ConfigTests(unittest.TestCase):
                 self.assertTrue(config.DAYDREAM_HOME.exists())
                 self.assertTrue(config.CHATS_DIR.exists())
                 self.assertTrue(config.MEMORIES_DIR.exists())
+
+    def test_cli_page_mode_defaults_and_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "daydream-home"
+            home.mkdir(parents=True, exist_ok=True)
+
+            with mock.patch.dict(
+                os.environ,
+                {"DAYDREAM_HOME": str(home)},
+                clear=False,
+            ):
+                config = reload_module("daydream.config")
+                self.assertEqual(config.get_default_cli_page_mode(), "loose")
+
+                persisted = config.set_default_cli_page_mode("tight")
+                self.assertEqual(persisted, "tight")
+
+                config = reload_module("daydream.config")
+                self.assertEqual(config.get_default_cli_page_mode(), "tight")
+
+                (home / "config.yaml").write_text(
+                    "chat:\n  cli_page_mode: invalid\n",
+                    encoding="utf-8",
+                )
+                config = reload_module("daydream.config")
+                self.assertEqual(config.get_default_cli_page_mode(), "loose")
 
 
 if __name__ == "__main__":

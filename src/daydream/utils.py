@@ -73,6 +73,7 @@ _DIM = "\x1b[2m"
 _BOLD = "\x1b[1m"
 _RESET = "\x1b[0m"
 _FRAME_CHAR = "_"
+CLI_PAGE_MODES = ("loose", "tight")
 
 
 # ── Generic utilities ──────────────────────────────────────────────────
@@ -240,6 +241,10 @@ def _frame_line(label: str, frame_width: int, indent: int, *, bottom: bool = Fal
     return (" " * indent) + prefix + (_FRAME_CHAR * fill)
 
 
+def _is_tight_mode(cli_page_mode: str) -> bool:
+    return str(cli_page_mode).strip().lower() == "tight"
+
+
 def build_input_box_lines(
     lines: list[str],
     *,
@@ -247,6 +252,7 @@ def build_input_box_lines(
     selected_command: str | None = None,
     placeholder: str = "Type a message",
     multiline: bool = False,
+    cli_page_mode: str = "loose",
 ) -> list[str]:
     frame_width, indent = _chat_frame_width()
     text_width = frame_width
@@ -266,7 +272,8 @@ def build_input_box_lines(
             rendered.append(f"{pad}{_fit_display_width(segment, text_width)}")
 
     if command_rows:
-        rendered.append(f"{pad}{' ' * text_width}")
+        if not _is_tight_mode(cli_page_mode):
+            rendered.append(f"{pad}{' ' * text_width}")
         rendered.append(f"{pad}{_DIM}{_fit_display_width('Commands', text_width)}{_RESET}")
         for name, description in command_rows:
             marker = "› " if name == selected_command else "  "
@@ -276,7 +283,8 @@ def build_input_box_lines(
             else:
                 rendered.append(f"{pad}{_DIM}{row}{_RESET}")
     elif multiline:
-        rendered.append(f"{pad}{' ' * text_width}")
+        if not _is_tight_mode(cli_page_mode):
+            rendered.append(f"{pad}{' ' * text_width}")
         hint = _fit_display_width('Multiline mode · End with """', text_width)
         rendered.append(f"{pad}{_DIM}{hint}{_RESET}")
 
@@ -289,6 +297,7 @@ def build_effort_menu_lines(
     selected: str,
     *,
     supported: bool,
+    cli_page_mode: str = "loose",
 ) -> list[str]:
     frame_width, indent = _chat_frame_width()
     text_width = frame_width
@@ -305,12 +314,38 @@ def build_effort_menu_lines(
             content = f"{_DIM}{content}{_RESET}"
         lines.append(f"{pad}{content}")
 
-    lines.append(f"{pad}{' ' * text_width}")
+    if not _is_tight_mode(cli_page_mode):
+        lines.append(f"{pad}{' ' * text_width}")
     hint = _fit_display_width("Use ↑/↓ or j/k · Enter to apply · Esc to cancel", text_width)
     lines.append(f"{pad}{_DIM}{hint}{_RESET}")
     if not supported:
         note = _fit_display_width("This model may ignore effort controls.", text_width)
         lines.append(f"{pad}{_DIM}{note}{_RESET}")
+    lines.append(_frame_line("", frame_width, indent, bottom=True))
+    return lines
+
+
+def build_cli_page_menu_lines(current: str, selected: str) -> list[str]:
+    frame_width, indent = _chat_frame_width()
+    text_width = frame_width
+    pad = " " * indent
+    lines = [_frame_line("CLI Page Mode", frame_width, indent)]
+
+    labels = {
+        "loose": "loose      Spacious default layout",
+        "tight": "tight      Compact layout with minimal gaps",
+    }
+    for option in CLI_PAGE_MODES:
+        marker = "› " if option == selected else "  "
+        suffix = "  current" if option == current else ""
+        content = _fit_display_width(f"{marker}{labels[option]}{suffix}", text_width)
+        if option == selected:
+            content = f"{_BOLD}{content}{_RESET}"
+        elif option == current:
+            content = f"{_DIM}{content}{_RESET}"
+        lines.append(f"{pad}{content}")
+
+    lines.append(f"{pad}{_DIM}{_fit_display_width('Use ↑/↓ or j/k · Enter to apply · Esc to cancel', text_width)}{_RESET}")
     lines.append(_frame_line("", frame_width, indent, bottom=True))
     return lines
 
@@ -481,16 +516,18 @@ def render_reasoning_box(
     *,
     rainbow: bool = False,
     label: str = "Daydreaming",
+    compact: bool = False,
 ) -> Group:
     """Render a framed reasoning box with animated header and clipped body."""
     normalized = reasoning_text.replace("\r\n", "\n").replace("\r", "\n")
     lines = normalized.split("\n")
     if normalized.endswith("\n"):
         lines.append("")
-    visible_lines = lines[-5:] if lines else [""]
+    visible_count = 3 if compact else 5
+    visible_lines = lines[-visible_count:] if lines else [""]
     if not any(line.strip() for line in visible_lines):
-        visible_lines = [""] * 4 + [" "]
-    while len(visible_lines) < 5:
+        visible_lines = [""] * max(0, visible_count - 1) + [" "]
+    while len(visible_lines) < visible_count:
         visible_lines.insert(0, "")
 
     body = Text("\n".join(visible_lines), style=f"dim {_C_REASON}")
@@ -678,9 +715,10 @@ class TerminalTitleAnimator:
 #
 
 class ConversationStatus:
-    def __init__(self, console: Console, model_label: str):
+    def __init__(self, console: Console, model_label: str, *, cli_page_mode: str = "loose"):
         self.console = console
         self.model_label = model_label
+        self.cli_page_mode = cli_page_mode
         self._frame = 0
         self._phase: str | None = "thinking"
         self._tokens_per_second: float | None = None
@@ -725,6 +763,7 @@ class ConversationStatus:
     def _render(self) -> Group:
         with self._lock:
             parts: list = []
+            compact = _is_tight_mode(self.cli_page_mode)
 
             if self._reasoning_active:
                 parts.append(render_reasoning_box(
@@ -732,21 +771,34 @@ class ConversationStatus:
                     self._frame,
                     rainbow=self._rainbow,
                     label=self._dream_word,
+                    compact=compact,
                 ))
-                parts.append(Text())
+                if not compact:
+                    parts.append(Text())
             elif self._waiting and not self._had_reasoning:
-                parts.append(render_reasoning_box("", self._frame, rainbow=self._rainbow, label=self._dream_word))
-                parts.append(Text())
+                parts.append(
+                    render_reasoning_box(
+                        "",
+                        self._frame,
+                        rainbow=self._rainbow,
+                        label=self._dream_word,
+                        compact=compact,
+                    )
+                )
+                if not compact:
+                    parts.append(Text())
             else:
                 # ── Reasoning summary (if model used thinking) ──
                 if self._had_reasoning and self._reasoning_elapsed is not None:
                     parts.append(render_reasoning_line(self._reasoning_elapsed, active=False))
-                    parts.append(Text())
+                    if not compact:
+                        parts.append(Text())
 
                 # ── Streamed output ──
                 if self._output:
                     parts.append(Text(self._output))
-                    parts.append(Text())
+                    if not compact:
+                        parts.append(Text())
 
             # ── Footer (always at bottom) ──
             reasoning_hint = None
@@ -769,6 +821,9 @@ class ConversationStatus:
             self.console.file,
             clear_on_finish=True,
             color_system=self.console.color_system or "truecolor",
+            scroll_on_grow=True,
+            scroll_on_first_render=True,
+            collapse_on_finish=_is_tight_mode(self.cli_page_mode),
         )
         self._renderer.render(self._render())
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -872,10 +927,18 @@ class BottomTerminalRenderer:
         *,
         clear_on_finish: bool = True,
         color_system: str | None = "truecolor",
+        scroll_on_grow: bool = True,
+        scroll_on_shrink: bool = False,
+        scroll_on_first_render: bool = False,
+        collapse_on_finish: bool = False,
     ) -> None:
         self.stream = stream
         self._clear_on_finish = clear_on_finish
         self._color_system = color_system
+        self._scroll_on_grow = scroll_on_grow
+        self._scroll_on_shrink = scroll_on_shrink
+        self._scroll_on_first_render = scroll_on_first_render
+        self._collapse_on_finish = collapse_on_finish
         self._line_count = 0
         self._cursor_hidden = False
         self._wrap_disabled = False
@@ -897,6 +960,12 @@ class BottomTerminalRenderer:
             return
         self._move_to(max(1, rows))
         self.stream.write("\n" * count)
+
+    def _scroll_down(self, count: int) -> None:
+        if count <= 0:
+            return
+        self._move_to(1)
+        self.stream.write(f"\x1b[{count}L")
 
     def _renderable_to_lines(self, renderable: list[str] | Iterable[str] | object) -> list[str]:
         if isinstance(renderable, list) and all(isinstance(line, str) for line in renderable):
@@ -927,15 +996,27 @@ class BottomTerminalRenderer:
         lines = self._renderable_to_lines(renderable)
         size = self._terminal_size()
         start_row = max(1, size.lines - len(lines) + 1)
+        first_render = self._start_row is None
         grows_upward = self._start_row is not None and start_row < self._start_row
+        shrinks_downward = self._start_row is not None and start_row > self._start_row
 
         # When a bottom-pinned overlay needs more rows than the previous frame,
         # clear the old overlay first, then scroll blank space into view.
         # This keeps prior chat history in scrollback instead of letting the
         # growing overlay wipe lines that were already printed above it.
-        if grows_upward:
+        if first_render:
+            if self._scroll_on_first_render:
+                self._scroll_up(len(lines), rows=size.lines)
+            clear_from = start_row
+        elif grows_upward:
             self._clear_from(self._start_row)
-            self._scroll_up(self._start_row - start_row, rows=size.lines)
+            if self._scroll_on_grow:
+                self._scroll_up(self._start_row - start_row, rows=size.lines)
+            clear_from = start_row
+        elif shrinks_downward:
+            self._clear_from(self._start_row)
+            if self._scroll_on_shrink:
+                self._scroll_down(start_row - self._start_row)
             clear_from = start_row
         else:
             clear_from = start_row if self._start_row is None else min(self._start_row, start_row)
@@ -966,6 +1047,9 @@ class BottomTerminalRenderer:
         if self._line_count and self._start_row is not None and self._clear_on_finish:
             self._clear_from(self._start_row)
             self._move_to(self._start_row)
+            if self._collapse_on_finish:
+                self.stream.write(f"\x1b[{self._line_count}M")
+                self._move_to(self._start_row)
         if self._cursor_hidden:
             self.stream.write("\x1b[?25h")
             self._cursor_hidden = False
@@ -977,9 +1061,109 @@ class BottomTerminalRenderer:
         self._start_row = None
 
 
+class InlineFlowRenderer(BottomTerminalRenderer):
+    """Renderer anchored to the current transcript position instead of terminal bottom."""
+
+    def __init__(
+        self,
+        stream,
+        *,
+        clear_on_finish: bool = True,
+        color_system: str | None = "truecolor",
+    ) -> None:
+        super().__init__(stream, clear_on_finish=clear_on_finish, color_system=color_system)
+
+    def _clear_inline_block(self, count: int) -> None:
+        if count <= 0:
+            return
+        for index in range(count):
+            self.stream.write("\r\x1b[2K")
+            if index < count - 1:
+                self.stream.write("\n")
+        if count > 1:
+            self.stream.write(f"\x1b[{count - 1}A")
+        self.stream.write("\r")
+
+    def _insert_inline_rows(self, count: int) -> None:
+        if count <= 0:
+            return
+        self.stream.write(f"\x1b[{count}L")
+
+    def _delete_inline_rows(self, count: int) -> None:
+        if count <= 0:
+            return
+        self.stream.write(f"\x1b[{count}M")
+
+    def render(self, renderable: list[str] | Iterable[str] | object) -> None:
+        if not self._cursor_hidden:
+            self.stream.write("\x1b[?25l")
+            self._cursor_hidden = True
+        if not self._wrap_disabled:
+            self.stream.write("\x1b[?7l")
+            self._wrap_disabled = True
+
+        lines = self._renderable_to_lines(renderable)
+        size = self._terminal_size()
+        if self._line_count == 0:
+            self._insert_inline_rows(len(lines))
+        elif len(lines) > self._line_count:
+            self.stream.write(f"\x1b[{self._line_count}B")
+            self.stream.write("\r")
+            self._insert_inline_rows(len(lines) - self._line_count)
+            self.stream.write(f"\x1b[{self._line_count}A")
+            self.stream.write("\r")
+        elif len(lines) < self._line_count:
+            self.stream.write(f"\x1b[{len(lines)}B")
+            self.stream.write("\r")
+            self._delete_inline_rows(self._line_count - len(lines))
+            self.stream.write(f"\x1b[{len(lines)}A")
+            self.stream.write("\r")
+
+        clear_count = max(self._line_count, len(lines))
+        self._clear_inline_block(clear_count)
+
+        for index, line in enumerate(lines):
+            self.stream.write("\r\x1b[2K")
+            self.stream.write(line)
+            if index < len(lines) - 1:
+                self.stream.write("\n")
+
+        if len(lines) > 1:
+            self.stream.write(f"\x1b[{len(lines) - 1}A")
+        self.stream.write("\r")
+
+        self.stream.flush()
+        self._line_count = len(lines)
+        self._last_size = size
+
+    def wait_for_input(self, renderable: list[str] | Iterable[str] | object) -> None:
+        fd = sys.stdin.fileno()
+        while True:
+            ready, _, _ = select.select([fd], [], [], 0.05)
+            size = self._terminal_size()
+            if size != self._last_size:
+                self.render(renderable)
+                continue
+            if ready:
+                return
+
+    def finish(self) -> None:
+        if self._line_count and self._clear_on_finish:
+            self._clear_inline_block(self._line_count)
+            self._delete_inline_rows(self._line_count)
+        if self._cursor_hidden:
+            self.stream.write("\x1b[?25h")
+            self._cursor_hidden = False
+        if self._wrap_disabled:
+            self.stream.write("\x1b[?7h")
+            self._wrap_disabled = False
+        self.stream.flush()
+        self._line_count = 0
+
+
 @contextmanager
-def daydreaming_status(console: Console, model_label: str):
-    status = ConversationStatus(console, model_label)
+def daydreaming_status(console: Console, model_label: str, *, cli_page_mode: str = "loose"):
+    status = ConversationStatus(console, model_label, cli_page_mode=cli_page_mode)
     status.start()
     try:
         yield status
@@ -987,7 +1171,7 @@ def daydreaming_status(console: Console, model_label: str):
         status.stop()
 
 
-def build_dreaming_menu_lines(selected: str) -> list[str]:
+def build_dreaming_menu_lines(selected: str, *, cli_page_mode: str = "loose") -> list[str]:
     """Arrow-key menu for /dreaming mode selection."""
     frame_width, indent = _chat_frame_width()
     text_width = frame_width
@@ -1007,7 +1191,8 @@ def build_dreaming_menu_lines(selected: str) -> list[str]:
             content = f"{_DIM}{content}{_RESET}"
         lines.append(f"{pad}{content}")
 
-    lines.append(f"{pad}{' ' * text_width}")
+    if not _is_tight_mode(cli_page_mode):
+        lines.append(f"{pad}{' ' * text_width}")
     hint = _fit_display_width("Use \u2191/\u2193 or j/k \u00b7 Enter to start \u00b7 Esc to cancel", text_width)
     lines.append(f"{pad}{_DIM}{hint}{_RESET}")
     lines.append(_frame_line("", frame_width, indent, bottom=True))
@@ -1019,6 +1204,7 @@ def build_session_list_lines(
     selected_index: int,
     *,
     allow_delete: bool = False,
+    cli_page_mode: str = "loose",
 ) -> list[str]:
     """Arrow-key menu for /resume session selection."""
     frame_width, indent = _chat_frame_width()
@@ -1043,7 +1229,8 @@ def build_session_list_lines(
             content = f"{_DIM}{content}{_RESET}"
         lines.append(f"{pad}{content}")
 
-    lines.append(f"{pad}{' ' * text_width}")
+    if not _is_tight_mode(cli_page_mode):
+        lines.append(f"{pad}{' ' * text_width}")
     hint_text = "Use \u2191/\u2193 or j/k \u00b7 Enter to resume"
     if allow_delete:
         hint_text += " \u00b7 d to delete"

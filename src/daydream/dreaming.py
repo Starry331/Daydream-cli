@@ -12,48 +12,76 @@ from daydream.storage import ChatMessage, Memory, load_all_memories
 # ── System prompts ─────────────────────────────────────────────────────
 
 REMING_SYSTEM = (
-    "You are a memory extraction assistant. Analyze the conversation and extract important memories.\n"
+    "You are performing REM-only memory processing — representational reformatting of a conversation.\n"
+    "Unlike systematic consolidation, you operate without prior stabilization. "
+    "Your processing should be creative, associative, and transformative.\n\n"
+    "Perform these operations on the conversation:\n"
+    "1. ASSOCIATIVE RECOMBINATION: Link scattered ideas and facts into new connections "
+    "that were not explicitly stated. Find hidden relationships.\n"
+    "2. SCHEMA ABSTRACTION: Distill specific exchanges into general principles, preferences, "
+    "or conceptual frameworks the user operates within.\n"
+    "3. AFFECTIVE REWEIGHTING: Identify what matters most to the user emotionally or motivationally. "
+    "Elevate important concerns, demote trivial ones.\n"
+    "4. GENERALIZATION: Sacrifice verbatim detail for higher-order patterns and transferable insights.\n\n"
     "For each memory, output a JSON object on its own line:\n"
-    '{"content": "...", "category": "fact|preference|context|insight", "importance": 0.0-1.0}\n'
-    "\n"
-    "Extract: facts learned, user preferences, important context, key decisions, useful insights.\n"
-    "Discard: greetings, filler, obvious/trivial exchanges, repetitive content.\n"
+    '{"content": "...", "category": "fact|preference|context|insight|pattern", "importance": 0.0-1.0}\n\n'
+    "Categories: fact=concrete knowledge, preference=user likes/dislikes/style, "
+    "context=situational background, insight=derived understanding, pattern=cross-topic regularity.\n"
+    "Importance: 0.0=trivial, 0.5=moderately useful, 1.0=critical to future interactions.\n"
     "Output ONLY the JSON lines, nothing else."
 )
 
-N3_SWS_SYSTEM = (
-    "You are performing hippocampal replay (N3/SWS deep sleep phase).\n"
-    "Replay the conversation and extract ALL declarative memories — facts, events, statements, decisions.\n"
-    "Be thorough and exhaustive. Include everything that could potentially be important.\n"
-    "For each memory, output a JSON object on its own line:\n"
+N2_SPINDLE_SYSTEM = (
+    "You are performing N2 sleep spindle processing — the gating phase of memory consolidation.\n"
+    "Your role is SELECTION and FILTERING, not extraction. You decide which experiences "
+    "from this conversation deserve to be consolidated into long-term memory.\n\n"
+    "Apply these gating criteria:\n"
+    "1. REACTIVATION WINDOWING: Identify moments in the conversation that carry learning signal "
+    "— new information, corrections, decisions, or preference reveals.\n"
+    "2. SENSORY GATING: Filter out noise — greetings, filler, small talk, repetitive exchanges, "
+    "and anything that does not contain novel or useful information.\n"
+    "3. INTERFERENCE SHIELDING: If multiple similar memories exist, select the most precise or "
+    "recent version. Remove contradictions by keeping the latest truth.\n"
+    "4. PLASTICITY TIMING: Prioritize memories that would be most useful for future conversations "
+    "— things the user is likely to reference again or that change how you should respond.\n\n"
+    "For each memory that passes your gate, output a JSON object on its own line:\n"
     '{"content": "...", "category": "fact|preference|context|insight"}\n'
     "Output ONLY the JSON lines."
 )
 
-N2_SPINDLE_SYSTEM = (
-    "You are performing sleep spindle processing (N2/Core sleep phase).\n"
-    "You will receive a list of candidate memories. Your job is to:\n"
-    "1. DISCARD trivial, redundant, or obvious memories\n"
-    "2. MERGE overlapping memories into consolidated ones\n"
-    "3. RATE each surviving memory's importance (0.0-1.0)\n"
-    "\n"
-    "For each memory to keep, output a JSON object on its own line:\n"
+N3_SWS_SYSTEM = (
+    "You are performing N3/SWS deep sleep processing — stabilization and systematic consolidation.\n"
+    "You receive memories that passed N2 gating. Your job is to STABILIZE, ORGANIZE, and PRUNE.\n\n"
+    "Apply these consolidation operations:\n"
+    "1. TRACE STABILIZATION: Refine each memory into a clear, self-contained statement. "
+    "Remove ambiguity. Ensure each memory is understandable without conversation context.\n"
+    "2. REDISTRIBUTION: Reorganize memories into proper categories. Facts should be factual, "
+    "preferences should capture user intent, contexts should be situational.\n"
+    "3. NOISE PRUNING: Merge near-duplicate memories. Tighten wording. Remove any remaining "
+    "filler that slipped through N2 gating.\n"
+    "4. CAPACITY RESET: Rate each memory importance (0.0-1.0) based on predicted future utility. "
+    "Be strict — only truly important memories should score above 0.7.\n\n"
+    "For each stabilized memory, output a JSON object on its own line:\n"
     '{"content": "...", "category": "fact|preference|context|insight", "importance": 0.0-1.0}\n'
     "Output ONLY the JSON lines."
 )
 
 REM_INTEGRATION_SYSTEM = (
-    "You are performing REM sleep memory integration.\n"
+    "You are performing REM sleep integration — the final phase after NREM stabilization.\n"
     "You will receive:\n"
-    "1. NEW memories from the current session (after N2 filtering)\n"
-    "2. EXISTING memories from previous sessions\n"
-    "\n"
-    "Your job is to:\n"
-    "1. CONNECT new memories to existing ones where relevant\n"
-    "2. FIND PATTERNS across sessions\n"
-    "3. CREATE abstract insights from concrete memories\n"
-    "4. REWEIGHT importance based on cross-session relevance\n"
-    "\n"
+    "1. NEW memories: stabilized by N3 from the current session\n"
+    "2. EXISTING memories: from previous sessions\n\n"
+    "Because these memories were already filtered (N2) and stabilized (N3), your integration "
+    "should be CONSTRAINED — build on the stable foundation rather than free-associating.\n\n"
+    "Perform these operations:\n"
+    "1. INTEGRATION: Connect new memories to existing ones. If a new fact extends or updates "
+    "an existing memory, merge them into one richer memory.\n"
+    "2. ABSTRACTION: Where multiple specific memories point to the same pattern, create a "
+    "higher-level insight that captures the underlying principle.\n"
+    "3. EMOTIONAL RECALIBRATION: Re-evaluate importance scores in light of the full memory set. "
+    "A memory that seemed minor alone may become important when it connects to a pattern.\n"
+    "4. REPRESENTATIONAL TRANSFORMATION: Rewrite memories to be maximally useful for an AI "
+    "assistant — focus on actionable knowledge, user preferences, and contextual cues.\n\n"
     "For each final memory, output a JSON object on its own line:\n"
     '{"content": "...", "category": "fact|preference|context|insight|pattern", "importance": 0.0-1.0}\n'
     "Output ONLY the JSON lines."
@@ -213,8 +241,8 @@ def run_dreaming(
 ) -> list[Memory]:
     """Full 3-phase sleep cycle.
 
-    Phase 1 — N3/SWS: Hippocampal replay — extract raw declarative memories
-    Phase 2 — N2/Core: Spindle processing — select, gate, filter
+    Phase 1 — N3/SWS: Deep sleep — extract raw declarative memories
+    Phase 2 — N2/Core: Spindle processing — select and gate candidate memories
     Phase 3 — REM: Integration & abstraction — connect, pattern-find, reweight
     """
     conversation_text = _format_conversation(messages)
@@ -232,30 +260,31 @@ def run_dreaming(
 
     # Phase 2 — N2/Core
     if on_phase is not None:
-        on_phase("n2", "Core sleep — spindle processing...")
+        on_phase("n2", "Core sleep — spindle gating...")
     formatted_raw = _format_memories_for_input(raw_memories)
-    filtered = _call_model_for_memories(
+    stabilized = _call_model_for_memories(
         model, tokenizer, N2_SPINDLE_SYSTEM, formatted_raw,
         temp=temp, max_tokens=max_tokens, on_token=on_token,
     )
 
+    phase_memories = stabilized
     source_phase = "n2"
-    if not filtered:
-        filtered = raw_memories
+    if not phase_memories:
+        phase_memories = raw_memories
         source_phase = "n3"
 
     # Phase 3 — REM
     if on_phase is not None:
         on_phase("rem", "REM sleep — integration...")
     existing = existing_memories if existing_memories is not None else load_all_memories()
-    all_context = _format_new_and_existing(filtered, existing)
+    all_context = _format_new_and_existing(phase_memories, existing)
     final = _call_model_for_memories(
         model, tokenizer, REM_INTEGRATION_SYSTEM, all_context,
         temp=temp, max_tokens=max_tokens, on_token=on_token,
     )
 
     if not final:
-        final = filtered
+        final = phase_memories
     else:
         source_phase = "rem"
 

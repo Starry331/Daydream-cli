@@ -11,16 +11,21 @@ import termios
 import time
 import tty
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Callable
 
 from rich.console import Console, Group
 from rich.text import Text
 
 from daydream import engine
+from daydream.config import get_default_cli_page_mode, set_default_cli_page_mode
 from daydream.models import ensure_runtime_model
 from daydream.registry import reverse_lookup
 from daydream.utils import (
     BottomTerminalRenderer,
+    CLI_PAGE_MODES,
+    InlineFlowRenderer,
+    build_cli_page_menu_lines,
     build_dreaming_menu_lines,
     build_effort_menu_lines,
     build_input_box_lines,
@@ -50,12 +55,14 @@ console = Console()
 err_console = Console(stderr=True)
 
 MULTILINE_SENTINEL = '"""'
-_PENDING_ESCAPE_TIMEOUT = 0.08
+_PENDING_ESCAPE_TIMEOUT = 0.03
 OPEN_THINK_TAG = "<think>"
 CLOSE_THINK_TAG = "</think>"
 EFFORT_LEVELS = ("instant", "short", "default", "long")
+CLI_PAGE_LEVELS = CLI_PAGE_MODES
 SLASH_COMMANDS = (
     ("/effort", "adjust reasoning depth"),
+    ("/cli-page", "choose loose or tight page spacing"),
     ("/help", "show available commands"),
     ("/new", "start a persistent chat session"),
     ("/resume", "resume a saved session"),
@@ -68,8 +75,27 @@ SLASH_COMMANDS = (
     ("/quit", "exit chat"),
 )
 REASONING_PREFIX_CANDIDATES = (
+    "usually, this means",
+    "this implies",
+    "user says",
+    "intent is",
+    "response should",
+    "keep it short",
+    "let's check the system instruction again",
+    "let's check the instruction again",
+    "the instruction says",
+    "now the actual response",
+    "now the actual answer",
     "thinking process",
     "thinking process:",
+    "thinking block",
+    "thinking block:",
+    "revised plan",
+    "revised plan:",
+    "final answer:",
+    "thinking:",
+    "actually, looking at",
+    "let's just respond",
     "here's a thinking process",
     "here is a thinking process",
     "the user asked",
@@ -82,6 +108,9 @@ REASONING_PREFIX_CANDIDATES = (
     "in summary",
     "reasoning",
     "reasoning:",
+    "response:",
+    "constraint check:",
+    "thinking block lines:",
     "analysis:",
     "let's think",
     "思考过程",
@@ -120,6 +149,36 @@ EMPHASIZED_REASONING_PREFIX_CANDIDATES = (
     "*option",
     "*self-correction",
 )
+
+_META_REASONING_PREFIX_CANDIDATES = (
+    "now the actual response",
+    "now the actual answer",
+    "now the response",
+    "now the answer",
+)
+_FINAL_ANSWER_LABELS = (
+    "final answer:",
+    "final answer：",
+    "answer:",
+    "answer：",
+    "response:",
+    "response：",
+    "final output:",
+    "final output：",
+    "回答:",
+    "回答：",
+    "答案:",
+    "答案：",
+    "回复:",
+    "回复：",
+)
+
+
+@dataclass
+class _TranscriptBlock:
+    kind: str
+    content: str = ""
+    elapsed: float | None = None
 
 
 def _print_stats(response):
@@ -172,16 +231,17 @@ def _collect_multiline_message(
 def _read_boxed_message(
     *,
     input_func: Callable[[str], str] = input,
+    cli_page_mode: str = "loose",
 ) -> str:
     if input_func is input and sys.stdin.isatty() and err_console.is_terminal:
-        return _read_live_boxed_message()
+        return _read_live_boxed_message(cli_page_mode=cli_page_mode)
 
     err_console.print(render_input_box([""], placeholder="Type a message or / for commands"))
     try:
         first_line = input_func("│ ")
         return _collect_multiline_message(first_line, lambda _: input_func("│ "))
     finally:
-        err_console.print()
+        _print_gap(cli_page_mode)
 
 
 def _matching_slash_commands(text: str) -> list[tuple[str, str]]:
@@ -199,6 +259,13 @@ def _matching_slash_commands(text: str) -> list[tuple[str, str]]:
 def _normalize_effort(value: str) -> str | None:
     choice = value.strip().lower()
     if choice in EFFORT_LEVELS:
+        return choice
+    return None
+
+
+def _normalize_cli_page_mode(value: str) -> str | None:
+    choice = value.strip().lower()
+    if choice in CLI_PAGE_LEVELS:
         return choice
     return None
 
@@ -224,7 +291,9 @@ def _effort_chat_template_kwargs(effort: str, tokenizer) -> dict:
         return {}
     if effort == "instant":
         return {"enable_thinking": False}
-    return {"enable_thinking": True}
+    if effort == "short":
+        return {"enable_thinking": True, "thinking_budget": 200}
+    return {"enable_thinking": True, "thinking_budget": 10000}
 
 
 def _effort_system_prompt(effort: str, model_name: str) -> str | None:
@@ -233,16 +302,16 @@ def _effort_system_prompt(effort: str, model_name: str) -> str | None:
 
     prompts = {
         "instant": (
-            "Reasoning effort: instant. Answer directly. Do not emit a thinking block, "
-            "do not spend extra tokens on hidden reasoning, and get to the answer fast."
+            "Answer directly and concisely. Prefer minimal internal reasoning. "
+            "Skip preamble and go straight to the answer."
         ),
         "short": (
-            "Reasoning effort: short. If you reason, keep the reasoning compact and minimal "
-            "before answering."
+            "Reason briefly and efficiently before answering. "
+            "Keep analysis minimal, skip obvious steps, and focus on the answer."
         ),
         "long": (
-            "Reasoning effort: long. Spend noticeably more time reasoning, explore edge cases, "
-            "and use a fuller thinking block before producing the final answer."
+            "Reason thoroughly before answering. "
+            "Explore key angles, consider edge cases, verify your logic, and then give the answer."
         ),
     }
     return prompts.get(effort)
@@ -287,14 +356,18 @@ def _build_session_memory_prompt(memories: list[Memory]) -> str | None:
             unique[key] = memory
 
     lines = [
+        "## Session Memory",
         "Session memory for this persistent chat only.",
-        "Use these memories when relevant, but do not mention this memory block unless it helps answer the user.",
+        "The following are memories extracted from earlier exchanges in this persistent chat session.",
+        "These represent knowledge, preferences, and patterns you have learned about the user.",
+        "Use them naturally when relevant — do not list them back to the user unless asked.",
+        "Treat high-importance memories (>0.7) as key context that should inform your responses.",
     ]
-    for memory in list(unique.values())[:12]:
+    for memory in list(unique.values())[:20]:
         content = memory.content.strip().replace("\n", " ")
-        if len(content) > 180:
-            content = content[:177] + "..."
-        lines.append(f"- [{memory.category} | {memory.importance:.2f}] {content}")
+        if len(content) > 200:
+            content = content[:197] + "..."
+        lines.append(f"- [{memory.category}|{memory.importance:.1f}] {content}")
 
     return "\n".join(lines)
 
@@ -377,7 +450,7 @@ def _read_key() -> str:
     deadline = time.monotonic() + 0.65
 
     while time.monotonic() < deadline:
-        if select.select([fd], [], [], 0.04)[0]:
+        if select.select([fd], [], [], 0.015)[0]:
             sequence += os.read(fd, 1).decode("utf-8", errors="ignore")
             break
     if len(sequence) == 1:
@@ -450,7 +523,7 @@ def _wait_for_menu_input(
         if renderer is None or not hasattr(renderer, "_terminal_size") or not hasattr(renderer, "_last_size"):
             return True
         fd = sys.stdin.fileno()
-        ready, _, _ = select.select([fd], [], [], 0.02)
+        ready, _, _ = select.select([fd], [], [], 0.01)
         size = renderer._terminal_size()
         if size != renderer._last_size:
             renderer.render(renderable)
@@ -465,6 +538,7 @@ def _render_input_state(
     *,
     multiline: bool,
     selected_command: str | None = None,
+    cli_page_mode: str = "loose",
 ) -> object:
     normalized = buffer.replace("\r\n", "\n").replace("\r", "\n")
     lines = normalized.split("\n")
@@ -477,6 +551,7 @@ def _render_input_state(
         selected_command=selected_command,
         placeholder="Type a message or / for commands",
         multiline=multiline,
+        cli_page_mode=cli_page_mode,
     )
 
 
@@ -499,6 +574,92 @@ def _status_overlay_reserve_lines(model_label: str) -> int:
     return max(1, measure_renderable_lines(preview, color_system=color_system))
 
 
+def _is_tight_cli_page_mode(cli_page_mode: str) -> bool:
+    return str(cli_page_mode).strip().lower() == "tight"
+
+
+def _print_gap(cli_page_mode: str, *, loose: int = 1, tight: int = 1) -> None:
+    count = tight if _is_tight_cli_page_mode(cli_page_mode) else loose
+    for _ in range(max(0, count)):
+        err_console.print()
+
+
+def _clear_visible_terminal() -> None:
+    if not err_console.is_terminal:
+        return
+    stream = getattr(err_console, "file", sys.stderr)
+    if not getattr(stream, "isatty", lambda: False)():
+        return
+    stream.write("\x1b[2J\x1b[H")
+    stream.flush()
+
+
+def _transcript_blocks_from_messages(messages: list[ChatMessage]) -> list[_TranscriptBlock]:
+    blocks: list[_TranscriptBlock] = []
+    for message in messages:
+        if message.role == "user":
+            blocks.append(_TranscriptBlock("user", message.content))
+            continue
+        if message.role != "assistant":
+            continue
+        if message.reasoning.strip():
+            blocks.append(_TranscriptBlock("reasoning_summary"))
+        blocks.append(_TranscriptBlock("assistant", message.content))
+    if blocks and blocks[-1].kind == "reasoning_hint":
+        blocks.pop()
+    return blocks
+
+
+def _append_transcript_turn(
+    blocks: list[_TranscriptBlock],
+    *,
+    user_input: str,
+    assistant_text: str,
+    reasoning_elapsed: float | None,
+    had_reasoning: bool,
+) -> None:
+    while blocks and blocks[-1].kind == "reasoning_hint":
+        blocks.pop()
+    blocks.append(_TranscriptBlock("user", user_input))
+    if had_reasoning:
+        blocks.append(_TranscriptBlock("reasoning_summary", elapsed=reasoning_elapsed))
+    if assistant_text:
+        blocks.append(_TranscriptBlock("assistant", assistant_text))
+    if had_reasoning and assistant_text:
+        blocks.append(_TranscriptBlock("reasoning_hint", "Use /t to expand reasoning"))
+
+
+def _repack_tight_page(model_label: str, blocks: list[_TranscriptBlock]) -> None:
+    _clear_visible_terminal()
+    err_console.print(f"[bold cyan]{model_label}[/]")
+    err_console.print("[dim]Use / for commands.[/dim]")
+    _print_gap("tight")
+
+    for index, block in enumerate(blocks):
+        if block.kind == "user":
+            err_console.print("[bold green]You[/]")
+            err_console.print(block.content, markup=False, highlight=False)
+        elif block.kind == "assistant":
+            err_console.print(f"[bold cyan]{model_label}[/]")
+            err_console.print(block.content, markup=False, highlight=False)
+        elif block.kind == "reasoning_summary":
+            elapsed = block.elapsed if block.elapsed is not None else 0.0
+            if elapsed > 0.0:
+                err_console.print(render_reasoning_line(elapsed, active=False))
+            else:
+                err_console.print("[dim]▸ Daydreamed[/dim]")
+        elif block.kind == "reasoning_hint":
+            err_console.print(f"[dim]{block.content}[/dim]")
+        else:
+            continue
+
+        if index < len(blocks) - 1:
+            _print_gap("tight")
+
+    if blocks:
+        _print_gap("tight")
+
+
 def _current_command_selection(
     buffer: str,
     current_selection: str | None,
@@ -516,9 +677,7 @@ def _current_command_selection(
     return matches, names[0]
 
 
-def _read_live_boxed_message() -> str:
-    _reserve_bottom_rows(_input_box_reserve_lines())
-
+def _read_live_boxed_message(*, cli_page_mode: str = "loose") -> str:
     buffer = ""
     multiline = False
     selected_command: str | None = None
@@ -526,7 +685,7 @@ def _read_live_boxed_message() -> str:
     pending_escape_started_at: float | None = None
 
     with _raw_stdin():
-        renderer = _InlineTerminalRenderer(sys.stderr)
+        renderer = _make_menu_renderer(cli_page_mode)
         try:
             matches, selected_command = _current_command_selection(
                 buffer,
@@ -538,6 +697,7 @@ def _read_live_boxed_message() -> str:
                     buffer,
                     multiline=multiline,
                     selected_command=selected_command,
+                    cli_page_mode=cli_page_mode,
                 )
             )
             while True:
@@ -556,6 +716,7 @@ def _read_live_boxed_message() -> str:
                             buffer,
                             multiline=multiline,
                             selected_command=selected_command,
+                            cli_page_mode=cli_page_mode,
                         )
                     )
                     raw_key = _read_key()
@@ -578,6 +739,7 @@ def _read_live_boxed_message() -> str:
                             buffer,
                             multiline=multiline,
                             selected_command=selected_command,
+                            cli_page_mode=cli_page_mode,
                         )
                     )
                     continue
@@ -591,6 +753,7 @@ def _read_live_boxed_message() -> str:
                             buffer,
                             multiline=multiline,
                             selected_command=selected_command,
+                            cli_page_mode=cli_page_mode,
                         )
                     )
                     continue
@@ -611,6 +774,7 @@ def _read_live_boxed_message() -> str:
                                 buffer,
                                 multiline=multiline,
                                 selected_command=None,
+                                cli_page_mode=cli_page_mode,
                             )
                         )
                         continue
@@ -624,6 +788,7 @@ def _read_live_boxed_message() -> str:
                                 buffer,
                                 multiline=multiline,
                                 selected_command=None,
+                                cli_page_mode=cli_page_mode,
                             )
                         )
                         continue
@@ -637,6 +802,7 @@ def _read_live_boxed_message() -> str:
                                 buffer,
                                 multiline=multiline,
                                 selected_command=None,
+                                cli_page_mode=cli_page_mode,
                             )
                         )
                         continue
@@ -652,6 +818,7 @@ def _read_live_boxed_message() -> str:
                                 buffer,
                                 multiline=multiline,
                                 selected_command=selected_command,
+                                cli_page_mode=cli_page_mode,
                             )
                         )
                     continue
@@ -680,6 +847,7 @@ def _read_live_boxed_message() -> str:
                             buffer,
                             multiline=multiline,
                             selected_command=selected_command,
+                            cli_page_mode=cli_page_mode,
                         )
                     )
                     continue
@@ -696,16 +864,21 @@ def _read_live_boxed_message() -> str:
                             buffer,
                             multiline=multiline,
                             selected_command=selected_command,
+                            cli_page_mode=cli_page_mode,
                         )
                     )
         finally:
             renderer.finish()
 
-    err_console.print()
+    if buffer.strip():
+        err_console.print(f"[bold green]You[/bold green]")
+        err_console.print(buffer, markup=False, highlight=False)
+        _print_gap(cli_page_mode)
+
     return buffer
 
 
-def _select_effort(current: str, *, supported: bool) -> str:
+def _select_effort(current: str, *, supported: bool, cli_page_mode: str = "loose") -> str:
     if not sys.stdin.isatty() or not err_console.is_terminal:
         return current
 
@@ -715,16 +888,28 @@ def _select_effort(current: str, *, supported: bool) -> str:
     pending_escape_started_at: float | None = None
 
     with _raw_stdin():
-        renderer = _InlineTerminalRenderer(sys.stderr)
+        renderer = _make_menu_renderer(cli_page_mode)
         try:
-            renderer.render(build_effort_menu_lines(current, options[index], supported=supported))
+            renderer.render(
+                build_effort_menu_lines(
+                    current,
+                    options[index],
+                    supported=supported,
+                    cli_page_mode=cli_page_mode,
+                )
+            )
             while True:
                 pending_key, pending_escape, pending_escape_started_at = _drain_pending_escape(
                     pending_escape,
                     pending_escape_started_at,
                 )
                 if pending_key is None:
-                    lines = build_effort_menu_lines(current, options[index], supported=supported)
+                    lines = build_effort_menu_lines(
+                        current,
+                        options[index],
+                        supported=supported,
+                        cli_page_mode=cli_page_mode,
+                    )
                     if not _wait_for_menu_input(
                         renderer,
                         lines,
@@ -747,7 +932,7 @@ def _select_effort(current: str, *, supported: bool) -> str:
                     raise KeyboardInterrupt
                 if key == "\x1b":
                     renderer.finish()
-                    err_console.print()
+                    _print_gap(cli_page_mode)
                     return current
                 if _is_up_key(key):
                     index = (index - 1) % len(options)
@@ -757,17 +942,98 @@ def _select_effort(current: str, *, supported: bool) -> str:
                     continue
                 elif key in ("1", "2", "3", "4"):
                     index = int(key) - 1
-                renderer.render(build_effort_menu_lines(current, options[index], supported=supported))
+                renderer.render(
+                    build_effort_menu_lines(
+                        current,
+                        options[index],
+                        supported=supported,
+                        cli_page_mode=cli_page_mode,
+                    )
+                )
         finally:
             renderer.finish()
 
-    err_console.print()
+    _print_gap(cli_page_mode)
+    return options[index]
+
+
+def _select_cli_page_mode(current: str) -> str:
+    if not sys.stdin.isatty() or not err_console.is_terminal:
+        return current
+
+    options = list(CLI_PAGE_LEVELS)
+    index = options.index(current) if current in options else 0
+    pending_escape = ""
+    pending_escape_started_at: float | None = None
+
+    with _raw_stdin():
+        renderer = _make_menu_renderer(current)
+        try:
+            renderer.render(build_cli_page_menu_lines(current, options[index]))
+            while True:
+                pending_key, pending_escape, pending_escape_started_at = _drain_pending_escape(
+                    pending_escape,
+                    pending_escape_started_at,
+                )
+                if pending_key is None:
+                    lines = build_cli_page_menu_lines(current, options[index])
+                    if not _wait_for_menu_input(
+                        renderer,
+                        lines,
+                        pending_escape=pending_escape,
+                    ):
+                        continue
+                    raw_key = _read_key()
+                    key, pending_escape, pending_escape_started_at = _merge_escape_key(
+                        raw_key,
+                        pending_escape,
+                        pending_escape_started_at,
+                    )
+                    if key is None:
+                        continue
+                else:
+                    key = pending_key
+                if key in ("\r", "\n"):
+                    break
+                if key in ("\x03",):
+                    raise KeyboardInterrupt
+                if key == "\x1b":
+                    renderer.finish()
+                    _print_gap(current)
+                    return current
+                if _is_up_key(key):
+                    index = (index - 1) % len(options)
+                elif _is_down_key(key):
+                    index = (index + 1) % len(options)
+                elif key in ("A", "B", "C", "D", "[", "O"):
+                    continue
+                renderer.render(build_cli_page_menu_lines(current, options[index]))
+        finally:
+            renderer.finish()
+
+    _print_gap(options[index])
     return options[index]
 
 
 class _InlineTerminalRenderer(BottomTerminalRenderer):
-    def __init__(self, stream) -> None:
-        super().__init__(stream, clear_on_finish=True)
+    def __init__(self, stream, *, collapse_on_finish: bool = False) -> None:
+        super().__init__(
+            stream,
+            clear_on_finish=True,
+            scroll_on_grow=True,
+            scroll_on_shrink=True,
+            scroll_on_first_render=True,
+            collapse_on_finish=collapse_on_finish,
+        )
+
+
+def _make_menu_renderer(cli_page_mode: str):
+    if _is_tight_cli_page_mode(cli_page_mode):
+        return InlineFlowRenderer(sys.stderr, clear_on_finish=True)
+    return _InlineTerminalRenderer(
+        sys.stderr,
+        collapse_on_finish=_is_tight_cli_page_mode(cli_page_mode),
+    )
 
 
 class _ReasoningParser:
@@ -925,6 +1191,8 @@ def _looks_like_reasoning_prefix(text: str) -> bool:
     lowered = sample.lower()
     if any(marker in lowered for marker in REASONING_PREFIX_CANDIDATES):
         return True
+    if _looks_like_meta_reasoning_sentence(sample):
+        return True
     if sample.startswith("1.") and "\n" in sample:
         return True
     return False
@@ -942,11 +1210,28 @@ def _might_be_reasoning_prefix(text: str) -> bool:
         return False
     if len(sample) > 64:
         return False
-    return any(candidate.startswith(sample) for candidate in REASONING_PREFIX_CANDIDATES)
+    return any(candidate.startswith(sample) for candidate in REASONING_PREFIX_CANDIDATES) or any(
+        candidate.startswith(sample) for candidate in _META_REASONING_PREFIX_CANDIDATES
+    )
+
+
+def _looks_like_meta_reasoning_sentence(text: str) -> bool:
+    sample = text.lstrip().lower()
+    if not sample:
+        return False
+    if any(sample.startswith(candidate) for candidate in _META_REASONING_PREFIX_CANDIDATES):
+        return True
+    if sample.startswith("that's ") and (" line" in sample or " lines" in sample):
+        return True
+    if sample.startswith("okay, i will") and ("thinking block" in sample or "count" in sample):
+        return True
+    return False
 
 
 def _should_end_implicit_reasoning(reasoning_text: str, buffer: str) -> bool:
     if not reasoning_text or not (reasoning_text.endswith("\n") or reasoning_text.endswith("\r")):
+        return False
+    if _last_reasoning_line_opens_draft(reasoning_text):
         return False
     sample = buffer.lstrip()
     if not sample:
@@ -958,9 +1243,38 @@ def _should_end_implicit_reasoning(reasoning_text: str, buffer: str) -> bool:
     return True
 
 
+def _last_reasoning_line_opens_draft(reasoning_text: str) -> bool:
+    lines = reasoning_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    for line in reversed(lines):
+        sample = line.strip().lower()
+        if not sample:
+            continue
+        return sample in (
+            "response:",
+            "response：",
+            "final output:",
+            "final output：",
+            "final choice:",
+            "final choice：",
+            "final decision:",
+            "final decision：",
+            "answer:",
+            "answer：",
+            "回答:",
+            "回答：",
+            "答案:",
+            "答案：",
+            "回复:",
+            "回复：",
+        )
+    return False
+
+
 def _looks_like_reasoning_line_start(text: str) -> bool:
     sample = text.lstrip()
     lowered = sample.lower()
+    if _looks_like_meta_reasoning_sentence(sample):
+        return True
     if sample.startswith(('"', "“", "'")):
         return True
     if sample.startswith(("**", "* ", "- ", "• ", "> ")):
@@ -970,6 +1284,25 @@ def _looks_like_reasoning_line_start(text: str) -> bool:
     if re.match(r"^\d+[\.\)]\s", sample):
         return True
     markers = (
+        "usually, this means",
+        "this implies",
+        "user says",
+        "intent is",
+        "response should",
+        "keep it short",
+        "thinking block:",
+        "thinking:",
+        "revised plan:",
+        "final answer:",
+        "response:",
+        "answer:",
+        "constraint check:",
+        "thinking block lines:",
+        "actually, looking at",
+        "let's check the system instruction again",
+        "let's check the instruction again",
+        "the instruction says",
+        "let's just respond",
         "input:",
         "language:",
         "meaning:",
@@ -997,6 +1330,12 @@ def _looks_like_reasoning_line_start(text: str) -> bool:
         "输入:",
         "意图",
         "最终",
+        "回答：",
+        "回答:",
+        "答案：",
+        "答案:",
+        "回复：",
+        "回复:",
         "好的，用户",
         "用户发来",
         "用户可能",
@@ -1021,11 +1360,32 @@ def _might_be_reasoning_line_start(text: str) -> bool:
         return False
     if len(sample) > 48:
         return False
+    if any(candidate.startswith(sample) for candidate in _META_REASONING_PREFIX_CANDIDATES):
+        return True
     if sample.startswith(('"', "“", "'")):
         return True
     if any(candidate.startswith(sample) for candidate in EMPHASIZED_REASONING_PREFIX_CANDIDATES):
         return True
     candidates = (
+        "usually, this means",
+        "this implies",
+        "user says",
+        "intent is",
+        "response should",
+        "keep it short",
+        "thinking block:",
+        "thinking:",
+        "revised plan:",
+        "final answer:",
+        "response:",
+        "answer:",
+        "constraint check:",
+        "thinking block lines:",
+        "actually, looking at",
+        "let's check the system instruction again",
+        "let's check the instruction again",
+        "the instruction says",
+        "let's just respond",
         "input:",
         "language:",
         "meaning:",
@@ -1053,6 +1413,12 @@ def _might_be_reasoning_line_start(text: str) -> bool:
         "输入:",
         "意图",
         "最终",
+        "回答：",
+        "回答:",
+        "答案：",
+        "答案:",
+        "回复：",
+        "回复:",
         "好的，用户",
         "用户发来",
         "用户可能",
@@ -1106,9 +1472,20 @@ def _looks_like_strong_reasoning_line(text: str) -> bool:
     if not sample:
         return False
     lowered = sample.lower()
+    if _looks_like_meta_reasoning_sentence(sample):
+        return True
     if _looks_like_emphasized_reasoning_label(sample):
         return True
     markers = (
+        "usually, this means",
+        "this implies",
+        "user says",
+        "intent is",
+        "response should",
+        "keep it short",
+        "revised plan:",
+        "thinking block:",
+        "thinking:",
         "user:",
         "model:",
         "input:",
@@ -1116,8 +1493,18 @@ def _looks_like_strong_reasoning_line(text: str) -> bool:
         "meaning:",
         "intent:",
         "final output:",
+        "final answer:",
         "final choice:",
         "final decision:",
+        "response:",
+        "answer:",
+        "constraint check:",
+        "thinking block lines:",
+        "actually, looking at",
+        "let's check the system instruction again",
+        "let's check the instruction again",
+        "the instruction says",
+        "let's just respond",
         "refinement:",
         "draft:",
         "review:",
@@ -1134,6 +1521,12 @@ def _looks_like_strong_reasoning_line(text: str) -> bool:
         "最终输出:",
         "最终决定：",
         "最终决定:",
+        "回答：",
+        "回答:",
+        "答案：",
+        "答案:",
+        "回复：",
+        "回复:",
         "总结：",
         "总结:",
     )
@@ -1146,7 +1539,18 @@ def _might_be_strong_reasoning_line(text: str) -> bool:
         return False
     if len(sample) > 40:
         return False
+    if any(candidate.startswith(sample) for candidate in _META_REASONING_PREFIX_CANDIDATES):
+        return True
     candidates = (
+        "usually, this means",
+        "this implies",
+        "user says",
+        "intent is",
+        "response should",
+        "keep it short",
+        "revised plan:",
+        "thinking block:",
+        "thinking:",
         "user:",
         "model:",
         "input:",
@@ -1154,8 +1558,18 @@ def _might_be_strong_reasoning_line(text: str) -> bool:
         "meaning:",
         "intent:",
         "final output:",
+        "final answer:",
         "final choice:",
         "final decision:",
+        "response:",
+        "answer:",
+        "constraint check:",
+        "thinking block lines:",
+        "actually, looking at",
+        "let's check the system instruction again",
+        "let's check the instruction again",
+        "the instruction says",
+        "let's just respond",
         "refinement:",
         "draft:",
         "review:",
@@ -1172,6 +1586,12 @@ def _might_be_strong_reasoning_line(text: str) -> bool:
         "最终输出:",
         "最终决定：",
         "最终决定:",
+        "回答：",
+        "回答:",
+        "答案：",
+        "答案:",
+        "回复：",
+        "回复:",
         "总结：",
         "总结:",
     )
@@ -1184,25 +1604,159 @@ def _can_start_late_implicit_reasoning(visible_tail: str) -> bool:
     return visible_tail.endswith("\n") or visible_tail.endswith("\n\n")
 
 
+def _extract_answer_labeled_text(text: str) -> str:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    lowered = normalized.lower()
+    best = ""
+    best_index = -1
+    for label in _FINAL_ANSWER_LABELS:
+        index = lowered.rfind(label.lower())
+        if index == -1:
+            continue
+        candidate = normalized[index + len(label):].strip()
+        if candidate and index >= best_index:
+            best = candidate
+            best_index = index
+    return best
+
+
+def _paragraph_looks_like_reasoning(paragraph: str) -> bool:
+    lines = [line.strip() for line in paragraph.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    lines = [line for line in lines if line]
+    if not lines:
+        return False
+
+    reasoning_lines = 0
+    for line in lines:
+        lowered = line.lower()
+        if _looks_like_strong_reasoning_line(line) or _looks_like_reasoning_line_start(line):
+            reasoning_lines += 1
+            continue
+        if re.match(
+            r"^\d+\.\s+(identify|recall|keep|ignore|determine|analyze|draft|check|review|summarize)\b",
+            lowered,
+        ):
+            reasoning_lines += 1
+            continue
+
+    if reasoning_lines == 0:
+        return False
+    return reasoning_lines >= len(lines) or reasoning_lines >= max(2, len(lines) - 1)
+
+
 def _clean_final_output_from_reasoning_leak(text: str) -> str:
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     lines = normalized.split("\n")
     marker_indexes = [index for index, line in enumerate(lines) if _looks_like_strong_reasoning_line(line)]
-    if not marker_indexes:
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"\n\s*\n", normalized)
+        if paragraph.strip()
+    ]
+    if not marker_indexes and not any(_paragraph_looks_like_reasoning(paragraph) for paragraph in paragraphs):
         return text
+    if not paragraphs:
+        return text
+    for paragraph in reversed(paragraphs):
+        labeled = _extract_answer_labeled_text(paragraph)
+        if labeled:
+            return labeled
+        if not _paragraph_looks_like_reasoning(paragraph):
+            return paragraph
+    return text
 
-    last_marker = marker_indexes[-1]
-    before = [line for line in lines[:last_marker] if line.strip()]
-    tail = lines[last_marker + 1:]
-    while tail and not tail[0].strip():
-        tail = tail[1:]
-    while tail and not tail[-1].strip():
-        tail = tail[:-1]
-    if not before or not tail:
-        return text
-    if not any(line.strip() and not _looks_like_strong_reasoning_line(line) for line in tail):
-        return text
-    return "\n".join(tail)
+
+def _recover_final_output(candidate_text: str, reasoning_text: str) -> str:
+    visible = _clean_final_output_from_reasoning_leak(candidate_text).strip()
+    if visible:
+        return visible
+
+    normalized = reasoning_text.replace("\r\n", "\n").replace("\r", "\n")
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"\n\s*\n", normalized)
+        if paragraph.strip()
+    ]
+    for paragraph in reversed(paragraphs):
+        if not _paragraph_looks_like_reasoning(paragraph):
+            return paragraph
+    return ""
+
+
+def _should_animate_final_body() -> bool:
+    if not isinstance(err_console, Console):
+        return False
+    stream = getattr(err_console, "file", None)
+    return bool(
+        err_console.is_terminal
+        and stream is not None
+        and getattr(stream, "isatty", lambda: False)()
+    )
+
+
+def _iter_body_chunks(text: str) -> list[str]:
+    chunks: list[str] = []
+    line_visible_count = 0
+    index = 0
+    length = len(text)
+
+    while index < length:
+        char = text[index]
+        if char == "\n":
+            chunks.append("\n")
+            line_visible_count = 0
+            index += 1
+            continue
+
+        if line_visible_count < 32:
+            chunk_size = 1
+        elif line_visible_count < 96:
+            chunk_size = 2
+        else:
+            chunk_size = 3
+
+        end = min(length, index + chunk_size)
+        newline_index = text.find("\n", index, end)
+        if newline_index != -1:
+            end = newline_index
+        if end == index:
+            chunks.append("\n")
+            line_visible_count = 0
+            index += 1
+            continue
+
+        chunk = text[index:end]
+        chunks.append(chunk)
+        line_visible_count += len(chunk)
+        index = end
+
+    return chunks
+
+
+def _print_final_body(text: str) -> None:
+    if not text:
+        return
+    if not _should_animate_final_body():
+        err_console.print(text, markup=False, highlight=False)
+        return
+
+    stream = err_console.file
+    for chunk in _iter_body_chunks(text):
+        stream.write(chunk)
+        stream.flush()
+        if chunk == "\n":
+            time.sleep(0.018)
+            continue
+
+        delay = 0.008 if len(chunk) == 1 else 0.005
+        if chunk[-1] in ",;，；:":
+            delay += 0.006
+        elif chunk[-1] in ".!?。！？":
+            delay += 0.012
+        time.sleep(delay)
+    if not text.endswith("\n"):
+        stream.write("\n")
+        stream.flush()
 
 
 def _stream_response(
@@ -1216,22 +1770,19 @@ def _stream_response(
     max_tokens,
     verbose,
     chat_template_kwargs: dict | None = None,
+    cli_page_mode: str = "loose",
 ):
-    """Stream a response, collecting the full text. Returns (full_text, last_response, reasoning_text)."""
+    """Stream a response, collecting the full text."""
     full_text = ""
+    candidate_text = ""
     last_response = None
-    wrote_output = False
+    streamed_output = False
     stream_to_stdout = not err_console.is_terminal
     parser = _ReasoningParser()
     prev_reasoning = False
-    saw_late_reasoning_after_output = False
-    visible_after_last_reasoning = ""
-    streamed_reasoning_output = False
+    saw_reasoning = False
 
-    if not stream_to_stdout:
-        _prepare_status_overlay_space(model_label)
-
-    with daydreaming_status(err_console, model_label) as status:
+    with daydreaming_status(err_console, model_label, cli_page_mode=cli_page_mode) as status:
         for response in engine.generate_stream(
             model, tokenizer, messages,
             max_tokens=max_tokens, temp=temp, top_p=top_p,
@@ -1240,13 +1791,14 @@ def _stream_response(
             raw_chunk = response.text or ""
             text_chunk, reasoning_chunk, reasoning_closed = parser.feed(raw_chunk)
             entered_reasoning = parser.in_reasoning and not prev_reasoning
+            if reasoning_chunk or entered_reasoning or reasoning_closed or parser.saw_reasoning:
+                saw_reasoning = True
 
             # Reasoning state transitions → drive the status display
             if reasoning_chunk and not prev_reasoning and not status.had_reasoning:
                 status.start_reasoning()
             if entered_reasoning:
-                if wrote_output and full_text.strip():
-                    saw_late_reasoning_after_output = True
+                if streamed_output and full_text.strip():
                     full_text = ""
                     if hasattr(status, "clear_output"):
                         status.clear_output()
@@ -1255,7 +1807,8 @@ def _stream_response(
                             status.output = ""
                         except Exception:
                             pass
-                visible_after_last_reasoning = ""
+                    streamed_output = False
+                candidate_text = ""
                 if not status.had_reasoning:
                     status.start_reasoning()
             if reasoning_chunk:
@@ -1265,37 +1818,28 @@ def _stream_response(
             prev_reasoning = parser.in_reasoning
 
             # Stats updates
-            if response.prompt_tps and not wrote_output:
+            if response.prompt_tps and not streamed_output:
                 status.update(phase="prefill", tokens_per_second=response.prompt_tps)
 
-            # First visible token → switch from animation to output mode
-            if text_chunk and not wrote_output:
-                status.ensure_minimum_wait(0.28)
-                status.update(waiting=False, phase=None)
-                if not stream_to_stdout and status.had_reasoning and not streamed_reasoning_output:
-                    if hasattr(status, "stop"):
-                        status.stop()
-                    _promote_terminal_output_to_scrollback()
-                    if status.reasoning_elapsed is not None:
-                        err_console.print(render_reasoning_line(status.reasoning_elapsed, active=False))
-                        err_console.print()
-                    streamed_reasoning_output = True
-
-            full_text += text_chunk
-            visible_after_last_reasoning += text_chunk
-            last_response = response
-
-            if text_chunk:
+            # No reasoning detected → normal live streaming body.
+            if text_chunk and not saw_reasoning:
+                if not streamed_output:
+                    status.ensure_minimum_wait(0.28)
+                    status.update(waiting=False, phase=None)
+                full_text += text_chunk
+                last_response = response
                 if stream_to_stdout:
                     print(text_chunk, end="", flush=True)
                 else:
-                    if streamed_reasoning_output:
-                        stream = getattr(err_console, "file", sys.stderr)
-                        stream.write(text_chunk)
-                        stream.flush()
-                    else:
-                        status.append_output(text_chunk)
-                wrote_output = True
+                    status.append_output(text_chunk)
+                streamed_output = True
+                if response.generation_tps:
+                    status.update(phase=None, tokens_per_second=response.generation_tps)
+            elif text_chunk:
+                # Reasoning was detected at some point in this response. Hold all
+                # visible text until we can determine the final clean body.
+                candidate_text += text_chunk
+                last_response = response
                 if response.generation_tps:
                     status.update(phase=None, tokens_per_second=response.generation_tps)
             elif response.generation_tps:
@@ -1304,33 +1848,36 @@ def _stream_response(
             if response.finish_reason:
                 break
 
-    if not stream_to_stdout:
-        if saw_late_reasoning_after_output and visible_after_last_reasoning.strip():
-            full_text = visible_after_last_reasoning
+    if saw_reasoning:
+        full_text = _recover_final_output(candidate_text or full_text, parser.reasoning_text)
+    else:
         full_text = _clean_final_output_from_reasoning_leak(full_text)
-        if not streamed_reasoning_output:
-            _promote_terminal_output_to_scrollback()
-            if status.had_reasoning and status.reasoning_elapsed is not None:
-                err_console.print(render_reasoning_line(status.reasoning_elapsed, active=False))
-                err_console.print()
-            if full_text:
-                err_console.print(full_text, markup=False, highlight=False)
-                err_console.print()
-        else:
-            if full_text and not full_text.endswith("\n"):
-                err_console.print()
-            err_console.print()
+    full_text = full_text.lstrip("\n")
+    if status.had_reasoning and full_text:
+        full_text = full_text.rstrip()
+
+    if not stream_to_stdout:
+        if status.had_reasoning and status.reasoning_elapsed is not None:
+            err_console.print(render_reasoning_line(status.reasoning_elapsed, active=False))
+            _print_gap(cli_page_mode)
+        if full_text:
+            err_console.print(f"[bold cyan]{model_label}[/bold cyan]")
+            _print_final_body(full_text)
+            _print_gap(cli_page_mode)
         if status.had_reasoning:
             err_console.print("[dim]Use /t to expand reasoning[/dim]")
-            err_console.print()
+            _print_gap(cli_page_mode)
 
-    if wrote_output and stream_to_stdout:
+    elif full_text and saw_reasoning:
+        print(full_text)
+
+    if streamed_output and stream_to_stdout and not saw_reasoning:
         print()
 
     if verbose and last_response:
         _print_stats(last_response)
 
-    return full_text, last_response, parser.reasoning_text
+    return full_text, last_response, parser.reasoning_text, status.reasoning_elapsed
 
 
 def _promote_terminal_output_to_scrollback() -> None:
@@ -1339,9 +1886,9 @@ def _promote_terminal_output_to_scrollback() -> None:
     stream = getattr(err_console, "file", sys.stderr)
     if not getattr(stream, "isatty", lambda: False)():
         return
-    rows = shutil.get_terminal_size(fallback=(96, 24)).lines
-    stream.write(f"\x1b[{rows};1H")
-    stream.write("\n")
+    size = shutil.get_terminal_size(fallback=(96, 24))
+    stream.write(f"\x1b[{size.lines};1H")
+    stream.write("\n" * size.lines)
     stream.flush()
 
 
@@ -1351,8 +1898,8 @@ def _reserve_bottom_rows(count: int) -> None:
     stream = getattr(err_console, "file", sys.stderr)
     if not getattr(stream, "isatty", lambda: False)():
         return
-    rows = shutil.get_terminal_size(fallback=(96, 24)).lines
-    stream.write(f"\x1b[{rows};1H")
+    size = shutil.get_terminal_size(fallback=(96, 24))
+    stream.write(f"\x1b[{size.lines};1H")
     stream.write("\n" * count)
     stream.flush()
 
@@ -1361,23 +1908,23 @@ def _prepare_status_overlay_space(model_label: str) -> None:
     _reserve_bottom_rows(_status_overlay_reserve_lines(model_label))
 
 
-def _print_resumed_history(messages: list[ChatMessage], assistant_label: str) -> None:
+def _print_resumed_history(messages: list[ChatMessage], assistant_label: str, *, cli_page_mode: str = "loose") -> None:
     visible_messages = [message for message in messages if message.role in {"user", "assistant"}]
     if not visible_messages:
         return
     visible_messages = visible_messages[-10:]
 
-    err_console.print()
+    _print_gap(cli_page_mode)
     for message in visible_messages:
         if message.role == "user":
-            err_console.print("[bold]You[/]")
+            err_console.print("[bold green]You[/]")
         else:
             err_console.print(f"[bold cyan]{assistant_label}[/]")
         err_console.print(message.content, markup=False, highlight=False)
-        err_console.print()
+        _print_gap(cli_page_mode)
 
 
-def _select_dreaming_mode() -> str | None:
+def _select_dreaming_mode(*, cli_page_mode: str = "loose") -> str | None:
     """Arrow-key menu to choose REMing or Daydream.
 
     Pattern: copy _select_effort() structure exactly.
@@ -1392,16 +1939,16 @@ def _select_dreaming_mode() -> str | None:
     pending_escape_started_at: float | None = None
 
     with _raw_stdin():
-        renderer = _InlineTerminalRenderer(sys.stderr)
+        renderer = _make_menu_renderer(cli_page_mode)
         try:
-            renderer.render(build_dreaming_menu_lines(options[index]))
+            renderer.render(build_dreaming_menu_lines(options[index], cli_page_mode=cli_page_mode))
             while True:
                 pending_key, pending_escape, pending_escape_started_at = _drain_pending_escape(
                     pending_escape,
                     pending_escape_started_at,
                 )
                 if pending_key is None:
-                    lines = build_dreaming_menu_lines(options[index])
+                    lines = build_dreaming_menu_lines(options[index], cli_page_mode=cli_page_mode)
                     if not _wait_for_menu_input(
                         renderer,
                         lines,
@@ -1424,7 +1971,7 @@ def _select_dreaming_mode() -> str | None:
                     raise KeyboardInterrupt
                 if key == "\x1b":
                     renderer.finish()
-                    err_console.print()
+                    _print_gap(cli_page_mode)
                     return None
                 if _is_up_key(key):
                     index = (index - 1) % len(options)
@@ -1432,11 +1979,11 @@ def _select_dreaming_mode() -> str | None:
                     index = (index + 1) % len(options)
                 elif key in ("A", "B", "C", "D", "[", "O"):
                     continue
-                renderer.render(build_dreaming_menu_lines(options[index]))
+                renderer.render(build_dreaming_menu_lines(options[index], cli_page_mode=cli_page_mode))
         finally:
             renderer.finish()
 
-    err_console.print()
+    _print_gap(cli_page_mode)
     return options[index]
 
 
@@ -1444,6 +1991,7 @@ def _select_session_action(
     sessions: list,
     *,
     allow_delete: bool = False,
+    cli_page_mode: str = "loose",
 ) -> tuple[str, object] | None:
     """Arrow-key menu to choose a session action.
 
@@ -1461,7 +2009,7 @@ def _select_session_action(
     pending_escape_started_at: float | None = None
 
     with _raw_stdin():
-        renderer = _InlineTerminalRenderer(sys.stderr)
+        renderer = _make_menu_renderer(cli_page_mode)
         try:
             window = _session_window(sessions, index)
             renderer.render(
@@ -1469,6 +2017,7 @@ def _select_session_action(
                     window,
                     index - _session_window_start(sessions, index),
                     allow_delete=allow_delete,
+                    cli_page_mode=cli_page_mode,
                 )
             )
             while True:
@@ -1482,6 +2031,7 @@ def _select_session_action(
                         window,
                         index - _session_window_start(sessions, index),
                         allow_delete=allow_delete,
+                        cli_page_mode=cli_page_mode,
                     )
                     if not _wait_for_menu_input(
                         renderer,
@@ -1505,7 +2055,7 @@ def _select_session_action(
                     raise KeyboardInterrupt
                 if key == "\x1b":
                     renderer.finish()
-                    err_console.print()
+                    _print_gap(cli_page_mode)
                     return None
                 if _is_up_key(key):
                     index = (index - 1) % len(sessions)
@@ -1521,12 +2071,13 @@ def _select_session_action(
                         window,
                         index - _session_window_start(sessions, index),
                         allow_delete=allow_delete,
+                        cli_page_mode=cli_page_mode,
                     )
                 )
         finally:
             renderer.finish()
 
-    err_console.print()
+    _print_gap(cli_page_mode)
     return ("resume", sessions[index])
 
 
@@ -1628,6 +2179,7 @@ def run_oneshot(
     display_name: str | None = None,
 ) -> None:
     """Run a single generation and exit."""
+    cli_page_mode = get_default_cli_page_mode()
     # Read from stdin if no prompt given
     if prompt is None:
         if sys.stdin.isatty():
@@ -1656,6 +2208,7 @@ def run_oneshot(
         model_label=display_name or reverse_lookup(resolved_name) or model_name,
         temp=temp, top_p=top_p, max_tokens=max_tokens, verbose=verbose,
         chat_template_kwargs=chat_template_kwargs,
+        cli_page_mode=cli_page_mode,
     )
 
 
@@ -1675,12 +2228,14 @@ def run_chat(
     with err_console.status("Preparing model..."):
         model, tokenizer = engine.load_model(repo_id, ensure_available=False)
     short = display_name or reverse_lookup(repo_id) or model_name
+    cli_page_mode = get_default_cli_page_mode()
 
     err_console.print(f"[bold cyan]{short}[/]")
     err_console.print("[dim]Use / for commands.[/dim]")
-    err_console.print()
+    _print_gap(cli_page_mode)
 
     messages: list[dict] = []
+    transcript_blocks: list[_TranscriptBlock] = []
     last_reasoning = ""
     effort = initial_effort if initial_effort in EFFORT_LEVELS else "default"
     effort_supported = _model_supports_effort(repo_id)
@@ -1691,7 +2246,7 @@ def run_chat(
 
     while True:
         try:
-            user_input = _read_boxed_message()
+            user_input = _read_boxed_message(cli_page_mode=cli_page_mode)
         except (EOFError, KeyboardInterrupt):
             err_console.print()
             break
@@ -1704,10 +2259,13 @@ def run_chat(
             break
         if stripped in ("/reset", "/clear", "/r"):
             messages = []
+            transcript_blocks = []
             if session is not None:
                 session.messages = []
                 session.updated_at = time.time()
                 save_session(session)
+            if _is_tight_cli_page_mode(cli_page_mode):
+                _repack_tight_page(short, transcript_blocks)
             err_console.print("[dim]Chat history cleared.[/dim]")
             continue
         if stripped in ("/help", "/h", "/?"):
@@ -1719,6 +2277,7 @@ def run_chat(
             err_console.print("[dim]/dreaming — consolidate memories from conversation[/dim]")
             err_console.print("[dim]/memory   — view extracted memories[/dim]")
             err_console.print("[dim]/effort   — pick instant / short / default / long[/dim]")
+            err_console.print("[dim]/cli-page — choose loose / tight page spacing[/dim]")
             err_console.print("[dim]/reset    — clear conversation history[/dim]")
             err_console.print("[dim]/clear    — alias for /reset[/dim]")
             err_console.print("[dim]/t        — show last captured reasoning[/dim]")
@@ -1726,16 +2285,33 @@ def run_chat(
             err_console.print("[dim]/help     — show this help[/dim]")
             continue
         if stripped == "/":
-            err_console.print("[dim]Type /effort, /new, /resume, /dreaming, /memory, /t, /reset, or /help.[/dim]")
+            err_console.print("[dim]Type /effort, /cli-page, /new, /resume, /dreaming, /memory, /t, /reset, or /help.[/dim]")
             continue
         if stripped.startswith("/effort"):
             parts = stripped.split(maxsplit=1)
             selected = _normalize_effort(parts[1]) if len(parts) > 1 else None
             if selected is None:
-                selected = _select_effort(effort, supported=effort_supported)
+                selected = _select_effort(effort, supported=effort_supported, cli_page_mode=cli_page_mode)
             effort = selected
             note = "[dim]Model may ignore this setting.[/dim]" if not effort_supported else ""
             err_console.print(f"[dim]Reasoning effort set to {effort}.[/dim] {note}".rstrip())
+            continue
+        if stripped.startswith("/cli-page"):
+            parts = stripped.split(maxsplit=1)
+            selected = _normalize_cli_page_mode(parts[1]) if len(parts) > 1 else None
+            if selected is None:
+                selected = _select_cli_page_mode(cli_page_mode)
+            cli_page_mode = set_default_cli_page_mode(selected)
+            err_console.print(
+                f"[dim]CLI page mode set to {cli_page_mode}. New chats will default to this mode.[/dim]"
+            )
+            if _is_tight_cli_page_mode(cli_page_mode):
+                transcript_blocks = _transcript_blocks_from_messages([
+                    ChatMessage(role=message["role"], content=message["content"], timestamp=0.0)
+                    for message in messages
+                    if message["role"] in {"user", "assistant"}
+                ])
+                _repack_tight_page(short, transcript_blocks)
             continue
         if stripped in ("/t", "/thoughts"):
             err_console.print(render_expanded_reasoning(last_reasoning))
@@ -1769,6 +2345,7 @@ def run_chat(
                 selection = _select_session_action(
                     available_sessions,
                     allow_delete=(stripped == "/forget"),
+                    cli_page_mode=cli_page_mode,
                 )
                 if selection is None:
                     break
@@ -1792,8 +2369,12 @@ def run_chat(
                 session = selected_session
                 messages = [{"role": m.role, "content": m.content} for m in session.messages]
                 session_memories = load_memories(session.session_id)
+                transcript_blocks = _transcript_blocks_from_messages(session.messages)
                 err_console.print(f"[dim]Resumed: {session.title} ({len(messages)} messages)[/dim]")
-                _print_resumed_history(session.messages, short)
+                if _is_tight_cli_page_mode(cli_page_mode):
+                    _repack_tight_page(short, transcript_blocks)
+                else:
+                    _print_resumed_history(session.messages, short, cli_page_mode=cli_page_mode)
                 break
             continue
         if stripped == "/dreaming":
@@ -1803,7 +2384,7 @@ def run_chat(
             if len(messages) < 2:
                 err_console.print("[dim]Need at least one exchange to dream about.[/dim]")
                 continue
-            mode = _select_dreaming_mode()
+            mode = _select_dreaming_mode(cli_page_mode=cli_page_mode)
             if mode is None:
                 continue
             new_memories = _run_dreaming(
@@ -1850,15 +2431,30 @@ def run_chat(
         )
         chat_template_kwargs = _effort_chat_template_kwargs(effort, tokenizer)
 
-        full_text, _, reasoning_text = _stream_response(
+        stream_result = _stream_response(
             model, tokenizer, request_messages,
             model_label=short,
             temp=temp, top_p=top_p, max_tokens=max_tokens, verbose=verbose,
             chat_template_kwargs=chat_template_kwargs,
+            cli_page_mode=cli_page_mode,
         )
+        if len(stream_result) == 4:
+            full_text, _, reasoning_text, reasoning_elapsed = stream_result
+        else:
+            full_text, _, reasoning_text = stream_result
+            reasoning_elapsed = None
         last_reasoning = reasoning_text
 
         messages.append({"role": "assistant", "content": full_text})
+        if _is_tight_cli_page_mode(cli_page_mode):
+            _append_transcript_turn(
+                transcript_blocks,
+                user_input=user_input,
+                assistant_text=full_text,
+                reasoning_elapsed=reasoning_elapsed,
+                had_reasoning=bool(reasoning_text.strip()),
+            )
+            _repack_tight_page(short, transcript_blocks)
 
         if session is not None:
             session.messages.append(ChatMessage(

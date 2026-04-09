@@ -11,10 +11,12 @@ from unittest import mock
 from rich.console import Console
 
 from daydream.chat import (
+    InlineFlowRenderer,
     _InlineTerminalRenderer,
     _ReasoningParser,
     _build_request_messages,
     _build_session_memory_prompt,
+    _clean_final_output_from_reasoning_leak,
     _collect_multiline_message,
     _confirm_memory_import,
     _confirm_session_delete,
@@ -25,16 +27,24 @@ from daydream.chat import (
     _extract_visible_text,
     _is_down_key,
     _is_up_key,
+    _iter_body_chunks,
     _merge_escape_key,
     _matching_slash_commands,
+    _make_menu_renderer,
     _model_supports_effort,
+    _normalize_cli_page_mode,
     _normalize_effort,
     _read_key,
     _read_live_boxed_message,
+    _extract_answer_labeled_text,
+    _recover_final_output,
+    _repack_tight_page,
+    _select_cli_page_mode,
     _select_dreaming_mode,
     _select_effort,
     _select_session_action,
     _status_overlay_reserve_lines,
+    _transcript_blocks_from_messages,
     run_chat,
     run_oneshot,
 )
@@ -151,10 +161,66 @@ class ChatTests(unittest.TestCase):
         self.assertIn("*Refinement:* Keep it conversational.", reasoning_delta)
         self.assertFalse(closed)
 
+    def test_reasoning_parser_keeps_thinking_block_response_inside_reasoning(self) -> None:
+        parser = _ReasoningParser()
+
+        delta, reasoning_delta, closed = parser.feed(
+            "Thinking block:\n"
+            "1. User repeats hi.\n"
+            "Response:\n"
+            "Hello again! Ready to help?\n\n"
+            "Hello again! What are we working on?"
+        )
+        self.assertEqual(delta, "Hello again! What are we working on?")
+        self.assertIn("Thinking block:", reasoning_delta)
+        self.assertIn("Response:\nHello again! Ready to help?", reasoning_delta)
+        self.assertTrue(closed)
+
+    def test_reasoning_parser_hides_meta_thinking_trace_before_final_answer(self) -> None:
+        parser = _ReasoningParser()
+
+        delta, reasoning_delta, closed = parser.feed(
+            "Okay, I will count the lines in the thinking block.\n\n"
+            "That's 4 lines. Perfect.\n\n"
+            "Now the actual response.\n"
+            "\"Hello! I'm Qwen, a large language model. How can I assist you today?\"\n\n"
+            "1. Identify user intent: Self-introduction.\n"
+            "2. Recall identity: Qwen, large language model.\n"
+            "3. Keep response brief and friendly.\n"
+            "4. Ignore typo in user query for clarity.\n\n"
+            "Hello! I'm Qwen, a large language model trained by Tongyi Lab. How can I assist you today?"
+        )
+        self.assertEqual(
+            delta,
+            "Hello! I'm Qwen, a large language model trained by Tongyi Lab. How can I assist you today?",
+        )
+        self.assertIn("thinking block", reasoning_delta.lower())
+        self.assertIn("Now the actual response.", reasoning_delta)
+        self.assertTrue(closed)
+
+    def test_reasoning_parser_hides_usually_means_and_instruction_check_trace(self) -> None:
+        parser = _ReasoningParser()
+
+        delta, reasoning_delta, closed = parser.feed(
+            "Usually, this means I should output the reasoning.\n"
+            "Let's check the system instruction again: \"Keep your thinking block under 3-5 lines.\"\n"
+            "Hello! How can I help you today?"
+        )
+        self.assertEqual(delta, "Hello! How can I help you today?")
+        self.assertIn("Usually, this means", reasoning_delta)
+        self.assertIn("Let's check the system instruction again", reasoning_delta)
+        self.assertTrue(closed)
+
     def test_matching_slash_commands_filters_by_prefix(self) -> None:
         matches = _matching_slash_commands("/e")
         self.assertEqual(matches[0][0], "/effort")
         self.assertTrue(any(name == "/help" for name, _ in _matching_slash_commands("/")))
+        self.assertTrue(any(name == "/cli-page" for name, _ in _matching_slash_commands("/cli")))
+
+    def test_normalize_cli_page_mode_accepts_supported_values(self) -> None:
+        self.assertEqual(_normalize_cli_page_mode("TIGHT"), "tight")
+        self.assertEqual(_normalize_cli_page_mode(" loose "), "loose")
+        self.assertIsNone(_normalize_cli_page_mode("compact"))
 
     def test_current_command_selection_defaults_and_preserves(self) -> None:
         matches, selected = _current_command_selection("/", None, multiline=False)
@@ -164,6 +230,54 @@ class ChatTests(unittest.TestCase):
         matches, selected = _current_command_selection("/e", "/effort", multiline=False)
         self.assertEqual(selected, "/effort")
         self.assertEqual(matches[0][0], "/effort")
+
+    def test_make_menu_renderer_uses_bottom_renderer_in_tight_mode(self) -> None:
+        renderer = _make_menu_renderer("tight")
+        self.assertIsInstance(renderer, InlineFlowRenderer)
+
+    def test_iter_body_chunks_splits_confirmed_body_into_small_pieces(self) -> None:
+        chunks = _iter_body_chunks("Hello from Daydream.")
+        self.assertGreater(len(chunks), 5)
+        self.assertEqual("".join(chunks), "Hello from Daydream.")
+        self.assertEqual(chunks[:5], list("Hello"))
+
+    def test_iter_body_chunks_resets_to_single_chars_after_newline(self) -> None:
+        chunks = _iter_body_chunks("Hello there.\nWorld again.")
+        newline_index = chunks.index("\n")
+        self.assertEqual(chunks[newline_index + 1:newline_index + 6], list("World"))
+
+    def test_transcript_blocks_from_messages_adds_reasoning_summary_for_assistant(self) -> None:
+        from daydream.storage import ChatMessage
+
+        blocks = _transcript_blocks_from_messages([
+            ChatMessage(role="user", content="hi", timestamp=1.0),
+            ChatMessage(role="assistant", content="hello", timestamp=2.0, reasoning="hidden"),
+        ])
+        self.assertEqual([block.kind for block in blocks], ["user", "reasoning_summary", "assistant"])
+
+    def test_repack_tight_page_reprints_compact_history(self) -> None:
+        fake_console = mock.Mock(is_terminal=True)
+        fake_console.print = mock.Mock()
+        fake_stream = io.StringIO()
+        fake_stream.isatty = lambda: True
+        fake_console.file = fake_stream
+
+        with mock.patch("daydream.chat.err_console", fake_console):
+            _repack_tight_page(
+                "qwen3.5-9b",
+                [
+                    mock.Mock(kind="user", content="hi", elapsed=None),
+                    mock.Mock(kind="reasoning_summary", content="", elapsed=1.5),
+                    mock.Mock(kind="assistant", content="hello", elapsed=None),
+                ],
+            )
+
+        self.assertTrue(fake_stream.getvalue().startswith("\x1b[2J\x1b[H"))
+        printed = " ".join(str(call.args[0]) for call in fake_console.print.call_args_list if call.args)
+        self.assertIn("Use / for commands.", printed)
+        self.assertIn("hi", printed)
+        self.assertIn("Daydreamed for 1.5s", printed)
+        self.assertIn("hello", printed)
 
     def test_read_key_supports_ss3_arrow_sequences(self) -> None:
         stdin = mock.Mock()
@@ -227,7 +341,151 @@ class ChatTests(unittest.TestCase):
             ):
             result = _read_live_boxed_message()
 
-        self.assertEqual(result, "/help")
+        self.assertEqual(result, "/cli-page")
+
+    def test_live_boxed_message_does_not_promote_terminal_after_user_input(self) -> None:
+        @contextmanager
+        def fake_raw():
+            yield
+
+        class FakeRenderer:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def render(self, _lines):
+                return
+
+            def wait_for_input(self, _lines):
+                return
+
+            def finish(self):
+                return
+
+        fake_err_console = mock.Mock()
+        fake_err_console.print = mock.Mock()
+
+        with mock.patch("daydream.chat._raw_stdin", fake_raw), \
+            mock.patch("daydream.chat._InlineTerminalRenderer", FakeRenderer), \
+            mock.patch("daydream.chat._read_key", side_effect=["h", "i", "\r"]), \
+            mock.patch("daydream.chat.err_console", fake_err_console), \
+            mock.patch("daydream.chat._promote_terminal_output_to_scrollback") as promote:
+            result = _read_live_boxed_message()
+
+        self.assertEqual(result, "hi")
+        promote.assert_not_called()
+
+    def test_clean_final_output_keeps_only_last_response_after_reasoning_blocks(self) -> None:
+        text = (
+            "This implies I should output the reasoning *and* the answer, but keep the reasoning very short.\n\n"
+            "*Revised Plan:*\n"
+            "1. Identify I am an AI trained by Google.\n"
+            "2. State that clearly.\n\n"
+            "*Thinking Block:*\n"
+            "I am an AI assistant trained by Google.\n"
+            "My purpose is to assist with tasks and answer questions.\n"
+            "I do not have personal identity or feelings.\n\n"
+            "*Answer:*\n"
+            "I am a large language model, trained by Google.\n\n"
+            "*Constraint Check:*\n"
+            "Thinking block lines: 3.\n\n"
+            "I am an AI assistant trained by Google.\n"
+            "I process text to generate responses.\n"
+            "I do not have a physical form.\n\n"
+            "I am a large language model, trained by Google."
+        )
+        self.assertEqual(
+            _clean_final_output_from_reasoning_leak(text),
+            "I am a large language model, trained by Google.",
+        )
+
+    def test_clean_final_output_keeps_only_last_response_for_meta_greeting_trace(self) -> None:
+        text = (
+            "User says hello.\n"
+            "Intent is greeting/connection.\n"
+            "Response should be friendly + offer help.\n"
+            "Keep it short.\n\n"
+            "*Draft:*\n"
+            "Hello! How can I assist you today?\n"
+            "That's a simple greeting, so I'll just reply warmly.\n"
+            "Ready for your next question.\n\n"
+            "*Final Answer:* Hello! How can I help you today?\n\n"
+            "Actually, looking at the instruction again: \"Keep your thinking block under 3-5 lines.\" This is a directive for the output if the thinking block is rendered. I will ensure the text I generate as \"thought\" is short.\n\n"
+            "Let's just respond naturally but concisely.\n\n"
+            "*Thinking:*\n"
+            "1. User initiates with \"hello\".\n"
+            "2. Standard protocol is reciprocal greeting + offer assistance.\n"
+            "3. No complex reasoning required for a simple greeting.\n"
+            "4. Drafting a brief, friendly reply.\n\n"
+            "*Response:* Hello! How can I help you today?\n\n"
+            "*Revised Plan:* Just answer.\n"
+            "User greeted with \"hello\".\n"
+            "Appropriate response is a greeting plus offer of help.\n"
+            "Keep response brief to adhere to conciseness.\n\n"
+            "*Response:* Hello! How can I help you today?\n\n"
+            "Hello! How can I help you today?"
+        )
+        self.assertEqual(
+            _clean_final_output_from_reasoning_leak(text),
+            "Hello! How can I help you today?",
+        )
+
+    def test_clean_final_output_keeps_only_last_response_for_meta_qwen_trace(self) -> None:
+        text = (
+            "Okay, I will count the lines in the thinking block.\n\n"
+            "That's 4 lines. Perfect.\n\n"
+            "Now the actual response.\n"
+            "\"Hello! I'm Qwen, a large language model. How can I assist you today?\"\n\n"
+            "1. Identify user intent: Self-introduction.\n"
+            "2. Recall identity: Qwen, large language model.\n"
+            "3. Keep response brief and friendly.\n"
+            "4. Ignore typo in user query for clarity.\n\n"
+            "Hello! I'm Qwen, a large language model trained by Tongyi Lab. How can I assist you today?"
+        )
+        self.assertEqual(
+            _clean_final_output_from_reasoning_leak(text),
+            "Hello! I'm Qwen, a large language model trained by Tongyi Lab. How can I assist you today?",
+        )
+
+    def test_clean_final_output_keeps_only_last_response_after_instruction_check_trace(self) -> None:
+        text = (
+            "Usually, this means I should output the reasoning.\n"
+            "Let's check the system instruction again: \"Keep your thinking block under 3-5 lines.\"\n\n"
+            "Hello! I'm Qwen, a large language model. How can I assist you today?\n\n"
+            "1. Identify user intent: Self-introduction.\n"
+            "2. Recall identity: Qwen, large language model.\n"
+            "3. Keep response brief and friendly.\n"
+            "4. Ignore typo in user query for clarity.\n\n"
+            "Hello! I'm Qwen, a large language model trained by Tongyi Lab. How can I assist you today?"
+        )
+        self.assertEqual(
+            _clean_final_output_from_reasoning_leak(text),
+            "Hello! I'm Qwen, a large language model trained by Tongyi Lab. How can I assist you today?",
+        )
+
+    def test_recover_final_output_falls_back_to_last_non_reasoning_paragraph(self) -> None:
+        reasoning = (
+            "Usually, this means I should output the reasoning.\n\n"
+            "Let's check the system instruction again: \"Keep your thinking block under 3-5 lines.\"\n\n"
+            "Hello! I'm Qwen, a large language model trained by Tongyi Lab. How can I assist you today?"
+        )
+        self.assertEqual(
+            _recover_final_output("", reasoning),
+            "Hello! I'm Qwen, a large language model trained by Tongyi Lab. How can I assist you today?",
+        )
+
+    def test_extract_answer_labeled_text_supports_chinese_answer_labels(self) -> None:
+        text = "分析：用户发送“？”意在确认响应状态。\n回答：我在，有什么可以帮您的吗？"
+        self.assertEqual(
+            _extract_answer_labeled_text(text),
+            "我在，有什么可以帮您的吗？",
+        )
+
+    def test_clean_final_output_keeps_only_chinese_answer_after_analysis_block(self) -> None:
+        text = "分析：用户发送“？”意在确认响应状态。\n回答：我在，有什么可以帮您的吗？"
+        self.assertEqual(
+            _clean_final_output_from_reasoning_leak(text),
+            "我在，有什么可以帮您的吗？",
+        )
 
     def test_effort_menu_handles_fragmented_down_arrow_without_leaking_b(self) -> None:
         @contextmanager
@@ -285,6 +543,60 @@ class ChatTests(unittest.TestCase):
             result = _select_effort("default", supported=True)
 
         self.assertEqual(result, "default")
+
+    def test_cli_page_menu_selects_tight_mode(self) -> None:
+        @contextmanager
+        def fake_raw():
+            yield
+
+        class FakeRenderer:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def render(self, _lines):
+                return
+
+            def wait_for_input(self, _lines):
+                return
+
+            def finish(self):
+                return
+
+        with mock.patch("daydream.chat._raw_stdin", fake_raw), \
+            mock.patch("daydream.chat._InlineTerminalRenderer", FakeRenderer), \
+            mock.patch("daydream.chat.sys.stdin.isatty", return_value=True), \
+            mock.patch("daydream.chat.err_console", mock.Mock(is_terminal=True)), \
+            mock.patch("daydream.chat._read_key", side_effect=["\x1b", "[", "B", "\r"]):
+            result = _select_cli_page_mode("loose")
+
+        self.assertEqual(result, "tight")
+
+    def test_cli_page_menu_escape_cancels_immediately(self) -> None:
+        @contextmanager
+        def fake_raw():
+            yield
+
+        class FakeRenderer:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def render(self, _lines):
+                return
+
+            def wait_for_input(self, _lines):
+                return
+
+            def finish(self):
+                return
+
+        with mock.patch("daydream.chat._raw_stdin", fake_raw), \
+            mock.patch("daydream.chat._InlineTerminalRenderer", FakeRenderer), \
+            mock.patch("daydream.chat.sys.stdin.isatty", return_value=True), \
+            mock.patch("daydream.chat.err_console", mock.Mock(is_terminal=True)), \
+            mock.patch("daydream.chat._read_key", return_value="\x1b"):
+            result = _select_cli_page_mode("loose")
+
+        self.assertEqual(result, "loose")
 
     def test_dreaming_menu_escape_cancels_immediately(self) -> None:
         @contextmanager
@@ -344,12 +656,15 @@ class ChatTests(unittest.TestCase):
         self.assertIsNone(_normalize_effort("medium"))
         self.assertTrue(_model_supports_effort("mlx-community/Qwen3-8B-4bit"))
         self.assertFalse(_model_supports_effort("mlx-community/SmolLM2-360M-Instruct-4bit"))
-        self.assertIsNotNone(_effort_system_prompt("short", "mlx-community/Qwen3-8B-4bit"))
+        self.assertIn(
+            "Reason briefly and efficiently",
+            _effort_system_prompt("short", "mlx-community/Qwen3-8B-4bit"),
+        )
         self.assertIsNone(_effort_system_prompt("short", "mlx-community/SmolLM2-360M-Instruct-4bit"))
         tokenizer = mock.Mock(has_thinking=True)
         self.assertEqual(_effort_chat_template_kwargs("instant", tokenizer), {"enable_thinking": False})
-        self.assertEqual(_effort_chat_template_kwargs("short", tokenizer), {"enable_thinking": True})
-        self.assertEqual(_effort_chat_template_kwargs("long", tokenizer), {"enable_thinking": True})
+        self.assertEqual(_effort_chat_template_kwargs("short", tokenizer), {"enable_thinking": True, "thinking_budget": 200})
+        self.assertEqual(_effort_chat_template_kwargs("long", tokenizer), {"enable_thinking": True, "thinking_budget": 10000})
         self.assertEqual(_effort_chat_template_kwargs("default", tokenizer), {})
 
     def test_build_request_messages_includes_effort_system_prompt(self) -> None:
@@ -362,7 +677,7 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(len(request), 2)
         self.assertEqual(request[0]["role"], "system")
         self.assertIn("base", request[0]["content"])
-        self.assertIn("Reasoning effort: long", request[0]["content"])
+        self.assertIn("Reason thoroughly before answering", request[0]["content"])
         self.assertEqual(request[1]["content"], "hello")
 
     def test_build_request_messages_includes_session_memory_prompt(self) -> None:
@@ -420,7 +735,7 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(request[0]["role"], "system")
         self.assertIn("base system", request[0]["content"])
         self.assertIn("User prefers terse answers.", request[0]["content"])
-        self.assertIn("Reasoning effort: instant", request[0]["content"])
+        self.assertIn("Answer directly and concisely", request[0]["content"])
 
     def test_confirm_memory_import_defaults_yes(self) -> None:
         with mock.patch("daydream.chat.err_console.input", return_value=""):
@@ -564,6 +879,35 @@ class ChatTests(unittest.TestCase):
         self.assertIn("\x1b[22;1H", output)
         self.assertIn("\x1b[28;1H", output)
 
+    def test_inline_terminal_renderer_reflows_on_first_render_and_shrink(self) -> None:
+        stream = io.StringIO()
+
+        class Renderer(_InlineTerminalRenderer):
+            def __init__(self, stream):
+                super().__init__(stream)
+                self.rows = 24
+                self.cols = 96
+
+            def _terminal_size(self):
+                return os.terminal_size((self.cols, self.rows))
+
+        renderer = Renderer(stream)
+        renderer.render(["a", "b", "c"])
+        first_snapshot = stream.getvalue()
+        renderer.render(["a", "b", "c", "d", "e", "f"])
+        growth_snapshot = stream.getvalue()
+        renderer.render(["a", "b", "c"])
+        renderer.finish()
+
+        growth_output = growth_snapshot[len(first_snapshot):]
+        shrink_output = stream.getvalue()[len(growth_snapshot):]
+
+        self.assertIn("\x1b[24;1H\n\n\n", first_snapshot)
+        self.assertIn("\x1b[22;1H\x1b[J", growth_output)
+        self.assertIn("\x1b[24;1H\n\n\n", growth_output)
+        self.assertIn("\x1b[19;1H\x1b[J", shrink_output)
+        self.assertIn("\x1b[1;1H\x1b[3L", shrink_output)
+
     def test_run_oneshot_resolves_before_preparing_load(self) -> None:
         output = io.StringIO()
 
@@ -597,8 +941,8 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(len(captured_calls), 1)
         request_messages, kwargs = captured_calls[0]
         self.assertEqual(request_messages[0]["role"], "system")
-        self.assertIn("Reasoning effort: long", request_messages[0]["content"])
-        self.assertEqual(kwargs["chat_template_kwargs"], {"enable_thinking": True})
+        self.assertIn("Reason thoroughly before answering", request_messages[0]["content"])
+        self.assertEqual(kwargs["chat_template_kwargs"], {"enable_thinking": True, "thinking_budget": 10000})
 
     def test_run_chat_applies_instant_effort_after_new_session(self) -> None:
         captured_calls = []
@@ -617,8 +961,71 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(len(captured_calls), 1)
         request_messages, kwargs = captured_calls[0]
         self.assertEqual(request_messages[0]["role"], "system")
-        self.assertIn("Reasoning effort: instant", request_messages[0]["content"])
+        self.assertIn("Answer directly and concisely", request_messages[0]["content"])
         self.assertEqual(kwargs["chat_template_kwargs"], {"enable_thinking": False})
+
+    def test_run_chat_cli_page_updates_default_mode(self) -> None:
+        with mock.patch("daydream.chat._read_boxed_message", side_effect=["/cli-page tight", "/quit"]), \
+            mock.patch("daydream.chat.ensure_runtime_model", return_value="mlx-community/Qwen3-8B-4bit"), \
+            mock.patch("daydream.chat.engine.load_model", return_value=("model", mock.Mock(has_thinking=True))), \
+            mock.patch("daydream.chat.get_default_cli_page_mode", return_value="loose"), \
+            mock.patch("daydream.chat.set_default_cli_page_mode", return_value="tight") as set_mode, \
+            mock.patch("daydream.chat.err_console") as fake_console:
+            fake_console.is_terminal = True
+            run_chat("foo")
+
+        set_mode.assert_called_once_with("tight")
+        printed = " ".join(
+            str(call.args[0])
+            for call in fake_console.print.call_args_list
+            if call.args
+        )
+        self.assertIn("CLI page mode set to tight", printed)
+
+    def test_run_chat_repacks_page_after_response_in_tight_mode(self) -> None:
+        with mock.patch("daydream.chat._read_boxed_message", side_effect=["hello", "/quit"]), \
+            mock.patch("daydream.chat.ensure_runtime_model", return_value="mlx-community/Qwen3-8B-4bit"), \
+            mock.patch("daydream.chat.engine.load_model", return_value=("model", mock.Mock(has_thinking=True))), \
+            mock.patch("daydream.chat.get_default_cli_page_mode", return_value="tight"), \
+            mock.patch("daydream.chat._stream_response", return_value=("Hi there.", None, "reasoning", 2.0)), \
+            mock.patch("daydream.chat._repack_tight_page") as repack:
+            run_chat("foo", display_name="qwen3.5-9b")
+
+        repack.assert_called_once()
+        args = repack.call_args.args
+        self.assertEqual(args[0], "qwen3.5-9b")
+        kinds = [block.kind for block in args[1]]
+        self.assertEqual(kinds, ["user", "reasoning_summary", "assistant", "reasoning_hint"])
+
+    def test_run_chat_repacks_resumed_history_in_tight_mode(self) -> None:
+        from daydream.storage import ChatMessage, ChatSession
+
+        session = ChatSession(
+            session_id="abc123",
+            model="qwen3.5-9b",
+            title="Saved chat",
+            created_at=1.0,
+            updated_at=2.0,
+            messages=[
+                ChatMessage(role="user", content="Earlier question", timestamp=1.0),
+                ChatMessage(role="assistant", content="Earlier answer", timestamp=2.0, reasoning="hidden"),
+            ],
+            memories=[],
+        )
+
+        with mock.patch("daydream.chat._read_boxed_message", side_effect=["/resume", "/quit"]), \
+            mock.patch("daydream.chat.ensure_runtime_model", return_value="mlx-community/Qwen3.5-9B-4bit"), \
+            mock.patch("daydream.chat.engine.load_model", return_value=("model", mock.Mock(has_thinking=True))), \
+            mock.patch("daydream.chat.get_default_cli_page_mode", return_value="tight"), \
+            mock.patch("daydream.chat.list_sessions", return_value=[session]), \
+            mock.patch("daydream.chat.load_memories", return_value=[]), \
+            mock.patch("daydream.chat._select_session_action", return_value=("resume", session)), \
+            mock.patch("daydream.chat._repack_tight_page") as repack:
+            run_chat("foo", display_name="qwen3.5-9b")
+
+        repack.assert_called_once()
+        blocks = repack.call_args.args[1]
+        self.assertEqual([block.kind for block in blocks], ["user", "reasoning_summary", "assistant"])
 
     def test_run_chat_keeps_output_after_reasoning_in_memoryless_mode(self) -> None:
         captured_statuses: list[object] = []
@@ -649,7 +1056,7 @@ class ChatTests(unittest.TestCase):
                 self.output += text
 
         @contextmanager
-        def fake_daydreaming_status(_console, _label):
+        def fake_daydreaming_status(_console, _label, **_kwargs):
             status = FakeStatus()
             captured_statuses.append(status)
             yield status
@@ -689,15 +1096,12 @@ class ChatTests(unittest.TestCase):
 
         self.assertEqual(len(captured_statuses), 1)
         self.assertEqual(captured_statuses[0].output, "")
-        raw = fake_err_console.file.getvalue()
-        self.assertTrue(raw.startswith(f"\x1b[24;1H{chr(10) * _status_overlay_reserve_lines('foo')}"))
-        self.assertGreaterEqual(raw.count("\x1b[24;1H\n"), 1)
-        self.assertIn("Hello from Daydream.", raw)
         printed = " ".join(
             str(call.args[0])
             for call in fake_err_console.print.call_args_list
             if call.args
         )
+        self.assertIn("Hello from Daydream.", printed)
         self.assertIn("Use /t to expand reasoning", printed)
 
     def test_run_chat_keeps_output_after_reasoning_in_persistent_session(self) -> None:
@@ -730,7 +1134,7 @@ class ChatTests(unittest.TestCase):
                 self.output += text
 
         @contextmanager
-        def fake_daydreaming_status(_console, _label):
+        def fake_daydreaming_status(_console, _label, **_kwargs):
             status = FakeStatus()
             captured_statuses.append(status)
             yield status
@@ -774,15 +1178,12 @@ class ChatTests(unittest.TestCase):
 
         self.assertEqual(len(captured_statuses), 1)
         self.assertEqual(captured_statuses[0].output, "")
-        raw = fake_err_console.file.getvalue()
-        self.assertTrue(raw.startswith(f"\x1b[24;1H{chr(10) * _status_overlay_reserve_lines('foo')}"))
-        self.assertGreaterEqual(raw.count("\x1b[24;1H\n"), 1)
-        self.assertIn("Hello from persistent memory.", raw)
         printed = " ".join(
             str(call.args[0])
             for call in fake_err_console.print.call_args_list
             if call.args
         )
+        self.assertIn("Hello from persistent memory.", printed)
         self.assertIn("Use /t to expand reasoning", printed)
         self.assertTrue(saved_sessions)
         self.assertEqual(saved_sessions[-1].messages[-1].content, "Hello from persistent memory.")
@@ -897,7 +1298,7 @@ class ChatTests(unittest.TestCase):
                 self.output += text
 
         @contextmanager
-        def fake_daydreaming_status(_console, _label):
+        def fake_daydreaming_status(_console, _label, **_kwargs):
             status = FakeStatus()
             captured_statuses.append(status)
             yield status
@@ -977,7 +1378,7 @@ class ChatTests(unittest.TestCase):
                 self.output = ""
 
         @contextmanager
-        def fake_daydreaming_status(_console, _label):
+        def fake_daydreaming_status(_console, _label, **_kwargs):
             yield FakeStatus()
 
         fake_err_console = mock.Mock(is_terminal=True)
@@ -1003,13 +1404,19 @@ class ChatTests(unittest.TestCase):
             mock.patch("daydream.chat.daydreaming_status", fake_daydreaming_status):
             run_chat("foo")
 
-        raw_terminal = fake_err_console.file.getvalue()
+        printed = " ".join(
+            str(call.args[0])
+            for call in fake_err_console.print.call_args_list
+            if call.args
+        )
         self.assertEqual(
-            raw_terminal.count("好的，随时待命！接下来你想聊些什么，或者有什么具体的问题需要我协助吗？"),
+            printed.count("好的，随时待命！接下来你想聊些什么，或者有什么具体的问题需要我协助吗？"),
             1,
         )
 
     def test_run_chat_streams_visible_text_after_reasoning_to_console(self) -> None:
+        captured_statuses: list[object] = []
+
         class FakeStatus:
             def __init__(self):
                 self.output = ""
@@ -1042,8 +1449,10 @@ class ChatTests(unittest.TestCase):
                 return
 
         @contextmanager
-        def fake_daydreaming_status(_console, _label):
-            yield FakeStatus()
+        def fake_daydreaming_status(_console, _label, **_kwargs):
+            status = FakeStatus()
+            captured_statuses.append(status)
+            yield status
 
         fake_err_console = mock.Mock(is_terminal=True)
         fake_err_console.print = mock.Mock()
@@ -1074,8 +1483,14 @@ class ChatTests(unittest.TestCase):
             mock.patch("daydream.chat.daydreaming_status", fake_daydreaming_status):
             run_chat("foo")
 
-        raw_terminal = fake_err_console.file.getvalue()
-        self.assertIn("First line. Second line.", raw_terminal)
+        self.assertEqual(len(captured_statuses), 1)
+        self.assertEqual(captured_statuses[0].output, "")
+        printed = " ".join(
+            str(call.args[0])
+            for call in fake_err_console.print.call_args_list
+            if call.args
+        )
+        self.assertIn("First line. Second line.", printed)
 
 
 if __name__ == "__main__":
