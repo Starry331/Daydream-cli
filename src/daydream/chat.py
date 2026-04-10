@@ -660,6 +660,39 @@ def _repack_tight_page(model_label: str, blocks: list[_TranscriptBlock]) -> None
         _print_gap("tight")
 
 
+def _repack_loose_page(model_label: str, blocks: list[_TranscriptBlock]) -> None:
+    visible_blocks = blocks[-30:]
+
+    _clear_visible_terminal()
+    err_console.print(f"[bold cyan]{model_label}[/]")
+    err_console.print("[dim]Use / for commands.[/dim]")
+    _print_gap("loose")
+
+    for index, block in enumerate(visible_blocks):
+        if block.kind == "user":
+            err_console.print("[bold green]You[/]")
+            err_console.print(block.content, markup=False, highlight=False)
+        elif block.kind == "assistant":
+            err_console.print(f"[bold cyan]{model_label}[/]")
+            err_console.print(block.content, markup=False, highlight=False)
+        elif block.kind == "reasoning_summary":
+            elapsed = block.elapsed if block.elapsed is not None else 0.0
+            if elapsed > 0.0:
+                err_console.print(render_reasoning_line(elapsed, active=False))
+            else:
+                err_console.print("[dim]▸ Daydreamed[/dim]")
+        elif block.kind == "reasoning_hint":
+            err_console.print(f"[dim]{block.content}[/dim]")
+        else:
+            continue
+
+        if index < len(visible_blocks) - 1:
+            _print_gap("loose")
+
+    if visible_blocks:
+        _print_gap("loose")
+
+
 def _current_command_selection(
     buffer: str,
     current_selection: str | None,
@@ -2266,6 +2299,8 @@ def run_chat(
                 save_session(session)
             if _is_tight_cli_page_mode(cli_page_mode):
                 _repack_tight_page(short, transcript_blocks)
+            else:
+                _repack_loose_page(short, transcript_blocks)
             err_console.print("[dim]Chat history cleared.[/dim]")
             continue
         if stripped in ("/help", "/h", "/?"):
@@ -2305,13 +2340,15 @@ def run_chat(
             err_console.print(
                 f"[dim]CLI page mode set to {cli_page_mode}. New chats will default to this mode.[/dim]"
             )
+            transcript_blocks = _transcript_blocks_from_messages([
+                ChatMessage(role=message["role"], content=message["content"], timestamp=0.0)
+                for message in messages
+                if message["role"] in {"user", "assistant"}
+            ])
             if _is_tight_cli_page_mode(cli_page_mode):
-                transcript_blocks = _transcript_blocks_from_messages([
-                    ChatMessage(role=message["role"], content=message["content"], timestamp=0.0)
-                    for message in messages
-                    if message["role"] in {"user", "assistant"}
-                ])
                 _repack_tight_page(short, transcript_blocks)
+            else:
+                _repack_loose_page(short, transcript_blocks)
             continue
         if stripped in ("/t", "/thoughts"):
             err_console.print(render_expanded_reasoning(last_reasoning))
@@ -2374,7 +2411,7 @@ def run_chat(
                 if _is_tight_cli_page_mode(cli_page_mode):
                     _repack_tight_page(short, transcript_blocks)
                 else:
-                    _print_resumed_history(session.messages, short, cli_page_mode=cli_page_mode)
+                    _repack_loose_page(short, transcript_blocks)
                 break
             continue
         if stripped == "/dreaming":
@@ -2446,15 +2483,17 @@ def run_chat(
         last_reasoning = reasoning_text
 
         messages.append({"role": "assistant", "content": full_text})
+        _append_transcript_turn(
+            transcript_blocks,
+            user_input=user_input,
+            assistant_text=full_text,
+            reasoning_elapsed=reasoning_elapsed,
+            had_reasoning=bool(reasoning_text.strip()),
+        )
         if _is_tight_cli_page_mode(cli_page_mode):
-            _append_transcript_turn(
-                transcript_blocks,
-                user_input=user_input,
-                assistant_text=full_text,
-                reasoning_elapsed=reasoning_elapsed,
-                had_reasoning=bool(reasoning_text.strip()),
-            )
             _repack_tight_page(short, transcript_blocks)
+        else:
+            _repack_loose_page(short, transcript_blocks)
 
         if session is not None:
             session.messages.append(ChatMessage(

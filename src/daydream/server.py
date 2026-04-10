@@ -19,7 +19,10 @@ from daydream.config import (
     SERVER_STATE_FILE,
     ensure_home,
     get_default_host,
+    get_default_max_tokens,
     get_default_port,
+    get_default_temp,
+    get_default_top_p,
 )
 from daydream.models import ensure_runtime_model, is_fixture_model
 from daydream.profiles import get_profile
@@ -55,7 +58,7 @@ def _build_server_args(
     port=11434,
     temp: float = 0.0,
     top_p: float = 1.0,
-    max_tokens: int = 512,
+    max_tokens: int = 4096,
     chat_template_args: dict | None = None,
 ) -> argparse.Namespace:
     """Build the argparse.Namespace that mlx_lm.server.ModelProvider expects."""
@@ -112,7 +115,7 @@ def _run_fixture_server(host: str, port: int, repo_id: str) -> None:
 
         def do_GET(self) -> None:
             if self.path == "/health":
-                self._send_json({"status": "ok"})
+                self._send_json({"status": "ok", "model": repo_id})
                 return
 
             if self.path != "/v1/models":
@@ -163,6 +166,7 @@ def _run_fixture_server(host: str, port: int, repo_id: str) -> None:
             )
 
     server = ThreadingHTTPServer((host, port), Handler)
+    server.allow_reuse_address = True
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -243,7 +247,7 @@ def _clear_server_state() -> None:
         pass
 
 
-def _spawn_background_server(*, model: str | None, host: str, port: int) -> None:
+def _spawn_background_server(*, model: str | None, host: str, port: int, max_tokens: int | None = None) -> None:
     ensure_home()
     if _is_server_healthy(host, port, timeout=0.5):
         console.print(f"[yellow]Server already running on http://{host}:{port}[/]")
@@ -253,6 +257,8 @@ def _spawn_background_server(*, model: str | None, host: str, port: int) -> None
     command = [sys.executable, "-m", "daydream", "serve", "--foreground", "--host", host, "--port", str(port)]
     if model:
         command.extend(["--model", model])
+    if max_tokens is not None:
+        command.extend(["--max-tokens", str(max_tokens)])
 
     SERVER_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with SERVER_LOG_FILE.open("ab") as log_handle:
@@ -277,7 +283,7 @@ def _spawn_background_server(*, model: str | None, host: str, port: int) -> None
         profile=profile_name,
     )
 
-    deadline = time.time() + 3.0
+    deadline = time.time() + 15.0
     while time.time() < deadline:
         if _is_server_healthy(host, port, timeout=0.2):
             console.print(f"[green]✓[/] Server started in background (pid {process.pid})")
@@ -297,14 +303,34 @@ def _spawn_background_server(*, model: str | None, host: str, port: int) -> None
     console.print("[dim]Status:[/]   warming up")
 
 
-def start_server(*, model=None, host="127.0.0.1", port=11434, detach: bool = False) -> None:
+def start_server(
+    *,
+    model=None,
+    host="127.0.0.1",
+    port=11434,
+    detach: bool = False,
+    max_tokens: int | None = None,
+) -> None:
     """Start the OpenAI-compatible API server."""
+    import logging
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     profile = get_profile(model) if model else None
     source_model = profile.from_model if profile else model
     repo_id = ensure_runtime_model(source_model, auto_pull=True, register_alias=True) if source_model else None
 
     if detach:
-        _spawn_background_server(model=profile.name if profile else repo_id, host=host, port=port)
+        _spawn_background_server(
+            model=profile.name if profile else repo_id,
+            host=host,
+            port=port,
+            max_tokens=max_tokens,
+        )
         return
 
     short = profile.name if profile else reverse_lookup(repo_id) or model if repo_id else None
@@ -340,19 +366,37 @@ def start_server(*, model=None, host="127.0.0.1", port=11434, detach: bool = Fal
         elif profile_parameters.get("effort") in {"short", "long"}:
             chat_template_args = {"enable_thinking": True}
 
+        effective_max_tokens = max_tokens or int(profile_parameters.get("max_tokens", get_default_max_tokens()))
         args = _build_server_args(
             model=repo_id,
             host=host,
             port=port,
-            temp=float(profile_parameters.get("temperature", 0.0)),
-            top_p=float(profile_parameters.get("top_p", 1.0)),
-            max_tokens=int(profile_parameters.get("max_tokens", 512)),
+            temp=float(profile_parameters.get("temperature", get_default_temp())),
+            top_p=float(profile_parameters.get("top_p", get_default_top_p())),
+            max_tokens=effective_max_tokens,
             chat_template_args=chat_template_args,
         )
-        provider = ModelProvider(args)
-        mlx_server_run(host, port, provider)
-    except KeyboardInterrupt:
-        console.print("\n[dim]Server stopped.[/dim]")
+        max_retries = 5
+        retry_delay = 1.0
+        for attempt in range(max_retries):
+            try:
+                provider = ModelProvider(args)
+                mlx_server_run(host, port, provider)
+                break
+            except KeyboardInterrupt:
+                console.print("\n[dim]Server stopped.[/dim]")
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    console.print(
+                        f"[yellow]Server error: {e}. Restarting in {retry_delay:.0f}s "
+                        f"(attempt {attempt + 1}/{max_retries})...[/yellow]"
+                    )
+                    time.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 30.0)
+                else:
+                    console.print(f"[red]Server crashed after {max_retries} attempts: {e}[/red]")
+                    raise
     finally:
         state = _load_server_state()
         if state and state.get("pid") == os.getpid():

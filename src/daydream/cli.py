@@ -204,12 +204,13 @@ def show(model):
 @click.option("--model", type=str, default=None, help="Model to preload")
 @click.option("--host", default=get_default_host(), show_default=True, help="Bind address")
 @click.option("--port", "-p", type=int, default=get_default_port(), show_default=True, help="Port number")
+@click.option("--max-tokens", type=int, default=None, help="Max tokens per response")
 @click.option("--background", is_flag=True, help="Run server in the background")
 @click.option("--foreground", is_flag=True, hidden=True)
 @click.option("--detach", is_flag=True, hidden=True)
 @click.pass_context
 @_handle_errors
-def serve(ctx, model_parts, model, host, port, background, foreground, detach):
+def serve(ctx, model_parts, model, host, port, max_tokens, background, foreground, detach):
     """Start or manage the OpenAI-compatible API server."""
     from daydream.server import start_server
     resolved_model = _coalesce_model_reference(model, model_parts)
@@ -218,6 +219,7 @@ def serve(ctx, model_parts, model, host, port, background, foreground, detach):
         host=host,
         port=port,
         detach=background or detach,
+        max_tokens=max_tokens,
     )
 
 

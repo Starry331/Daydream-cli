@@ -622,6 +622,7 @@ def render_status_footer(
     tokens_per_second: float | None = None,
     phase: str | None = None,
     hint: str | None = None,
+    reasoning_seconds: float | None = None,
 ) -> Text:
     """Status footer pinned at bottom of display area."""
     text = Text(style="dim")
@@ -633,6 +634,9 @@ def render_status_footer(
     if tokens_per_second:
         text.append("  ·  ", style="dim")
         text.append(f"{tokens_per_second:.1f} tok/s", style="dim")
+    if reasoning_seconds is not None and reasoning_seconds > 0:
+        text.append("  ·  ", style="dim")
+        text.append(f"{reasoning_seconds:.1f}s thinking", style="dim")
     if hint:
         text.append("  ·  ", style="dim")
         text.append(hint, style="dim")
@@ -804,10 +808,12 @@ class ConversationStatus:
             reasoning_hint = None
             if self._reasoning_active or self._had_reasoning:
                 reasoning_hint = "Use /t to expand reasoning"
+            live_reasoning = self._reasoning_time() if self._reasoning_active else None
             parts.append(render_status_footer(
                 self.model_label,
                 tokens_per_second=self._tokens_per_second,
                 hint=reasoning_hint,
+                reasoning_seconds=live_reasoning,
             ))
 
             return Group(*parts)
