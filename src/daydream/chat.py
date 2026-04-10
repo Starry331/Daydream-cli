@@ -44,6 +44,7 @@ from daydream.storage import (
     ChatMessage,
     Memory,
     delete_session,
+    rename_session,
     save_session,
     list_sessions,
     save_memories,
@@ -67,6 +68,7 @@ SLASH_COMMANDS = (
     ("/new", "start a persistent chat session"),
     ("/resume", "resume a saved session"),
     ("/forget", "delete a saved session"),
+    ("/rename", "rename a saved session"),
     ("/dreaming", "consolidate memories from conversation"),
     ("/memory", "view extracted memories"),
     ("/reset", "clear conversation history"),
@@ -2309,6 +2311,7 @@ def run_chat(
             err_console.print("[dim]/new      — start a persistent chat session[/dim]")
             err_console.print("[dim]/resume   — resume a saved session[/dim]")
             err_console.print("[dim]/forget   — delete a saved session[/dim]")
+            err_console.print("[dim]/rename   — rename a saved session[/dim]")
             err_console.print("[dim]/dreaming — consolidate memories from conversation[/dim]")
             err_console.print("[dim]/memory   — view extracted memories[/dim]")
             err_console.print("[dim]/effort   — pick instant / short / default / long[/dim]")
@@ -2320,7 +2323,7 @@ def run_chat(
             err_console.print("[dim]/help     — show this help[/dim]")
             continue
         if stripped == "/":
-            err_console.print("[dim]Type /effort, /cli-page, /new, /resume, /dreaming, /memory, /t, /reset, or /help.[/dim]")
+            err_console.print("[dim]Type /effort, /cli-page, /new, /resume, /rename, /dreaming, /memory, /t, /reset, or /help.[/dim]")
             continue
         if stripped.startswith("/effort"):
             parts = stripped.split(maxsplit=1)
@@ -2413,6 +2416,36 @@ def run_chat(
                 else:
                     _repack_loose_page(short, transcript_blocks)
                 break
+            continue
+        if stripped == "/rename":
+            available_sessions = list_sessions()
+            if not available_sessions:
+                err_console.print("[dim]No saved sessions.[/dim]")
+                continue
+            selection = _select_session_action(
+                available_sessions,
+                allow_delete=False,
+                cli_page_mode=cli_page_mode,
+            )
+            if selection is None:
+                continue
+            _, selected_session = selection
+            old_title = selected_session.title or selected_session.session_id[:8]
+            err_console.print(f"[dim]Current title: {old_title}[/dim]")
+            try:
+                new_title = err_console.input("[dim]New title: [/dim]").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if not new_title:
+                err_console.print("[dim]Rename cancelled.[/dim]")
+                continue
+            renamed = rename_session(selected_session.session_id, new_title)
+            if renamed:
+                err_console.print(f"[dim]Renamed: {old_title} → {new_title}[/dim]")
+                if session is not None and session.session_id == selected_session.session_id:
+                    session.title = new_title
+            else:
+                err_console.print("[dim]Session not found.[/dim]")
             continue
         if stripped == "/dreaming":
             if session is None:

@@ -109,6 +109,21 @@ def delete_session(session_id: str) -> bool:
     return False
 
 
+def rename_session(session_id: str, new_title: str) -> bool:
+    """Rename a session. Returns True if it existed and was renamed."""
+    path = CHATS_DIR / f"{session_id}.json"
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    data["title"] = new_title
+    data["updated_at"] = time.time()
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return True
+
+
 # ── Memory I/O ─────────────────────────────────────────────────────────
 
 def save_memories(session_id: str, memories: list[Memory]) -> None:

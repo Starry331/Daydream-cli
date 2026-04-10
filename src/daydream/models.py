@@ -58,6 +58,32 @@ FIXTURE_MODELS = {
 GGUF_HINT = "GGUF models are not supported. Use a quantized MLX model instead."
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    if "429" in msg or "rate limit" in msg or "too many requests" in msg:
+        return True
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status == 429
+
+
+def _print_hf_token_hint(exc: Exception) -> None:
+    import os
+    has_token = bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"))
+    if _is_rate_limit_error(exc):
+        console.print()
+        console.print("[yellow]Rate limited by Hugging Face.[/]")
+        if not has_token:
+            console.print("[dim]Optional: set a Hugging Face token for higher rate limits and faster downloads:[/dim]")
+            console.print()
+            console.print("  [bold]export HF_TOKEN=your_huggingface_token[/bold]")
+            console.print()
+            console.print("[dim]Get a free token at https://huggingface.co/settings/tokens[/dim]")
+    elif not has_token:
+        console.print()
+        console.print("[dim]Tip: set a Hugging Face token for higher rate limits and faster downloads:[/dim]")
+        console.print("  [bold]export HF_TOKEN=your_huggingface_token[/bold]")
+
+
 def _scan_cache():
     """Scan the HF cache, returning None if no cache exists yet."""
     if not MODEL_CACHE_DIR.exists():
@@ -298,6 +324,7 @@ def pull_model(name: str, *, register_alias: bool = False) -> None:
                 path = _install_fixture_model(repo_id)
                 if path is None:
                     console.print(f"[red]Error:[/] {e}")
+                    _print_hf_token_hint(e)
                     raise SystemExit(1)
                 progress.update(task, description="Installed offline fixture")
                 console.print("[yellow]Hub unavailable.[/] Installed local offline fixture for testing.")
