@@ -350,6 +350,31 @@ def build_cli_page_menu_lines(current: str, selected: str) -> list[str]:
     return lines
 
 
+def build_draft_menu_lines(current: str, selected: str) -> list[str]:
+    frame_width, indent = _chat_frame_width()
+    text_width = frame_width
+    pad = " " * indent
+    lines = [_frame_line("Draft Acceleration (Beta)", frame_width, indent)]
+
+    labels = {
+        "on": "on         Enable built-in Qwen3.5 draft acceleration",
+        "off": "off        Disable draft acceleration",
+    }
+    for option in ("on", "off"):
+        marker = "› " if option == selected else "  "
+        suffix = "  current" if option == current else ""
+        content = _fit_display_width(f"{marker}{labels[option]}{suffix}", text_width)
+        if option == selected:
+            content = f"{_BOLD}{content}{_RESET}"
+        elif option == current:
+            content = f"{_DIM}{content}{_RESET}"
+        lines.append(f"{pad}{content}")
+
+    lines.append(f"{pad}{_DIM}{_fit_display_width('Use ↑/↓ or j/k · Enter to apply · Esc to cancel', text_width)}{_RESET}")
+    lines.append(_frame_line("", frame_width, indent, bottom=True))
+    return lines
+
+
 def _z_length_value(frame: int) -> float:
     """Animated cluster length in [0, 3] with smooth Z -> ZZ -> ZZZ -> blank transitions."""
     stage_values = (1.0, 2.0, 3.0, 0.0, 1.0)
@@ -623,6 +648,7 @@ def render_status_footer(
     phase: str | None = None,
     hint: str | None = None,
     reasoning_seconds: float | None = None,
+    draft_active: bool = False,
 ) -> Text:
     """Status footer pinned at bottom of display area."""
     text = Text(style="dim")
@@ -637,6 +663,9 @@ def render_status_footer(
     if reasoning_seconds is not None and reasoning_seconds > 0:
         text.append("  ·  ", style="dim")
         text.append(f"{reasoning_seconds:.1f}s thinking", style="dim")
+    if draft_active:
+        text.append("  ·  ", style="dim")
+        text.append("draft", style="bold green")
     if hint:
         text.append("  ·  ", style="dim")
         text.append(hint, style="dim")
@@ -719,10 +748,11 @@ class TerminalTitleAnimator:
 #
 
 class ConversationStatus:
-    def __init__(self, console: Console, model_label: str, *, cli_page_mode: str = "loose"):
+    def __init__(self, console: Console, model_label: str, *, cli_page_mode: str = "loose", draft_active: bool = False):
         self.console = console
         self.model_label = model_label
         self.cli_page_mode = cli_page_mode
+        self.draft_active = draft_active
         self._frame = 0
         self._phase: str | None = "thinking"
         self._tokens_per_second: float | None = None
@@ -814,6 +844,7 @@ class ConversationStatus:
                 tokens_per_second=self._tokens_per_second,
                 hint=reasoning_hint,
                 reasoning_seconds=live_reasoning,
+                draft_active=self.draft_active,
             ))
 
             return Group(*parts)
@@ -1168,8 +1199,8 @@ class InlineFlowRenderer(BottomTerminalRenderer):
 
 
 @contextmanager
-def daydreaming_status(console: Console, model_label: str, *, cli_page_mode: str = "loose"):
-    status = ConversationStatus(console, model_label, cli_page_mode=cli_page_mode)
+def daydreaming_status(console: Console, model_label: str, *, cli_page_mode: str = "loose", draft_active: bool = False):
+    status = ConversationStatus(console, model_label, cli_page_mode=cli_page_mode, draft_active=draft_active)
     status.start()
     try:
         yield status

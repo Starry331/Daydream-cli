@@ -19,13 +19,19 @@ from rich.text import Text
 
 from daydream import engine
 from daydream.config import get_default_cli_page_mode, set_default_cli_page_mode
-from daydream.models import ensure_runtime_model
+from daydream.models import ensure_runtime_model, is_model_available_locally, pull_model
 from daydream.registry import reverse_lookup
+from daydream.speculative import (
+    default_draft_for_model,
+    default_num_draft_tokens,
+    draft_model_for_family,
+)
 from daydream.utils import (
     BottomTerminalRenderer,
     CLI_PAGE_MODES,
     InlineFlowRenderer,
     build_cli_page_menu_lines,
+    build_draft_menu_lines,
     build_dreaming_menu_lines,
     build_effort_menu_lines,
     build_input_box_lines,
@@ -61,8 +67,11 @@ OPEN_THINK_TAG = "<think>"
 CLOSE_THINK_TAG = "</think>"
 EFFORT_LEVELS = ("instant", "short", "default", "long")
 CLI_PAGE_LEVELS = CLI_PAGE_MODES
+_DRAFT_COMMAND_LEVELS = ("on", "off")
+DRAFT_SLASH_COMMAND = "/draft(beta)"
 SLASH_COMMANDS = (
     ("/effort", "adjust reasoning depth"),
+    (DRAFT_SLASH_COMMAND, "toggle draft acceleration for supported models"),
     ("/cli-page", "choose loose or tight page spacing"),
     ("/help", "show available commands"),
     ("/new", "start a persistent chat session"),
@@ -317,6 +326,46 @@ def _effort_system_prompt(effort: str, model_name: str) -> str | None:
         ),
     }
     return prompts.get(effort)
+
+
+def _normalize_draft_command(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in _DRAFT_COMMAND_LEVELS:
+        return normalized
+    return None
+
+
+def _resolve_speculative_settings(
+    *,
+    model_name: str,
+    resolved_model: str,
+    draft_mode: str | None,
+    just_downloaded_main: bool,
+    allow_prompt: bool,
+) -> tuple[str | None, int | None]:
+    if draft_mode == "off":
+        return None, None
+
+    draft_model = draft_model_for_family(resolved_model)
+    if draft_model is None:
+        if draft_mode == "force":
+            raise ValueError("Manual draft mode is only supported for Qwen3.5 MLX models.")
+        return None, None
+
+    num_draft_tokens = default_num_draft_tokens(resolved_model)
+    if num_draft_tokens is None:
+        return None, None
+
+    if is_model_available_locally(draft_model):
+        return draft_model, num_draft_tokens
+
+    if draft_mode == "force":
+        pull_model(draft_model, register_alias=True)
+        return draft_model, num_draft_tokens
+
+    return None, None
 
 
 def _build_request_messages(
@@ -596,9 +645,16 @@ def _clear_visible_terminal() -> None:
     stream.flush()
 
 
-def _transcript_blocks_from_messages(messages: list[ChatMessage]) -> list[_TranscriptBlock]:
+def _transcript_blocks_from_messages(
+    messages: list[ChatMessage],
+    *,
+    limit_visible: int | None = None,
+) -> list[_TranscriptBlock]:
     blocks: list[_TranscriptBlock] = []
-    for message in messages:
+    visible_messages = [message for message in messages if message.role in {"user", "assistant"}]
+    if limit_visible is not None:
+        visible_messages = visible_messages[-limit_visible:]
+    for message in visible_messages:
         if message.role == "user":
             blocks.append(_TranscriptBlock("user", message.content))
             continue
@@ -1047,6 +1103,64 @@ def _select_cli_page_mode(current: str) -> str:
             renderer.finish()
 
     _print_gap(options[index])
+    return options[index]
+
+
+def _select_draft_mode(current: str, *, cli_page_mode: str = "loose") -> str:
+    if not sys.stdin.isatty() or not err_console.is_terminal:
+        return current
+
+    options = list(_DRAFT_COMMAND_LEVELS)
+    index = options.index(current) if current in options else 0
+    pending_escape = ""
+    pending_escape_started_at: float | None = None
+
+    with _raw_stdin():
+        renderer = _make_menu_renderer(cli_page_mode)
+        try:
+            renderer.render(build_draft_menu_lines(current, options[index]))
+            while True:
+                pending_key, pending_escape, pending_escape_started_at = _drain_pending_escape(
+                    pending_escape,
+                    pending_escape_started_at,
+                )
+                if pending_key is None:
+                    lines = build_draft_menu_lines(current, options[index])
+                    if not _wait_for_menu_input(
+                        renderer,
+                        lines,
+                        pending_escape=pending_escape,
+                    ):
+                        continue
+                    raw_key = _read_key()
+                    key, pending_escape, pending_escape_started_at = _merge_escape_key(
+                        raw_key,
+                        pending_escape,
+                        pending_escape_started_at,
+                    )
+                    if key is None:
+                        continue
+                else:
+                    key = pending_key
+                if key in ("\r", "\n"):
+                    break
+                if key in ("\x03",):
+                    raise KeyboardInterrupt
+                if key == "\x1b":
+                    renderer.finish()
+                    _print_gap(cli_page_mode)
+                    return current
+                if _is_up_key(key):
+                    index = (index - 1) % len(options)
+                elif _is_down_key(key):
+                    index = (index + 1) % len(options)
+                elif key in ("A", "B", "C", "D", "[", "O"):
+                    continue
+                renderer.render(build_draft_menu_lines(current, options[index]))
+        finally:
+            renderer.finish()
+
+    _print_gap(cli_page_mode)
     return options[index]
 
 
@@ -1805,6 +1919,10 @@ def _stream_response(
     max_tokens,
     verbose,
     chat_template_kwargs: dict | None = None,
+    draft_model=None,
+    num_draft_tokens: int | None = None,
+    prefill_step_size: int | None = None,
+    prompt_cache=None,
     cli_page_mode: str = "loose",
 ):
     """Stream a response, collecting the full text."""
@@ -1817,11 +1935,15 @@ def _stream_response(
     prev_reasoning = False
     saw_reasoning = False
 
-    with daydreaming_status(err_console, model_label, cli_page_mode=cli_page_mode) as status:
+    with daydreaming_status(err_console, model_label, cli_page_mode=cli_page_mode, draft_active=draft_model is not None) as status:
         for response in engine.generate_stream(
             model, tokenizer, messages,
             max_tokens=max_tokens, temp=temp, top_p=top_p,
             chat_template_kwargs=chat_template_kwargs,
+            draft_model=draft_model,
+            num_draft_tokens=num_draft_tokens,
+            prefill_step_size=prefill_step_size,
+            prompt_cache=prompt_cache,
         ):
             raw_chunk = response.text or ""
             text_chunk, reasoning_chunk, reasoning_closed = parser.feed(raw_chunk)
@@ -1856,8 +1978,12 @@ def _stream_response(
             if response.prompt_tps and not streamed_output:
                 status.update(phase="prefill", tokens_per_second=response.prompt_tps)
 
-            # No reasoning detected → normal live streaming body.
-            if text_chunk and not saw_reasoning:
+            # Stream visible text in real-time:
+            # - Before any reasoning: stream directly
+            # - After reasoning ended (</think> seen): stream directly
+            # - During reasoning: buffer in candidate_text
+            reasoning_ended = saw_reasoning and not parser.in_reasoning
+            if text_chunk and (not saw_reasoning or reasoning_ended):
                 if not streamed_output:
                     status.ensure_minimum_wait(0.28)
                     status.update(waiting=False, phase=None)
@@ -1871,8 +1997,7 @@ def _stream_response(
                 if response.generation_tps:
                     status.update(phase=None, tokens_per_second=response.generation_tps)
             elif text_chunk:
-                # Reasoning was detected at some point in this response. Hold all
-                # visible text until we can determine the final clean body.
+                # Inside reasoning — hold visible text
                 candidate_text += text_chunk
                 last_response = response
                 if response.generation_tps:
@@ -1947,7 +2072,6 @@ def _print_resumed_history(messages: list[ChatMessage], assistant_label: str, *,
     visible_messages = [message for message in messages if message.role in {"user", "assistant"}]
     if not visible_messages:
         return
-    visible_messages = visible_messages[-10:]
 
     _print_gap(cli_page_mode)
     for message in visible_messages:
@@ -2211,6 +2335,7 @@ def run_oneshot(
     system: str | None = None,
     verbose: bool = False,
     initial_effort: str = "default",
+    draft_mode: str | None = None,
     display_name: str | None = None,
 ) -> None:
     """Run a single generation and exit."""
@@ -2225,9 +2350,35 @@ def run_oneshot(
             err_console.print("[red]Error:[/] Empty input.")
             raise SystemExit(1)
 
+    primary_was_local = is_model_available_locally(model_name)
     resolved_name = ensure_runtime_model(model_name, auto_pull=True, register_alias=True)
+    just_downloaded_main = (not primary_was_local) and is_model_available_locally(resolved_name)
     with err_console.status("Preparing model..."):
         model, tokenizer = engine.load_model(resolved_name, ensure_available=False)
+    if type(model).__module__.startswith("mlx_lm."):
+        engine.set_metal_wired_limit()
+    supports_draft_runtime, draft_runtime_reason = engine.speculative_runtime_status(model)
+    if not supports_draft_runtime:
+        draft_repo, num_draft_tokens = None, None
+        if draft_mode == "force":
+            err_console.print(f"[dim]{draft_runtime_reason}[/dim]")
+    else:
+        draft_repo, num_draft_tokens = _resolve_speculative_settings(
+            model_name=model_name,
+            resolved_model=resolved_name,
+            draft_mode=draft_mode,
+            just_downloaded_main=just_downloaded_main,
+            allow_prompt=sys.stdin.isatty(),
+        )
+    with err_console.status("Preparing model..."):
+        draft_model = (
+            engine.load_model(draft_repo, ensure_available=False)[0]
+            if draft_repo is not None
+            else None
+        )
+    if draft_model is not None and type(model).__module__.startswith("mlx_lm."):
+        with err_console.status("Warming up draft model..."):
+            engine.warmup_draft_model(model, draft_model, tokenizer)
 
     base_messages = [{"role": "user", "content": prompt}]
     request_messages = _build_request_messages(
@@ -2243,6 +2394,9 @@ def run_oneshot(
         model_label=display_name or reverse_lookup(resolved_name) or model_name,
         temp=temp, top_p=top_p, max_tokens=max_tokens, verbose=verbose,
         chat_template_kwargs=chat_template_kwargs,
+        draft_model=draft_model,
+        num_draft_tokens=num_draft_tokens,
+        prefill_step_size=2048,
         cli_page_mode=cli_page_mode,
     )
 
@@ -2256,14 +2410,46 @@ def run_chat(
     system: str | None = None,
     verbose: bool = False,
     initial_effort: str = "default",
+    draft_mode: str | None = None,
     display_name: str | None = None,
 ) -> None:
     """Run an interactive chat REPL."""
+    primary_was_local = is_model_available_locally(model_name)
     repo_id = ensure_runtime_model(model_name, auto_pull=True, register_alias=True)
+    just_downloaded_main = (not primary_was_local) and is_model_available_locally(repo_id)
     with err_console.status("Preparing model..."):
         model, tokenizer = engine.load_model(repo_id, ensure_available=False)
+    supports_draft_runtime, draft_runtime_reason = engine.speculative_runtime_status(model)
+    if draft_mode == "force":
+        if not supports_draft_runtime:
+            err_console.print(f"[dim]{draft_runtime_reason}[/dim]")
+            draft_repo, num_draft_tokens = None, None
+        else:
+            draft_repo, num_draft_tokens = _resolve_speculative_settings(
+                model_name=model_name,
+                resolved_model=repo_id,
+                draft_mode=draft_mode,
+                just_downloaded_main=just_downloaded_main,
+                allow_prompt=True,
+            )
+    else:
+        draft_repo, num_draft_tokens = None, None
+    if type(model).__module__.startswith("mlx_lm."):
+        engine.set_metal_wired_limit()
+    with err_console.status("Preparing model..."):
+        draft_model = (
+            engine.load_model(draft_repo, ensure_available=False)[0]
+            if draft_repo is not None
+            else None
+        )
+    if draft_model is not None and type(model).__module__.startswith("mlx_lm."):
+        with err_console.status("Warming up draft model..."):
+            engine.warmup_draft_model(model, draft_model, tokenizer)
     short = display_name or reverse_lookup(repo_id) or model_name
     cli_page_mode = get_default_cli_page_mode()
+    supported_draft_repo = draft_model_for_family(repo_id)
+    active_num_draft_tokens = num_draft_tokens
+    prompt_cache = engine.create_prompt_cache(model, draft_model)
 
     err_console.print(f"[bold cyan]{short}[/]")
     err_console.print("[dim]Use / for commands.[/dim]")
@@ -2295,6 +2481,7 @@ def run_chat(
         if stripped in ("/reset", "/clear", "/r"):
             messages = []
             transcript_blocks = []
+            prompt_cache = engine.create_prompt_cache(model, draft_model)
             if session is not None:
                 session.messages = []
                 session.updated_at = time.time()
@@ -2315,6 +2502,7 @@ def run_chat(
             err_console.print("[dim]/dreaming — consolidate memories from conversation[/dim]")
             err_console.print("[dim]/memory   — view extracted memories[/dim]")
             err_console.print("[dim]/effort   — pick instant / short / default / long[/dim]")
+            err_console.print(f"[dim]{DRAFT_SLASH_COMMAND} — turn draft acceleration on / off[/dim]")
             err_console.print("[dim]/cli-page — choose loose / tight page spacing[/dim]")
             err_console.print("[dim]/reset    — clear conversation history[/dim]")
             err_console.print("[dim]/clear    — alias for /reset[/dim]")
@@ -2323,7 +2511,7 @@ def run_chat(
             err_console.print("[dim]/help     — show this help[/dim]")
             continue
         if stripped == "/":
-            err_console.print("[dim]Type /effort, /cli-page, /new, /resume, /rename, /dreaming, /memory, /t, /reset, or /help.[/dim]")
+            err_console.print(f"[dim]Type /effort, {DRAFT_SLASH_COMMAND}, /cli-page, /new, /resume, /rename, /dreaming, /memory, /t, /reset, or /help.[/dim]")
             continue
         if stripped.startswith("/effort"):
             parts = stripped.split(maxsplit=1)
@@ -2331,8 +2519,51 @@ def run_chat(
             if selected is None:
                 selected = _select_effort(effort, supported=effort_supported, cli_page_mode=cli_page_mode)
             effort = selected
+            prompt_cache = engine.create_prompt_cache(model, draft_model)
             note = "[dim]Model may ignore this setting.[/dim]" if not effort_supported else ""
             err_console.print(f"[dim]Reasoning effort set to {effort}.[/dim] {note}".rstrip())
+            continue
+        command_name = stripped.split(maxsplit=1)[0].lower()
+        if command_name in {"/draft", DRAFT_SLASH_COMMAND}:
+            parts = stripped.split(maxsplit=1)
+            selected = _normalize_draft_command(parts[1]) if len(parts) > 1 else None
+            if selected is None:
+                current = "on" if draft_model is not None else "off"
+                if len(parts) == 1:
+                    selected = _select_draft_mode(current, cli_page_mode=cli_page_mode)
+                else:
+                    err_console.print(
+                        f"[dim]Draft acceleration is {current}. Use {DRAFT_SLASH_COMMAND} on or {DRAFT_SLASH_COMMAND} off.[/dim]"
+                    )
+                    continue
+            if supported_draft_repo is None:
+                err_console.print("[dim]Draft acceleration is only supported for Qwen3.5 MLX models.[/dim]")
+                continue
+            if not supports_draft_runtime:
+                reason = draft_runtime_reason or "Draft acceleration is unavailable for this runtime."
+                err_console.print(f"[dim]{reason}[/dim]")
+                continue
+            if selected == "off":
+                draft_model = None
+                active_num_draft_tokens = None
+                prompt_cache = engine.create_prompt_cache(model, None)
+                err_console.print("[dim]Draft acceleration disabled.[/dim]")
+                continue
+            if not is_model_available_locally(supported_draft_repo):
+                err_console.print(
+                    f"[dim]Draft model not installed locally: {supported_draft_repo}. Pull it first to enable acceleration.[/dim]"
+                )
+                continue
+            if draft_repo != supported_draft_repo or draft_model is None:
+                with err_console.status("Loading draft model..."):
+                    draft_model = engine.load_model(supported_draft_repo, ensure_available=False)[0]
+                if type(model).__module__.startswith("mlx_lm."):
+                    with err_console.status("Warming up draft model..."):
+                        engine.warmup_draft_model(model, draft_model, tokenizer)
+            draft_repo = supported_draft_repo
+            active_num_draft_tokens = default_num_draft_tokens(repo_id)
+            prompt_cache = engine.create_prompt_cache(model, draft_model)
+            err_console.print(f"[dim]Draft acceleration enabled with {supported_draft_repo}.[/dim]")
             continue
         if stripped.startswith("/cli-page"):
             parts = stripped.split(maxsplit=1)
@@ -2368,6 +2599,7 @@ def run_chat(
                 memories=[],
             )
             session_memories = []
+            prompt_cache = engine.create_prompt_cache(model, draft_model)
             # Copy existing messages into session if any
             for msg in messages:
                 session.messages.append(ChatMessage(
@@ -2400,6 +2632,7 @@ def run_chat(
                         if session is not None and session.session_id == selected_session.session_id:
                             session = None
                             session_memories = []
+                            prompt_cache = engine.create_prompt_cache(model, draft_model)
                         err_console.print(
                             f"[dim]Deleted saved session: {selected_session.title or selected_session.session_id[:8]}[/dim]"
                         )
@@ -2409,6 +2642,7 @@ def run_chat(
                 session = selected_session
                 messages = [{"role": m.role, "content": m.content} for m in session.messages]
                 session_memories = load_memories(session.session_id)
+                prompt_cache = engine.create_prompt_cache(model, draft_model)
                 transcript_blocks = _transcript_blocks_from_messages(session.messages)
                 err_console.print(f"[dim]Resumed: {session.title} ({len(messages)} messages)[/dim]")
                 if _is_tight_cli_page_mode(cli_page_mode):
@@ -2475,6 +2709,7 @@ def run_chat(
                 session.updated_at = time.time()
                 save_memories(session.session_id, session_memories)
                 save_session(session)
+                prompt_cache = engine.create_prompt_cache(model, draft_model)
                 err_console.print(f"[dim]Added {len(new_memories)} memories to this session.[/dim]")
             else:
                 err_console.print("[dim]Discarded extracted memories.[/dim]")
@@ -2506,6 +2741,10 @@ def run_chat(
             model_label=short,
             temp=temp, top_p=top_p, max_tokens=max_tokens, verbose=verbose,
             chat_template_kwargs=chat_template_kwargs,
+            draft_model=draft_model,
+            num_draft_tokens=active_num_draft_tokens,
+            prefill_step_size=2048,
+            prompt_cache=prompt_cache,
             cli_page_mode=cli_page_mode,
         )
         if len(stream_result) == 4:

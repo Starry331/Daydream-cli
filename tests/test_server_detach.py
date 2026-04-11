@@ -169,6 +169,60 @@ class ServerDetachTests(unittest.TestCase):
                 self.assertEqual(args.chat_template_args, {"enable_thinking": False})
                 self.assertIn("CLI-only", output.getvalue())
 
+    def test_server_enables_qwen35_draft_when_runtime_is_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir(parents=True, exist_ok=True)
+
+            with mock.patch.dict(os.environ, {"DAYDREAM_HOME": str(home)}, clear=False):
+                reload_module("daydream.config")
+                server = reload_module("daydream.server")
+                output = io.StringIO()
+                server.console = Console(file=output, force_terminal=False, color_system=None)
+
+                with mock.patch.object(server, "ensure_runtime_model", return_value="mlx-community/Qwen3.5-9B-MLX-4bit"), \
+                    mock.patch.object(server, "is_model_available_locally", side_effect=lambda name: "0.8B-OptiQ" in str(name)), \
+                    mock.patch.object(server, "is_fixture_model", return_value=False), \
+                    mock.patch.object(server.engine, "load_model", side_effect=[(mock.Mock(), mock.Mock()), (mock.Mock(), mock.Mock())]), \
+                    mock.patch.object(server, "_run_runtime_server") as run_runtime:
+                    server.start_server(model="qwen3.5:9b")
+
+                run_runtime.assert_called_once()
+                kwargs = run_runtime.call_args.kwargs
+                self.assertIsNotNone(kwargs["draft_model"])
+                rendered = output.getvalue()
+                self.assertIn("Speculative:", rendered)
+                self.assertIn("mlx-community/Qwen3.5-0.8B-OptiQ-4bit", rendered)
+
+    def test_server_skips_qwen35_draft_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir(parents=True, exist_ok=True)
+
+            with mock.patch.dict(os.environ, {"DAYDREAM_HOME": str(home)}, clear=False):
+                reload_module("daydream.config")
+                server = reload_module("daydream.server")
+
+                fake_mlx_server = mock.Mock()
+                fake_provider = mock.Mock()
+
+                with mock.patch.object(server, "ensure_runtime_model", return_value="mlx-community/Qwen3.5-9B-MLX-4bit"), \
+                    mock.patch.object(server, "is_model_available_locally", return_value=False), \
+                    mock.patch.object(server, "is_fixture_model", return_value=False), \
+                    mock.patch.dict(
+                        "sys.modules",
+                        {
+                            "mlx_lm.server": mock.Mock(
+                                ModelProvider=fake_provider,
+                                run=fake_mlx_server,
+                            )
+                        },
+                    ):
+                    server.start_server(model="qwen3.5:9b")
+
+                args = fake_provider.call_args.args[0]
+                self.assertIsNone(args.draft_model)
+
 
 if __name__ == "__main__":
     unittest.main()

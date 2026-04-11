@@ -31,6 +31,7 @@ class CliTests(unittest.TestCase):
             host="127.0.0.1",
             port=11434,
             detach=False,
+            draft_mode=None,
         )
 
     def test_serve_accepts_legacy_model_option(self) -> None:
@@ -44,6 +45,7 @@ class CliTests(unittest.TestCase):
             host="127.0.0.1",
             port=11434,
             detach=True,
+            draft_mode=None,
         )
 
     def test_create_command_saves_profile(self) -> None:
@@ -89,8 +91,25 @@ class CliTests(unittest.TestCase):
             system="You are terse.",
             verbose=False,
             initial_effort="long",
+            draft_mode=None,
             display_name="mycoder",
         )
+
+    def test_run_accepts_draft_flag(self) -> None:
+        runner = CliRunner()
+        with mock.patch("daydream.chat.run_oneshot") as run_oneshot:
+            result = runner.invoke(cli, ["run", "qwen3.5:9b", "hello", "--draft"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(run_oneshot.call_args.kwargs["draft_mode"], "force")
+
+    def test_run_accepts_no_draft_flag(self) -> None:
+        runner = CliRunner()
+        with mock.patch("daydream.chat.run_oneshot") as run_oneshot:
+            result = runner.invoke(cli, ["run", "qwen3.5:9b", "hello", "--no-draft"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(run_oneshot.call_args.kwargs["draft_mode"], "off")
 
 
 if __name__ == "__main__":

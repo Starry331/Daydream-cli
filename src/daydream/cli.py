@@ -105,10 +105,12 @@ def create(name, file_path):
 @click.option("--top-p", type=float, default=get_default_top_p(), show_default=True, help="Nucleus sampling top-p")
 @click.option("--max-tokens", "-m", type=int, default=get_default_max_tokens(), show_default=True, help="Max tokens to generate")
 @click.option("--system", "-s", type=str, default=None, help="System prompt")
+@click.option("--draft", "draft_mode", flag_value="force", default=None, help="Enable the built-in Qwen3.5 draft model")
+@click.option("--no-draft", "draft_mode", flag_value="off", help="Disable draft-model acceleration")
 @click.option("--verbose", "-v", is_flag=True, help="Show performance metrics")
 @click.pass_context
 @_handle_errors
-def run(ctx, model, prompt, temp, top_p, max_tokens, system, verbose):
+def run(ctx, model, prompt, temp, top_p, max_tokens, system, draft_mode, verbose):
     """Run a model — interactive chat or one-shot generation."""
     from daydream.chat import run_chat, run_oneshot
 
@@ -136,6 +138,7 @@ def run(ctx, model, prompt, temp, top_p, max_tokens, system, verbose):
             system=system,
             verbose=verbose,
             initial_effort=initial_effort,
+            draft_mode=draft_mode,
             display_name=profile.name if profile else model,
         )
     else:
@@ -147,6 +150,7 @@ def run(ctx, model, prompt, temp, top_p, max_tokens, system, verbose):
             system=system,
             verbose=verbose,
             initial_effort=initial_effort,
+            draft_mode=draft_mode,
             display_name=profile.name if profile else model,
         )
 
@@ -205,22 +209,27 @@ def show(model):
 @click.option("--host", default=get_default_host(), show_default=True, help="Bind address")
 @click.option("--port", "-p", type=int, default=get_default_port(), show_default=True, help="Port number")
 @click.option("--max-tokens", type=int, default=None, help="Max tokens per response")
+@click.option("--draft", "draft_mode", flag_value="force", default=None, help="Force-enable draft-model acceleration")
+@click.option("--no-draft", "draft_mode", flag_value="off", help="Disable draft-model acceleration")
 @click.option("--background", is_flag=True, help="Run server in the background")
 @click.option("--foreground", is_flag=True, hidden=True)
 @click.option("--detach", is_flag=True, hidden=True)
 @click.pass_context
 @_handle_errors
-def serve(ctx, model_parts, model, host, port, max_tokens, background, foreground, detach):
+def serve(ctx, model_parts, model, host, port, max_tokens, draft_mode, background, foreground, detach):
     """Start or manage the OpenAI-compatible API server."""
     from daydream.server import start_server
     resolved_model = _coalesce_model_reference(model, model_parts)
-    start_server(
+    kwargs = dict(
         model=resolved_model,
         host=host,
         port=port,
         detach=background or detach,
-        max_tokens=max_tokens,
+        draft_mode=draft_mode,
     )
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    start_server(**kwargs)
 
 
 @cli.command()

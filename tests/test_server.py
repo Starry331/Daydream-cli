@@ -28,6 +28,32 @@ class _FakeResponse:
 
 
 class ServerTests(unittest.TestCase):
+    def test_finalize_runtime_response_text_keeps_reasoning_out_of_content(self) -> None:
+        server = reload_module("daydream.server")
+        parser = server._ReasoningParser()
+        mixed = (
+            "Usually, this means I should output the reasoning.\n"
+            "Let's check the system instruction again: Keep it short.\n"
+            "*Final Answer:* Hello! How can I help you today?"
+        )
+        visible, _, _ = parser.feed(mixed)
+        content, reasoning = server._finalize_runtime_response_text(visible, parser)
+
+        self.assertEqual(content, "Hello! How can I help you today?")
+        self.assertIn("Usually, this means", reasoning)
+        self.assertNotIn("Usually, this means", content)
+
+    def test_finalize_runtime_response_text_extracts_chinese_answer_label(self) -> None:
+        server = reload_module("daydream.server")
+        parser = server._ReasoningParser()
+        mixed = "分析：用户发送“？”意在确认响应状态。\n回答：我在，有什么可以帮您的吗？"
+        visible, _, _ = parser.feed(mixed)
+        content, reasoning = server._finalize_runtime_response_text(visible, parser)
+
+        self.assertEqual(content, "我在，有什么可以帮您的吗？")
+        self.assertIn("分析：用户发送", reasoning)
+        self.assertNotIn("分析：用户发送", content)
+
     def test_show_status_checks_health_and_lists_models(self) -> None:
         server = reload_module("daydream.server")
         output = io.StringIO()

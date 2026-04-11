@@ -34,11 +34,15 @@ from daydream.chat import (
     _model_supports_effort,
     _normalize_cli_page_mode,
     _normalize_effort,
+    _normalize_draft_command,
+    _append_transcript_turn,
     _read_key,
     _read_live_boxed_message,
     _extract_answer_labeled_text,
     _recover_final_output,
     _repack_tight_page,
+    _resolve_speculative_settings,
+    _select_draft_mode,
     _select_cli_page_mode,
     _select_dreaming_mode,
     _select_effort,
@@ -216,11 +220,17 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(matches[0][0], "/effort")
         self.assertTrue(any(name == "/help" for name, _ in _matching_slash_commands("/")))
         self.assertTrue(any(name == "/cli-page" for name, _ in _matching_slash_commands("/cli")))
+        self.assertTrue(any(name == "/draft(beta)" for name, _ in _matching_slash_commands("/dr")))
 
     def test_normalize_cli_page_mode_accepts_supported_values(self) -> None:
         self.assertEqual(_normalize_cli_page_mode("TIGHT"), "tight")
         self.assertEqual(_normalize_cli_page_mode(" loose "), "loose")
         self.assertIsNone(_normalize_cli_page_mode("compact"))
+
+    def test_normalize_draft_command_accepts_supported_values(self) -> None:
+        self.assertEqual(_normalize_draft_command("ON"), "on")
+        self.assertEqual(_normalize_draft_command(" off "), "off")
+        self.assertIsNone(_normalize_draft_command("auto"))
 
     def test_current_command_selection_defaults_and_preserves(self) -> None:
         matches, selected = _current_command_selection("/", None, multiline=False)
@@ -341,7 +351,7 @@ class ChatTests(unittest.TestCase):
             ):
             result = _read_live_boxed_message()
 
-        self.assertEqual(result, "/cli-page")
+        self.assertEqual(result, "/draft(beta)")
 
     def test_live_boxed_message_does_not_promote_terminal_after_user_input(self) -> None:
         @contextmanager
@@ -571,6 +581,60 @@ class ChatTests(unittest.TestCase):
 
         self.assertEqual(result, "tight")
 
+    def test_draft_menu_selects_off_with_down_arrow(self) -> None:
+        @contextmanager
+        def fake_raw():
+            yield
+
+        class FakeRenderer:
+            def __init__(self, *_args, **_kwargs):
+                self.lines = []
+
+            def render(self, lines):
+                self.lines = list(lines)
+
+            def wait_for_input(self, _lines):
+                return
+
+            def finish(self):
+                return
+
+        with mock.patch("daydream.chat._raw_stdin", fake_raw), \
+            mock.patch("daydream.chat._InlineTerminalRenderer", FakeRenderer), \
+            mock.patch("daydream.chat.sys.stdin.isatty", return_value=True), \
+            mock.patch("daydream.chat.err_console", mock.Mock(is_terminal=True)), \
+            mock.patch("daydream.chat._read_key", side_effect=["\x1b", "[", "B", "\r"]):
+            result = _select_draft_mode("on")
+
+        self.assertEqual(result, "off")
+
+    def test_draft_menu_escape_cancels_immediately(self) -> None:
+        @contextmanager
+        def fake_raw():
+            yield
+
+        class FakeRenderer:
+            def __init__(self, *_args, **_kwargs):
+                self.lines = []
+
+            def render(self, lines):
+                self.lines = list(lines)
+
+            def wait_for_input(self, _lines):
+                return
+
+            def finish(self):
+                return
+
+        with mock.patch("daydream.chat._raw_stdin", fake_raw), \
+            mock.patch("daydream.chat._InlineTerminalRenderer", FakeRenderer), \
+            mock.patch("daydream.chat.sys.stdin.isatty", return_value=True), \
+            mock.patch("daydream.chat.err_console", mock.Mock(is_terminal=True)), \
+            mock.patch("daydream.chat._read_key", return_value="\x1b"):
+            result = _select_draft_mode("on")
+
+        self.assertEqual(result, "on")
+
     def test_cli_page_menu_escape_cancels_immediately(self) -> None:
         @contextmanager
         def fake_raw():
@@ -736,6 +800,59 @@ class ChatTests(unittest.TestCase):
         self.assertIn("base system", request[0]["content"])
         self.assertIn("User prefers terse answers.", request[0]["content"])
         self.assertIn("Answer directly and concisely", request[0]["content"])
+
+    def test_resolve_speculative_settings_auto_enables_local_qwen35_draft(self) -> None:
+        with mock.patch("daydream.chat.is_model_available_locally", side_effect=lambda name: "0.8b-optiq" in name.lower()):
+            draft_model, num_draft_tokens = _resolve_speculative_settings(
+                model_name="qwen3.5:9b",
+                resolved_model="mlx-community/Qwen3.5-9B-MLX-4bit",
+                draft_mode=None,
+                just_downloaded_main=False,
+                allow_prompt=True,
+            )
+
+        self.assertEqual(draft_model, "mlx-community/Qwen3.5-0.8B-OptiQ-4bit")
+        self.assertEqual(num_draft_tokens, 6)
+
+    def test_resolve_speculative_settings_does_not_prompt_after_main_auto_pull(self) -> None:
+        with mock.patch("daydream.chat.is_model_available_locally", return_value=False), \
+            mock.patch("daydream.chat.pull_model") as pull_model:
+            draft_model, num_draft_tokens = _resolve_speculative_settings(
+                model_name="qwen3.5:9b",
+                resolved_model="mlx-community/Qwen3.5-9B-MLX-4bit",
+                draft_mode=None,
+                just_downloaded_main=True,
+                allow_prompt=True,
+            )
+
+        pull_model.assert_not_called()
+        self.assertIsNone(draft_model)
+        self.assertIsNone(num_draft_tokens)
+
+    def test_resolve_speculative_settings_skips_prompt_when_run_only_loads_existing_model(self) -> None:
+        with mock.patch("daydream.chat.is_model_available_locally", return_value=False), \
+            mock.patch("daydream.chat.pull_model") as pull_model:
+            draft_model, num_draft_tokens = _resolve_speculative_settings(
+                model_name="qwen3.5:9b",
+                resolved_model="mlx-community/Qwen3.5-9B-MLX-4bit",
+                draft_mode=None,
+                just_downloaded_main=False,
+                allow_prompt=True,
+            )
+
+        pull_model.assert_not_called()
+        self.assertIsNone(draft_model)
+        self.assertIsNone(num_draft_tokens)
+
+    def test_resolve_speculative_settings_rejects_manual_draft_for_non_qwen35(self) -> None:
+        with self.assertRaisesRegex(ValueError, "only supported for Qwen3.5 MLX models"):
+            _resolve_speculative_settings(
+                model_name="smollm2:135m",
+                resolved_model="mlx-community/SmolLM2-135M-Instruct-4bit",
+                draft_mode="force",
+                just_downloaded_main=False,
+                allow_prompt=True,
+            )
 
     def test_confirm_memory_import_defaults_yes(self) -> None:
         with mock.patch("daydream.chat.err_console.input", return_value=""):
@@ -924,6 +1041,24 @@ class ChatTests(unittest.TestCase):
         )
         load_model.assert_called_once_with("mlx-community/Foo-4bit", ensure_available=False)
 
+    def test_run_oneshot_auto_enables_local_qwen35_draft(self) -> None:
+        output = io.StringIO()
+
+        def fake_is_local(name: str) -> bool:
+            return name == "mlx-community/Qwen3.5-0.8B-OptiQ-4bit"
+
+        with mock.patch("daydream.chat.err_console", Console(file=output, force_terminal=False, color_system=None)), \
+            mock.patch("daydream.chat.is_model_available_locally", side_effect=fake_is_local), \
+            mock.patch("daydream.chat.ensure_runtime_model", return_value="mlx-community/Qwen3.5-9B-MLX-4bit"), \
+            mock.patch("daydream.chat.engine.load_model", side_effect=[("main-model", "tokenizer"), ("draft-model", "draft-tokenizer")]), \
+            mock.patch("daydream.chat._stream_response", return_value=("hello", None, "", None)) as stream_response:
+            run_oneshot("qwen3.5:9b", prompt="hello")
+
+        self.assertEqual(stream_response.call_args.kwargs["draft_model"], "draft-model")
+        self.assertEqual(stream_response.call_args.kwargs["num_draft_tokens"], 6)
+        self.assertEqual(stream_response.call_args.kwargs["kv_bits"], 8)
+        self.assertEqual(stream_response.call_args.kwargs["prefill_step_size"], 2048)
+
     def test_run_chat_applies_effort_after_new_session(self) -> None:
         captured_calls = []
 
@@ -981,6 +1116,100 @@ class ChatTests(unittest.TestCase):
             if call.args
         )
         self.assertIn("CLI page mode set to tight", printed)
+
+    def test_run_chat_draft_on_enables_local_qwen35_draft(self) -> None:
+        captured_calls = []
+
+        def fake_stream_response(_model, _tokenizer, _request_messages, **kwargs):
+            captured_calls.append(kwargs)
+            return ("hello", None, "")
+
+        def fake_is_local(name: str) -> bool:
+            return name in {"foo", "mlx-community/Qwen3.5-0.8B-OptiQ-4bit"}
+
+        with mock.patch("daydream.chat._read_boxed_message", side_effect=["/draft on", "hello", "/quit"]), \
+            mock.patch("daydream.chat.ensure_runtime_model", return_value="mlx-community/Qwen3.5-9B-MLX-4bit"), \
+            mock.patch("daydream.chat.is_model_available_locally", side_effect=fake_is_local), \
+            mock.patch("daydream.chat.engine.load_model", side_effect=[("model", mock.Mock(has_thinking=True)), ("draft-model", "draft-tokenizer")]), \
+            mock.patch("daydream.chat._stream_response", side_effect=fake_stream_response):
+            run_chat("foo", draft_mode="off")
+
+        self.assertEqual(captured_calls[0]["draft_model"], "draft-model")
+        self.assertEqual(captured_calls[0]["num_draft_tokens"], 6)
+
+    def test_run_chat_draft_on_warns_for_unsupported_models(self) -> None:
+        captured_calls = []
+        fake_err_console = mock.Mock(is_terminal=True)
+        fake_err_console.print = mock.Mock()
+        fake_err_console.status = contextmanager(lambda _msg: iter([None]))  # type: ignore[arg-type]
+        fake_err_console.file = io.StringIO()
+        fake_err_console.file.isatty = lambda: True
+
+        def fake_stream_response(_model, _tokenizer, _request_messages, **kwargs):
+            captured_calls.append(kwargs)
+            return ("hello", None, "")
+
+        with mock.patch("daydream.chat.err_console", fake_err_console), \
+            mock.patch("daydream.chat._read_boxed_message", side_effect=["/draft on", "hello", "/quit"]), \
+            mock.patch("daydream.chat.ensure_runtime_model", return_value="mlx-community/SmolLM2-135M-Instruct-4bit"), \
+            mock.patch("daydream.chat.is_model_available_locally", return_value=True), \
+            mock.patch("daydream.chat.engine.load_model", return_value=("model", mock.Mock(has_thinking=True))), \
+            mock.patch("daydream.chat._stream_response", side_effect=fake_stream_response):
+            run_chat("foo", draft_mode="off")
+
+        printed = " ".join(str(call.args[0]) for call in fake_err_console.print.call_args_list if call.args)
+        self.assertIn("only supported for Qwen3.5 MLX models", printed)
+        self.assertIsNone(captured_calls[0]["draft_model"])
+
+    def test_run_chat_draft_on_warns_when_qwen35_draft_model_missing(self) -> None:
+        captured_calls = []
+        fake_err_console = mock.Mock(is_terminal=True)
+        fake_err_console.print = mock.Mock()
+        fake_err_console.status = contextmanager(lambda _msg: iter([None]))  # type: ignore[arg-type]
+        fake_err_console.file = io.StringIO()
+        fake_err_console.file.isatty = lambda: True
+
+        def fake_stream_response(_model, _tokenizer, _request_messages, **kwargs):
+            captured_calls.append(kwargs)
+            return ("hello", None, "")
+
+        def fake_is_local(name: str) -> bool:
+            return name == "foo"
+
+        with mock.patch("daydream.chat.err_console", fake_err_console), \
+            mock.patch("daydream.chat._read_boxed_message", side_effect=["/draft on", "hello", "/quit"]), \
+            mock.patch("daydream.chat.ensure_runtime_model", return_value="mlx-community/Qwen3.5-9B-MLX-4bit"), \
+            mock.patch("daydream.chat.is_model_available_locally", side_effect=fake_is_local), \
+            mock.patch("daydream.chat.engine.load_model", return_value=("model", mock.Mock(has_thinking=True))), \
+            mock.patch("daydream.chat.pull_model") as pull_model, \
+            mock.patch("daydream.chat._stream_response", side_effect=fake_stream_response):
+            run_chat("foo", draft_mode="off")
+
+        printed = " ".join(str(call.args[0]) for call in fake_err_console.print.call_args_list if call.args)
+        self.assertIn("Draft model not installed locally", printed)
+        pull_model.assert_not_called()
+        self.assertIsNone(captured_calls[0]["draft_model"])
+
+    def test_run_chat_reuses_prompt_cache_across_turns(self) -> None:
+        captured_calls = []
+        prompt_cache = object()
+
+        def fake_stream_response(_model, _tokenizer, _request_messages, **kwargs):
+            captured_calls.append(kwargs)
+            return ("hello", None, "")
+
+        with mock.patch("daydream.chat._read_boxed_message", side_effect=["hello", "again", "/quit"]), \
+            mock.patch("daydream.chat.ensure_runtime_model", return_value="mlx-community/Qwen3-8B-4bit"), \
+            mock.patch("daydream.chat.engine.load_model", return_value=("model", mock.Mock(has_thinking=True))), \
+            mock.patch("daydream.chat.engine.create_prompt_cache", return_value=prompt_cache), \
+            mock.patch("daydream.chat._stream_response", side_effect=fake_stream_response):
+            run_chat("foo")
+
+        self.assertEqual(len(captured_calls), 2)
+        self.assertIs(captured_calls[0]["prompt_cache"], prompt_cache)
+        self.assertIs(captured_calls[1]["prompt_cache"], prompt_cache)
+        self.assertEqual(captured_calls[0]["prefill_step_size"], 2048)
+        self.assertEqual(captured_calls[1]["prefill_step_size"], 2048)
 
     def test_run_chat_repacks_page_after_response_in_tight_mode(self) -> None:
         with mock.patch("daydream.chat._read_boxed_message", side_effect=["hello", "/quit"]), \
@@ -1227,7 +1456,7 @@ class ChatTests(unittest.TestCase):
         self.assertIn("Earlier answer", printed)
         self.assertNotIn("hidden chain", printed)
 
-    def test_run_chat_resume_prints_only_last_ten_visible_messages(self) -> None:
+    def test_run_chat_resume_prints_saved_history_without_truncating_visible_messages(self) -> None:
         from daydream.storage import ChatMessage, ChatSession
 
         fake_err_console = mock.Mock(is_terminal=True)
@@ -1264,8 +1493,8 @@ class ChatTests(unittest.TestCase):
             for call in fake_err_console.print.call_args_list
             if call.args
         )
-        self.assertNotIn("Question-00", printed)
-        self.assertNotIn("Answer-01", printed)
+        self.assertIn("Question-00", printed)
+        self.assertIn("Answer-01", printed)
         self.assertIn("Question-02", printed)
         self.assertIn("Answer-11", printed)
 
@@ -1349,6 +1578,8 @@ class ChatTests(unittest.TestCase):
         self.assertNotIn("我可以用中文和您交流", printed)
 
     def test_run_chat_does_not_duplicate_final_output_after_reasoning(self) -> None:
+        captured_turns: list[tuple[str, str]] = []
+
         class FakeStatus:
             def __init__(self):
                 self.output = ""
@@ -1381,6 +1612,16 @@ class ChatTests(unittest.TestCase):
         def fake_daydreaming_status(_console, _label, **_kwargs):
             yield FakeStatus()
 
+        def record_turn(blocks, *, user_input, assistant_text, reasoning_elapsed, had_reasoning):
+            captured_turns.append((user_input, assistant_text))
+            return _append_transcript_turn(
+                blocks,
+                user_input=user_input,
+                assistant_text=assistant_text,
+                reasoning_elapsed=reasoning_elapsed,
+                had_reasoning=had_reasoning,
+            )
+
         fake_err_console = mock.Mock(is_terminal=True)
         fake_err_console.print = mock.Mock()
         fake_err_console.status = contextmanager(lambda _msg: iter([None]))  # type: ignore[arg-type]
@@ -1401,17 +1642,13 @@ class ChatTests(unittest.TestCase):
             mock.patch("daydream.chat.ensure_runtime_model", return_value="mlx-community/Foo-4bit"), \
             mock.patch("daydream.chat.engine.load_model", return_value=("model", mock.Mock(has_thinking=True))), \
             mock.patch("daydream.chat.engine.generate_stream", side_effect=lambda *args, **kwargs: responses), \
+            mock.patch("daydream.chat._append_transcript_turn", side_effect=record_turn), \
             mock.patch("daydream.chat.daydreaming_status", fake_daydreaming_status):
             run_chat("foo")
 
-        printed = " ".join(
-            str(call.args[0])
-            for call in fake_err_console.print.call_args_list
-            if call.args
-        )
         self.assertEqual(
-            printed.count("好的，随时待命！接下来你想聊些什么，或者有什么具体的问题需要我协助吗？"),
-            1,
+            captured_turns,
+            [("你好", "好的，随时待命！接下来你想聊些什么，或者有什么具体的问题需要我协助吗？")],
         )
 
     def test_run_chat_streams_visible_text_after_reasoning_to_console(self) -> None:

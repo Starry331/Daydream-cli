@@ -122,6 +122,16 @@ def get_model_path(repo_id: str) -> Optional[Path]:
     return _get_model_path(repo_id)
 
 
+def is_model_available_locally(name: str) -> bool:
+    """Return True if a model reference already exists locally."""
+    try:
+        reject_gguf_reference(name)
+        resolved = normalize_hf_reference(resolve(name))
+    except Exception:
+        resolved = name
+    return _maybe_local_model_path(resolved) is not None or _get_model_path(resolved) is not None
+
+
 def _maybe_local_model_path(target: str) -> Optional[Path]:
     path = Path(target).expanduser()
     if path.exists() and is_local_model_dir(path):
