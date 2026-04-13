@@ -398,9 +398,98 @@ def resolve(name: str) -> str:
     return target
 
 
+def copy_alias(source: str, destination: str) -> str:
+    """Create a custom alias for an existing model.
+
+    Returns the repo ID that the new alias points to.
+    """
+    repo_id = resolve(source)
+
+    dest = destination.strip().lower()
+    if not dest:
+        raise ValueError("Destination alias cannot be empty.")
+    if "/" in dest:
+        raise ValueError("Alias cannot contain '/'. Use a simple name like 'mymodel' or 'mymodel:variant'.")
+
+    if ":" in dest:
+        family, variant = dest.split(":", 1)
+    else:
+        family, variant = dest, "default"
+
+    user_registry = _load_user_registry()
+    merged = _get_merged_registry()
+
+    if family in merged:
+        existing_target = merged[family].get(variant)
+        if existing_target == repo_id:
+            return repo_id
+        if existing_target is not None:
+            raise ValueError(
+                f"Alias '{destination}' already exists and points to '{existing_target}'. "
+                f"Remove it first with `daydream rm {destination}`."
+            )
+
+    if family not in user_registry:
+        user_registry[family] = {}
+    user_registry[family][variant] = repo_id
+    _save_user_registry(user_registry)
+    return repo_id
+
+
+def list_user_aliases() -> list[tuple[str, str]]:
+    """Return all user-defined aliases as (alias, repo_id) pairs."""
+    user_registry = _load_user_registry()
+    results: list[tuple[str, str]] = []
+    for family, variants in user_registry.items():
+        for variant, repo_id in variants.items():
+            if variant == "default":
+                results.append((family, repo_id))
+            else:
+                results.append((f"{family}:{variant}", repo_id))
+    return sorted(results)
+
+
+def remove_alias(alias: str) -> str:
+    """Remove a user-defined alias. Returns the repo_id it pointed to."""
+    alias = alias.strip().lower()
+    if ":" in alias:
+        family, variant = alias.split(":", 1)
+    else:
+        family, variant = alias, "default"
+
+    user_registry = _load_user_registry()
+    if family not in user_registry or variant not in user_registry[family]:
+        raise ValueError(f"Alias '{alias}' not found in user registry.")
+
+    # Check it's not a builtin
+    if family in BUILTIN_REGISTRY and variant in BUILTIN_REGISTRY[family]:
+        raise ValueError(f"'{alias}' is a built-in name and cannot be removed.")
+
+    repo_id = user_registry[family][variant]
+    del user_registry[family][variant]
+    if not user_registry[family]:
+        del user_registry[family]
+    _save_user_registry(user_registry)
+    return repo_id
+
+
 def reverse_lookup(repo_id: str) -> Optional[str]:
     """Find the short name for a HuggingFace repo ID, if one exists."""
     return _find_short_name_for_target(repo_id)
+
+
+def reverse_lookup_all(repo_id: str) -> list[str]:
+    """Find all short names that point to this repo ID."""
+    registry = _get_merged_registry()
+    names: list[str] = []
+    for family, variants in registry.items():
+        for variant, value in variants.items():
+            if value != repo_id:
+                continue
+            short = _format_short_name(family, variant, variants)
+            if short:
+                names.append(short)
+    return names
 
 
 def list_available() -> list[tuple[str, str, str]]:

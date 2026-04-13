@@ -33,6 +33,7 @@ from daydream.registry import (
     register_remote_model,
     resolve,
     reverse_lookup,
+    reverse_lookup_all,
 )
 from daydream.utils import terminal_title_status
 
@@ -380,6 +381,24 @@ def ensure_runtime_model(name: str, *, auto_pull: bool = False, register_alias: 
     return repo_id
 
 
+def downloaded_models() -> list[tuple[str, str]]:
+    """Return a list of (short_name, repo_id) for all downloaded models."""
+    cache_info = _scan_cache()
+    if cache_info is None:
+        return []
+    results = []
+    for repo in sorted(
+        cache_info.repos,
+        key=lambda r: r.last_accessed or r.last_modified or 0,
+        reverse=True,
+    ):
+        if repo.repo_type != "model":
+            continue
+        short = reverse_lookup(repo.repo_id) or repo.repo_id
+        results.append((short, repo.repo_id))
+    return results
+
+
 def list_models() -> None:
     """List downloaded models."""
     cache_info = _scan_cache()
@@ -406,11 +425,16 @@ def list_models() -> None:
         if repo.repo_type != "model":
             continue
 
-        short = reverse_lookup(repo_id) or ""
+        aliases = reverse_lookup_all(repo_id)
         size = format_size(repo.size_on_disk)
         modified = format_time_ago(repo.last_accessed)
 
-        table.add_row(short or "-", repo_id, size, modified)
+        if aliases:
+            table.add_row(aliases[0], repo_id, size, modified)
+            for alias in aliases[1:]:
+                table.add_row(alias, "", "", "")
+        else:
+            table.add_row("-", repo_id, size, modified)
         found = True
 
     if not found:

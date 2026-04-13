@@ -166,6 +166,68 @@ def pull(model):
     pull_model(resolved_model)
 
 
+@cli.command()
+@click.argument("source", required=False, default=None)
+@click.argument("destination", required=False, default=None)
+@_handle_errors
+def cp(source, destination):
+    """Create an alias for a model."""
+    from daydream.registry import copy_alias
+
+    if source and destination:
+        repo_id = copy_alias(source, destination)
+        Console().print(f"[green]✓[/] Alias [bold]{destination}[/] -> {repo_id}")
+        return
+
+    from daydream.interactive import interactive_select, interactive_input
+    from daydream.models import downloaded_models
+
+    models = downloaded_models()
+    if not models:
+        err_console.print("[red]Error:[/] No downloaded models found.")
+        raise SystemExit(1)
+
+    selected = interactive_select("Select a model:", models)
+    if selected is None:
+        return
+
+    short_name, repo_id = selected
+    alias = interactive_input(f"Enter alias for [bold]{short_name}[/]:")
+    if not alias:
+        return
+
+    copy_alias(short_name, alias)
+    Console().print(f"[green]✓[/] Alias [bold]{alias}[/] -> {repo_id}")
+
+
+@cli.command()
+@click.argument("alias", required=False, default=None)
+@_handle_errors
+def unalias(alias):
+    """Remove a model alias."""
+    from daydream.registry import list_user_aliases, remove_alias
+
+    if alias:
+        repo_id = remove_alias(alias)
+        Console().print(f"[green]✓[/] Removed alias [bold]{alias}[/] (was -> {repo_id})")
+        return
+
+    from daydream.interactive import interactive_select
+
+    aliases = list_user_aliases()
+    if not aliases:
+        err_console.print("[dim]No user-defined aliases found.[/dim]")
+        return
+
+    selected = interactive_select("Select alias to remove:", aliases)
+    if selected is None:
+        return
+
+    alias_name, repo_id = selected
+    remove_alias(alias_name)
+    Console().print(f"[green]✓[/] Removed alias [bold]{alias_name}[/] (was -> {repo_id})")
+
+
 @cli.command(name="list")
 @_handle_errors
 def list_models():
