@@ -311,6 +311,35 @@ def stop(force):
     stop_server(force=force)
 
 
+@cli.command()
+@_handle_errors
+def link():
+    """Launch or install linked AI tools."""
+    from daydream.interactive import interactive_menu, interactive_select
+    from daydream.links import get_menu_items, launch_tool
+
+    items = get_menu_items()
+    selected = interactive_menu("Daydream Link", items)
+    if selected is None:
+        return
+
+    if selected["key"] == "chat":
+        from daydream.models import downloaded_models
+        models = downloaded_models()
+        if not models:
+            err_console.print("[red]Error:[/] No downloaded models found. Run [bold]daydream pull <model>[/bold] first.")
+            raise SystemExit(1)
+        model = interactive_select("Select a model:", models)
+        if model is None:
+            return
+        short_name, _ = model
+        from daydream.chat import run_chat
+        run_chat(short_name)
+        return
+
+    launch_tool(selected)
+
+
 @cli.command(name="models")
 @_handle_errors
 def available_models():
