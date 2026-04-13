@@ -594,10 +594,11 @@ def _wait_for_menu_input(
         ready, _, _ = select.select([fd], [], [], 0.01)
         size = renderer._terminal_size()
         if size != renderer._last_size:
-            renderer.render(renderable)
+            return False
         return bool(ready)
     if renderer is not None:
-        renderer.wait_for_input(renderable)
+        renderer.render(renderable)
+        return renderer.wait_for_input(renderable)
     return True
 
 
@@ -819,7 +820,7 @@ def _read_live_boxed_message(*, cli_page_mode: str = "loose") -> str:
                     multiline=multiline,
                 )
                 if pending_key is None:
-                    renderer.wait_for_input(
+                    input_ready = renderer.wait_for_input(
                         _render_input_state(
                             buffer,
                             multiline=multiline,
@@ -827,6 +828,17 @@ def _read_live_boxed_message(*, cli_page_mode: str = "loose") -> str:
                             cli_page_mode=cli_page_mode,
                         )
                     )
+                    if not input_ready:
+                        # Terminal resized — re-render with new dimensions
+                        renderer.render(
+                            _render_input_state(
+                                buffer,
+                                multiline=multiline,
+                                selected_command=selected_command,
+                                cli_page_mode=cli_page_mode,
+                            )
+                        )
+                        continue
                     raw_key = _read_key()
                     key, pending_escape, pending_escape_started_at = _merge_escape_key(
                         raw_key,

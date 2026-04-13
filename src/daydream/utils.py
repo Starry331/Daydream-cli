@@ -245,6 +245,36 @@ def _is_tight_mode(cli_page_mode: str) -> bool:
     return str(cli_page_mode).strip().lower() == "tight"
 
 
+def _trim_live_output(text: str, *, columns: int | None = None, rows: int | None = None) -> str:
+    """Keep only a bounded tail of streamed body text for live overlays.
+
+    The full assistant body is tracked separately by chat.py and printed again
+    after generation finishes. The live overlay only needs enough recent text
+    to look continuous while avoiding pathological re-renders for long outputs.
+    """
+    if not text:
+        return ""
+
+    size = shutil.get_terminal_size(fallback=(96, 24))
+    columns = max(20, columns or size.columns)
+    rows = max(8, rows or size.lines)
+
+    # Trim against *wrapped* visual rows, not just explicit newlines or raw
+    # characters. Narrow terminals turn long paragraphs into many visual rows;
+    # if we only keep a large char tail, the live overlay still grows too tall
+    # and appears to stall mid-generation.
+    visible_rows = max(6, min(rows - 6, 12))
+    wrapped_rows: list[str] = []
+    for logical_line in text.split("\n"):
+        wrapped_rows.extend(_wrap_display_text(logical_line, columns))
+
+    if len(wrapped_rows) <= visible_rows:
+        return text
+
+    tail_rows = wrapped_rows[-visible_rows:]
+    return "\n".join(tail_rows)
+
+
 def build_input_box_lines(
     lines: list[str],
     *,
@@ -776,6 +806,7 @@ class ConversationStatus:
         self._title_animator = TerminalTitleAnimator(self._dream_word, frames=_TITLE_Z_FRAMES)
         self._rainbow = random.random() < _RAINBOW_PROBABILITY
         self._stopped = False
+        self._last_render_at = 0.0
 
     def _reasoning_time(self) -> float:
         elapsed = self._reasoning_elapsed or 0.0
@@ -849,6 +880,15 @@ class ConversationStatus:
 
             return Group(*parts)
 
+    def _render_overlay(self, *, force: bool = False) -> None:
+        if self._renderer is None or self._stopped:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_render_at) < 0.05:
+            return
+        self._renderer.render(self._render())
+        self._last_render_at = now
+
     def start(self) -> None:
         self._started_at = time.monotonic()
         self._title_animator.start()
@@ -862,7 +902,7 @@ class ConversationStatus:
             scroll_on_first_render=True,
             collapse_on_finish=_is_tight_mode(self.cli_page_mode),
         )
-        self._renderer.render(self._render())
+        self._render_overlay(force=True)
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -870,8 +910,7 @@ class ConversationStatus:
         while not self._stop.wait(0.08):
             with self._lock:
                 self._frame += 1
-            if self._renderer is not None:
-                self._renderer.render(self._render())
+            self._render_overlay()
 
     def update(
         self,
@@ -880,17 +919,20 @@ class ConversationStatus:
         tokens_per_second=_UNSET,
         waiting: bool | None = None,
     ) -> None:
+        phase_changed = False
+        waiting_changed = False
         with self._lock:
             if phase is not _UNSET:
+                phase_changed = self._phase != phase
                 self._phase = phase
             if tokens_per_second is not _UNSET:
                 self._tokens_per_second = tokens_per_second
             if waiting is not None and self._waiting != waiting:
                 self._waiting = waiting
+                waiting_changed = True
                 if not waiting:
                     self._title_animator.stop()
-        if self._renderer is not None and not self._stopped:
-            self._renderer.render(self._render())
+        self._render_overlay(force=phase_changed or waiting_changed)
 
     def ensure_minimum_wait(self, minimum_seconds: float) -> None:
         if self._started_at is None or self._reasoning_active:
@@ -907,8 +949,7 @@ class ConversationStatus:
                 self._reasoning_start = time.monotonic()
             self._had_reasoning = True
             self._phase = "thinking"
-        if self._renderer is not None and not self._stopped:
-            self._renderer.render(self._render())
+        self._render_overlay(force=True)
 
     def end_reasoning(self) -> None:
         with self._lock:
@@ -918,30 +959,26 @@ class ConversationStatus:
                 self._reasoning_elapsed = (self._reasoning_elapsed or 0.0) + elapsed
                 self._reasoning_start = None
         self._title_animator.stop()
-        if self._renderer is not None and not self._stopped:
-            self._renderer.render(self._render())
+        self._render_overlay(force=True)
 
     def append_reasoning(self, text: str) -> None:
         if not text:
             return
         with self._lock:
             self._reasoning_text += text
-        if self._renderer is not None and not self._stopped:
-            self._renderer.render(self._render())
+        self._render_overlay()
 
     def append_output(self, text: str) -> None:
         if not text:
             return
         with self._lock:
-            self._output += text
-        if self._renderer is not None and not self._stopped:
-            self._renderer.render(self._render())
+            self._output = _trim_live_output(self._output + text)
+        self._render_overlay()
 
     def clear_output(self) -> None:
         with self._lock:
             self._output = ""
-        if self._renderer is not None and not self._stopped:
-            self._renderer.render(self._render())
+        self._render_overlay(force=True)
 
     def stop(self) -> None:
         if self._stopped:
@@ -951,7 +988,7 @@ class ConversationStatus:
         if self._thread is not None:
             self._thread.join(timeout=0.2)
         if self._renderer is not None:
-            self._renderer.render(self._render())
+            self._render_overlay(force=True)
             self._renderer.finish()
             self._renderer = None
         self._title_animator.stop()
@@ -1033,6 +1070,15 @@ class BottomTerminalRenderer:
         lines = self._renderable_to_lines(renderable)
         size = self._terminal_size()
         start_row = max(1, size.lines - len(lines) + 1)
+
+        # Detect terminal size change — reflow makes row tracking unreliable,
+        # so clear the entire visible screen and re-render from scratch.
+        width_changed = self._start_row is not None and self._last_size != size
+        if width_changed:
+            self.stream.write("\x1b[H\x1b[J")
+            self._start_row = None
+            self._line_count = 0
+
         first_render = self._start_row is None
         grows_upward = self._start_row is not None and start_row < self._start_row
         shrinks_downward = self._start_row is not None and start_row > self._start_row
@@ -1042,7 +1088,7 @@ class BottomTerminalRenderer:
         # This keeps prior chat history in scrollback instead of letting the
         # growing overlay wipe lines that were already printed above it.
         if first_render:
-            if self._scroll_on_first_render:
+            if self._scroll_on_first_render and not width_changed:
                 self._scroll_up(len(lines), rows=size.lines)
             clear_from = start_row
         elif grows_upward:
@@ -1069,16 +1115,21 @@ class BottomTerminalRenderer:
         self._line_count = len(lines)
         self._last_size = size
 
-    def wait_for_input(self, renderable: list[str] | Iterable[str] | object) -> None:
+    def wait_for_input(self, renderable: list[str] | Iterable[str] | object) -> bool:
+        """Wait for stdin input or terminal resize.
+
+        Returns True if input is ready, False if terminal was resized.
+        """
         fd = sys.stdin.fileno()
         while True:
             ready, _, _ = select.select([fd], [], [], 0.05)
             size = self._terminal_size()
             if size != self._last_size:
-                self.render(renderable)
-                continue
+                # Don't update _last_size here — let render() see the
+                # width change so it can aggressively clear reflow artifacts.
+                return False
             if ready:
-                return
+                return True
 
     def finish(self) -> None:
         if self._line_count and self._start_row is not None and self._clear_on_finish:
@@ -1141,6 +1192,12 @@ class InlineFlowRenderer(BottomTerminalRenderer):
 
         lines = self._renderable_to_lines(renderable)
         size = self._terminal_size()
+
+        # Size change — reflow makes position tracking unreliable.
+        if self._line_count > 0 and self._last_size != size:
+            self.stream.write("\x1b[H\x1b[J")
+            self._line_count = 0
+
         if self._line_count == 0:
             self._insert_inline_rows(len(lines))
         elif len(lines) > self._line_count:
@@ -1173,16 +1230,19 @@ class InlineFlowRenderer(BottomTerminalRenderer):
         self._line_count = len(lines)
         self._last_size = size
 
-    def wait_for_input(self, renderable: list[str] | Iterable[str] | object) -> None:
+    def wait_for_input(self, renderable: list[str] | Iterable[str] | object) -> bool:
+        """Wait for stdin input or terminal resize.
+
+        Returns True if input is ready, False if terminal was resized.
+        """
         fd = sys.stdin.fileno()
         while True:
             ready, _, _ = select.select([fd], [], [], 0.05)
             size = self._terminal_size()
             if size != self._last_size:
-                self.render(renderable)
-                continue
+                return False
             if ready:
-                return
+                return True
 
     def finish(self) -> None:
         if self._line_count and self._clear_on_finish:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import os
 import unittest
+from unittest import mock
 
 from rich.console import Console
 
@@ -249,10 +250,10 @@ class DaydreamingTextTests(unittest.TestCase):
         console = Console(file=stream, force_terminal=True, color_system="truecolor")
         status = ConversationStatus(console, "qwen3.5-9b", cli_page_mode="tight")
 
-        with unittest.mock.patch("daydream.utils.BottomTerminalRenderer") as bottom_cls, unittest.mock.patch(
+        with mock.patch("daydream.utils.BottomTerminalRenderer") as bottom_cls, mock.patch(
             "daydream.utils.InlineFlowRenderer"
         ) as inline_cls:
-            renderer = unittest.mock.Mock()
+            renderer = mock.Mock()
             bottom_cls.return_value = renderer
             status.start()
             status.stop()
@@ -260,6 +261,55 @@ class DaydreamingTextTests(unittest.TestCase):
         bottom_cls.assert_called_once()
         self.assertTrue(bottom_cls.call_args.kwargs["collapse_on_finish"])
         inline_cls.assert_not_called()
+
+    def test_conversation_status_append_output_trims_live_overlay_tail(self) -> None:
+        stream = io.StringIO()
+        console = Console(file=stream, force_terminal=False, width=40)
+        status = ConversationStatus(console, "qwen3.5-9b")
+
+        with mock.patch(
+            "daydream.utils.shutil.get_terminal_size",
+            return_value=os.terminal_size((40, 12)),
+        ):
+            status.append_output("A" * 4000 + "\nTAIL")
+
+        self.assertLess(len(status._output), 4000)
+        self.assertTrue(status._output.endswith("TAIL"))
+
+    def test_conversation_status_append_output_keeps_recent_visual_rows(self) -> None:
+        stream = io.StringIO()
+        console = Console(file=stream, force_terminal=False, width=40)
+        status = ConversationStatus(console, "qwen3.5-9b")
+        text = "\n".join(f"line {i} " + ("x" * 80) for i in range(60))
+
+        with mock.patch(
+            "daydream.utils.shutil.get_terminal_size",
+            return_value=os.terminal_size((40, 12)),
+        ):
+            status.append_output(text)
+
+        self.assertNotIn("line 0", status._output)
+        self.assertNotIn("line 40", status._output)
+        self.assertIn("line 58", status._output)
+        self.assertIn("line 59", status._output)
+
+    def test_conversation_status_coalesces_rapid_output_renders(self) -> None:
+        stream = io.StringIO()
+        console = Console(file=stream, force_terminal=False, width=40)
+        status = ConversationStatus(console, "qwen3.5-9b")
+        status._renderer = mock.Mock()
+        status._stopped = False
+        status._last_render_at = 10.0
+
+        with mock.patch("daydream.utils.time.monotonic", return_value=10.01):
+            status.append_output("a")
+        with mock.patch("daydream.utils.time.monotonic", return_value=10.03):
+            status.append_output("b")
+        self.assertEqual(status._renderer.render.call_count, 0)
+
+        with mock.patch("daydream.utils.time.monotonic", return_value=10.08):
+            status.append_output("c")
+        self.assertEqual(status._renderer.render.call_count, 1)
 
 
 if __name__ == "__main__":

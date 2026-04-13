@@ -1,6 +1,6 @@
 [project]
 name = "daydream"
-version = "0.1.6"
+version = "0.1.7"
 description = "Apple Silicon local model CLI — Ollama UX, MLX engine"
 requires-python = ">=3.14"
 dependencies = [
