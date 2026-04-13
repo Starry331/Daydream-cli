@@ -161,6 +161,8 @@ EMPHASIZED_REASONING_PREFIX_CANDIDATES = (
     "*self-correction",
 )
 
+_IMPLICIT_REASONING_MAX_CHARS = 8000
+
 _META_REASONING_PREFIX_CANDIDATES = (
     "now the actual response",
     "now the actual answer",
@@ -295,11 +297,26 @@ def _model_supports_effort(model_name: str) -> bool:
 
 
 def _effort_chat_template_kwargs(effort: str, tokenizer) -> dict:
-    if effort == "default":
-        return {}
+    # Detect thinking support: check has_thinking attribute first,
+    # then fall back to inspecting the Jinja template for enable_thinking.
+    # Distilled models (e.g. Qwen3.5-Claude) may lack has_thinking but
+    # still have a template that supports enable_thinking.
     has_thinking = bool(getattr(tokenizer, "has_thinking", False))
     if not has_thinking:
+        template = getattr(tokenizer, "chat_template", None)
+        if template and "enable_thinking" in str(template):
+            has_thinking = True
+    if not has_thinking:
         return {}
+    # Always enable thinking so the model wraps reasoning in
+    # <think>...</think> tags instead of leaking it into visible text.
+    # Always pass thinking_budget — Jinja templates silently ignore
+    # unknown variables, and omitting it can cause some templates to
+    # default to a very small budget (cutting reasoning short).
+    if effort == "default":
+        return {"enable_thinking": True, "thinking_budget": 10000}
+    if effort == "long":
+        return {"enable_thinking": True, "thinking_budget": 10000}
     if effort == "instant":
         return {"enable_thinking": False}
     if effort == "short":
@@ -1190,10 +1207,123 @@ class _ReasoningParser:
         self.reasoning_text = ""
         self.in_reasoning = False
         self.saw_reasoning = False
+        self.saw_think_tags = False
         self._emitted_any_visible = False
         self._buffer = ""
         self._implicit_reasoning = False
+        self._implicit_reasoning_chars = 0
         self._visible_tail = ""
+
+    def _consume_reasoning(self, reasoning_parts: list[str]) -> bool | None:
+        """Process buffer in reasoning mode.
+
+        Returns: True=closed, None=need more data, False=consumed char.
+        """
+        if self._buffer.startswith(CLOSE_THINK_TAG):
+            self._buffer = self._buffer[len(CLOSE_THINK_TAG):]
+            self.in_reasoning = False
+            self._implicit_reasoning = False
+            return True
+        if _starts_with_partial_tag(self._buffer, CLOSE_THINK_TAG):
+            return None
+        if self._implicit_reasoning and _should_end_implicit_reasoning(self.reasoning_text, self._buffer):
+            self.in_reasoning = False
+            self._implicit_reasoning = False
+            return True
+        char = self._buffer[0]
+        reasoning_parts.append(char)
+        self.reasoning_text += char
+        self._buffer = self._buffer[1:]
+        if self._implicit_reasoning:
+            self._implicit_reasoning_chars += 1
+            if self._implicit_reasoning_chars >= _IMPLICIT_REASONING_MAX_CHARS:
+                self.in_reasoning = False
+                self._implicit_reasoning = False
+                return True
+        return False
+
+    def _try_explicit_tags(self, visible_parts: list[str], reasoning_parts: list[str], just_closed: bool) -> str | None:
+        """Check for <think>/</ think> tags.
+
+        Returns: "opened"/"closed"/"wait"/"skip"/None.
+        """
+        if self._buffer.startswith(OPEN_THINK_TAG):
+            self.saw_reasoning = True
+            self.saw_think_tags = True
+            self.in_reasoning = True
+            self._implicit_reasoning = False
+            self._buffer = self._buffer[len(OPEN_THINK_TAG):]
+            return "opened"
+
+        close_index = self._buffer.find(CLOSE_THINK_TAG)
+        open_index = self._buffer.find(OPEN_THINK_TAG)
+        if (
+            not self.saw_reasoning
+            and close_index != -1
+            and (open_index == -1 or close_index < open_index)
+        ):
+            prefix = self._buffer[:close_index]
+            if prefix:
+                reasoning_parts.append(prefix)
+                self.reasoning_text += prefix
+            self.saw_reasoning = True
+            self.saw_think_tags = True
+            self._buffer = self._buffer[close_index + len(CLOSE_THINK_TAG):]
+            return "closed"
+
+        if _starts_with_partial_tag(self._buffer, OPEN_THINK_TAG):
+            return "wait"
+        if self.saw_reasoning and self._buffer.startswith(CLOSE_THINK_TAG):
+            self._buffer = self._buffer[len(CLOSE_THINK_TAG):]
+            return "closed"
+        if just_closed and self.saw_reasoning and self._buffer[:1] in ("\n", "\r"):
+            self._buffer = self._buffer[1:]
+            return "skip"
+        if (
+            not self.saw_reasoning
+            and _starts_with_partial_tag(self._buffer, CLOSE_THINK_TAG)
+        ):
+            return "wait"
+        if self.saw_reasoning and _starts_with_partial_tag(self._buffer, CLOSE_THINK_TAG):
+            return "wait"
+        return None
+
+    def _try_implicit_reasoning(self) -> bool | None:
+        """Check heuristics for implicit reasoning.
+
+        Returns: True=entered, None=tentative(wait), False=no match.
+        """
+        if (
+            not self.saw_reasoning
+            and not self._emitted_any_visible
+            and _looks_like_reasoning_prefix(self._buffer)
+        ):
+            self.saw_reasoning = True
+            self.in_reasoning = True
+            self._implicit_reasoning = True
+            self._implicit_reasoning_chars = 0
+            return True
+        if (
+            not self.saw_reasoning
+            and not self._emitted_any_visible
+            and _might_be_reasoning_prefix(self._buffer)
+        ):
+            return None
+        if (
+            _can_start_late_implicit_reasoning(self._visible_tail)
+            and _looks_like_strong_reasoning_line(self._buffer)
+        ):
+            self.saw_reasoning = True
+            self.in_reasoning = True
+            self._implicit_reasoning = True
+            self._implicit_reasoning_chars = 0
+            return True
+        if (
+            _can_start_late_implicit_reasoning(self._visible_tail)
+            and _might_be_strong_reasoning_line(self._buffer)
+        ):
+            return None
+        return False
 
     def feed(self, chunk: str) -> tuple[str, str, bool]:
         self._buffer += chunk
@@ -1203,93 +1333,29 @@ class _ReasoningParser:
 
         while self._buffer:
             if self.in_reasoning:
-                if self._buffer.startswith(CLOSE_THINK_TAG):
-                    self._buffer = self._buffer[len(CLOSE_THINK_TAG):]
-                    self.in_reasoning = False
-                    self._implicit_reasoning = False
+                result = self._consume_reasoning(reasoning_parts)
+                if result is True:
                     just_closed = True
                     continue
-                if _starts_with_partial_tag(self._buffer, CLOSE_THINK_TAG):
+                if result is None:
                     break
-                if self._implicit_reasoning and _should_end_implicit_reasoning(self.reasoning_text, self._buffer):
-                    self.in_reasoning = False
-                    self._implicit_reasoning = False
-                    just_closed = True
-                    continue
-                char = self._buffer[0]
-                reasoning_parts.append(char)
-                self.reasoning_text += char
-                self._buffer = self._buffer[1:]
                 continue
 
-            if self._buffer.startswith(OPEN_THINK_TAG):
-                self.saw_reasoning = True
-                self.in_reasoning = True
-                self._implicit_reasoning = False
-                self._buffer = self._buffer[len(OPEN_THINK_TAG):]
+            tag = self._try_explicit_tags(visible_parts, reasoning_parts, just_closed)
+            if tag == "opened":
                 continue
-
-            close_index = self._buffer.find(CLOSE_THINK_TAG)
-            open_index = self._buffer.find(OPEN_THINK_TAG)
-            if (
-                not self.saw_reasoning
-                and not self._emitted_any_visible
-                and close_index != -1
-                and (open_index == -1 or close_index < open_index)
-            ):
-                prefix = self._buffer[:close_index]
-                if prefix:
-                    reasoning_parts.append(prefix)
-                    self.reasoning_text += prefix
-                self.saw_reasoning = True
-                self._buffer = self._buffer[close_index + len(CLOSE_THINK_TAG):]
+            if tag == "closed":
                 just_closed = True
                 continue
+            if tag == "wait":
+                break
+            if tag == "skip":
+                continue
 
-            if _starts_with_partial_tag(self._buffer, OPEN_THINK_TAG):
-                break
-            if self.saw_reasoning and self._buffer.startswith(CLOSE_THINK_TAG):
-                self._buffer = self._buffer[len(CLOSE_THINK_TAG):]
-                just_closed = True
+            implicit = self._try_implicit_reasoning()
+            if implicit is True:
                 continue
-            if just_closed and self.saw_reasoning and self._buffer[:1] in ("\n", "\r"):
-                self._buffer = self._buffer[1:]
-                continue
-            if (
-                not self.saw_reasoning
-                and not self._emitted_any_visible
-                and _starts_with_partial_tag(self._buffer, CLOSE_THINK_TAG)
-            ):
-                break
-            if self.saw_reasoning and _starts_with_partial_tag(self._buffer, CLOSE_THINK_TAG):
-                break
-            if (
-                not self.saw_reasoning
-                and not self._emitted_any_visible
-                and _looks_like_reasoning_prefix(self._buffer)
-            ):
-                self.saw_reasoning = True
-                self.in_reasoning = True
-                self._implicit_reasoning = True
-                continue
-            if (
-                not self.saw_reasoning
-                and not self._emitted_any_visible
-                and _might_be_reasoning_prefix(self._buffer)
-            ):
-                break
-            if (
-                _can_start_late_implicit_reasoning(self._visible_tail)
-                and _looks_like_strong_reasoning_line(self._buffer)
-            ):
-                self.saw_reasoning = True
-                self.in_reasoning = True
-                self._implicit_reasoning = True
-                continue
-            if (
-                _can_start_late_implicit_reasoning(self._visible_tail)
-                and _might_be_strong_reasoning_line(self._buffer)
-            ):
+            if implicit is None:
                 break
 
             char = self._buffer[0]
@@ -1300,6 +1366,23 @@ class _ReasoningParser:
                 self._emitted_any_visible = True
 
         return "".join(visible_parts), "".join(reasoning_parts), just_closed
+
+    def flush(self) -> tuple[str, str, bool]:
+        """Emit any remaining buffered content at end-of-stream."""
+        remaining = self._buffer
+        self._buffer = ""
+        if self.in_reasoning and self._implicit_reasoning:
+            # Implicit reasoning never found exit → force close
+            self.in_reasoning = False
+            self._implicit_reasoning = False
+            return remaining, "", True
+        if self.in_reasoning:
+            # Explicit <think> never closed → add remainder to reasoning
+            if remaining:
+                self.reasoning_text += remaining
+            return "", remaining, False
+        # Not in reasoning → emit as visible text
+        return remaining, "", False
 
 
 def _extract_visible_text(text: str) -> tuple[str, str, bool]:
@@ -1333,35 +1416,44 @@ def _extract_visible_text(text: str) -> tuple[str, str, bool]:
     return "".join(visible), "".join(reasoning), in_reasoning
 
 
-def _looks_like_reasoning_prefix(text: str) -> bool:
+def _check_reasoning_prefix(text: str) -> str | None:
+    """Check if text looks like a reasoning prefix.
+
+    Returns: "definite" / "tentative" / None.
+    """
     sample = text.lstrip()
     if not sample:
-        return False
+        return None
     lowered = sample.lower()
+    # Definite checks (no length limit)
     if any(marker in lowered for marker in REASONING_PREFIX_CANDIDATES):
-        return True
+        return "definite"
     if _looks_like_meta_reasoning_sentence(sample):
-        return True
+        return "definite"
     if sample.startswith("1.") and "\n" in sample:
-        return True
-    return False
+        return "definite"
+    # Tentative checks (with length limit)
+    if len(lowered) > 64:
+        return None
+    if any(candidate.startswith(lowered) for candidate in REASONING_PREFIX_CANDIDATES):
+        return "tentative"
+    if any(candidate.startswith(lowered) for candidate in _META_REASONING_PREFIX_CANDIDATES):
+        return "tentative"
+    return None
+
+
+def _looks_like_reasoning_prefix(text: str) -> bool:
+    return _check_reasoning_prefix(text) == "definite"
+
+
+def _might_be_reasoning_prefix(text: str) -> bool:
+    return _check_reasoning_prefix(text) == "tentative"
 
 
 def _starts_with_partial_tag(text: str, tag: str) -> bool:
     if not text or len(text) >= len(tag):
         return False
     return tag.startswith(text)
-
-
-def _might_be_reasoning_prefix(text: str) -> bool:
-    sample = text.lstrip().lower()
-    if not sample:
-        return False
-    if len(sample) > 64:
-        return False
-    return any(candidate.startswith(sample) for candidate in REASONING_PREFIX_CANDIDATES) or any(
-        candidate.startswith(sample) for candidate in _META_REASONING_PREFIX_CANDIDATES
-    )
 
 
 def _looks_like_meta_reasoning_sentence(text: str) -> bool:
@@ -1387,7 +1479,7 @@ def _should_end_implicit_reasoning(reasoning_text: str, buffer: str) -> bool:
         return False
     if sample.startswith(('"', "“", "'")):
         return False
-    if _looks_like_reasoning_line_start(sample) or _might_be_reasoning_line_start(sample):
+    if _check_reasoning_line_start(sample) is not None:
         return False
     return True
 
@@ -1419,177 +1511,120 @@ def _last_reasoning_line_opens_draft(reasoning_text: str) -> bool:
     return False
 
 
-def _looks_like_reasoning_line_start(text: str) -> bool:
+_REASONING_LINE_START_MARKERS = (
+    "usually, this means",
+    "this implies",
+    "user says",
+    "intent is",
+    "response should",
+    "keep it short",
+    "thinking block:",
+    "thinking:",
+    "revised plan:",
+    "final answer:",
+    "response:",
+    "answer:",
+    "constraint check:",
+    "thinking block lines:",
+    "actually, looking at",
+    "let's check the system instruction again",
+    "let's check the instruction again",
+    "the instruction says",
+    "let's just respond",
+    "input:",
+    "language:",
+    "meaning:",
+    "intent:",
+    "option ",
+    "analysis",
+    "reasoning",
+    "determine",
+    "draft",
+    "final",
+    "review",
+    "self-correction",
+    "let's",
+    "the user",
+    "i need to",
+    "i should",
+    "first",
+    "however",
+    "summary",
+    "wait",
+    "check",
+    "步骤",
+    "分析",
+    "输入：",
+    "输入:",
+    "意图",
+    "最终",
+    "回答：",
+    "回答:",
+    "答案：",
+    "答案:",
+    "回复：",
+    "回复:",
+    "好的，用户",
+    "用户发来",
+    "用户可能",
+    "看起来",
+    "我需要",
+    "我应该",
+    "首先",
+    "不过",
+    "另外",
+    "同时",
+    "现在需要",
+    "根据我的知识库",
+    "总结",
+    "总结：",
+)
+
+
+def _check_reasoning_line_start(text: str) -> str | None:
+    """Check if text looks like a reasoning line start.
+
+    Returns: "definite" / "tentative" / None.
+    """
     sample = text.lstrip()
+    if not sample:
+        return None
     lowered = sample.lower()
+    # Definite checks (no length limit)
     if _looks_like_meta_reasoning_sentence(sample):
-        return True
-    if sample.startswith(('"', "“", "'")):
-        return True
+        return "definite"
+    if sample.startswith(('"', "“", "‘")):
+        return "definite"
     if sample.startswith(("**", "* ", "- ", "• ", "> ")):
-        return True
+        return "definite"
     if _looks_like_emphasized_reasoning_label(sample):
-        return True
+        return "definite"
     if re.match(r"^\d+[\.\)]\s", sample):
-        return True
-    markers = (
-        "usually, this means",
-        "this implies",
-        "user says",
-        "intent is",
-        "response should",
-        "keep it short",
-        "thinking block:",
-        "thinking:",
-        "revised plan:",
-        "final answer:",
-        "response:",
-        "answer:",
-        "constraint check:",
-        "thinking block lines:",
-        "actually, looking at",
-        "let's check the system instruction again",
-        "let's check the instruction again",
-        "the instruction says",
-        "let's just respond",
-        "input:",
-        "language:",
-        "meaning:",
-        "intent:",
-        "option ",
-        "analysis",
-        "reasoning",
-        "determine",
-        "draft",
-        "final",
-        "review",
-        "self-correction",
-        "let's",
-        "the user",
-        "i need to",
-        "i should",
-        "first",
-        "however",
-        "summary",
-        "wait",
-        "check",
-        "步骤",
-        "分析",
-        "输入：",
-        "输入:",
-        "意图",
-        "最终",
-        "回答：",
-        "回答:",
-        "答案：",
-        "答案:",
-        "回复：",
-        "回复:",
-        "好的，用户",
-        "用户发来",
-        "用户可能",
-        "看起来",
-        "我需要",
-        "我应该",
-        "首先",
-        "不过",
-        "另外",
-        "同时",
-        "现在需要",
-        "根据我的知识库",
-        "总结",
-        "总结：",
-    )
-    return any(lowered.startswith(marker) for marker in markers)
+        return "definite"
+    if any(lowered.startswith(marker) for marker in _REASONING_LINE_START_MARKERS):
+        return "definite"
+    # Tentative checks (with length limit)
+    if len(lowered) > 48:
+        return None
+    if any(candidate.startswith(lowered) for candidate in _META_REASONING_PREFIX_CANDIDATES):
+        return "tentative"
+    if any(candidate.startswith(lowered) for candidate in EMPHASIZED_REASONING_PREFIX_CANDIDATES):
+        return "tentative"
+    if any(candidate.startswith(lowered) for candidate in _REASONING_LINE_START_MARKERS):
+        return "tentative"
+    if any(candidate.startswith(lowered) for candidate in ("* ", "- ", "• ", "> ")):
+        return "tentative"
+    if re.match(r"^\d+[\.\)]?$", lowered):
+        return "tentative"
+    return None
+
+
+def _looks_like_reasoning_line_start(text: str) -> bool:
+    return _check_reasoning_line_start(text) == "definite"
 
 
 def _might_be_reasoning_line_start(text: str) -> bool:
-    sample = text.lstrip().lower()
-    if not sample:
-        return False
-    if len(sample) > 48:
-        return False
-    if any(candidate.startswith(sample) for candidate in _META_REASONING_PREFIX_CANDIDATES):
-        return True
-    if sample.startswith(('"', "“", "'")):
-        return True
-    if any(candidate.startswith(sample) for candidate in EMPHASIZED_REASONING_PREFIX_CANDIDATES):
-        return True
-    candidates = (
-        "usually, this means",
-        "this implies",
-        "user says",
-        "intent is",
-        "response should",
-        "keep it short",
-        "thinking block:",
-        "thinking:",
-        "revised plan:",
-        "final answer:",
-        "response:",
-        "answer:",
-        "constraint check:",
-        "thinking block lines:",
-        "actually, looking at",
-        "let's check the system instruction again",
-        "let's check the instruction again",
-        "the instruction says",
-        "let's just respond",
-        "input:",
-        "language:",
-        "meaning:",
-        "intent:",
-        "option ",
-        "analysis",
-        "reasoning",
-        "determine",
-        "draft",
-        "final",
-        "review",
-        "self-correction",
-        "let's",
-        "the user",
-        "i need to",
-        "i should",
-        "first",
-        "however",
-        "summary",
-        "wait",
-        "check",
-        "步骤",
-        "分析",
-        "输入：",
-        "输入:",
-        "意图",
-        "最终",
-        "回答：",
-        "回答:",
-        "答案：",
-        "答案:",
-        "回复：",
-        "回复:",
-        "好的，用户",
-        "用户发来",
-        "用户可能",
-        "看起来",
-        "我需要",
-        "我应该",
-        "首先",
-        "不过",
-        "另外",
-        "同时",
-        "现在需要",
-        "根据我的知识库",
-        "总结",
-        "总结：",
-        "* ",
-        "- ",
-        "• ",
-        "> ",
-    )
-    if any(candidate.startswith(sample) for candidate in candidates):
-        return True
-    return bool(re.match(r"^\d+[\.\)]?$", sample))
+    return _check_reasoning_line_start(text) == "tentative"
 
 
 def _looks_like_emphasized_reasoning_label(text: str) -> bool:
@@ -1616,135 +1651,107 @@ def _looks_like_emphasized_reasoning_label(text: str) -> bool:
     return any(inner.startswith(marker) for marker in markers)
 
 
-def _looks_like_strong_reasoning_line(text: str) -> bool:
+_STRONG_REASONING_MARKERS = (
+    "usually, this means",
+    "this implies",
+    "user says",
+    "intent is",
+    "response should",
+    "keep it short",
+    "revised plan:",
+    "thinking block:",
+    "thinking:",
+    "user:",
+    "model:",
+    "input:",
+    "language:",
+    "meaning:",
+    "intent:",
+    "final output:",
+    "final answer:",
+    "final choice:",
+    "final decision:",
+    "response:",
+    "answer:",
+    "constraint check:",
+    "thinking block lines:",
+    "actually, looking at",
+    "let's check the system instruction again",
+    "let's check the instruction again",
+    "the instruction says",
+    "let's just respond",
+    "let me think",
+    "my reasoning",
+    "my reasoning:",
+    "the question",
+    "the question/task",
+    "refinement:",
+    "draft:",
+    "review:",
+    "analysis:",
+    "reasoning:",
+    "self-correction:",
+    "wait,",
+    "wait ",
+    "okay,",
+    "okay ",
+    "输入：",
+    "输入:",
+    "最终输出：",
+    "最终输出:",
+    "最终决定：",
+    "最终决定:",
+    "回答：",
+    "回答:",
+    "答案：",
+    "答案:",
+    "回复：",
+    "回复:",
+    "总结：",
+    "总结:",
+    "用户问的是",
+    "用户想",
+    "用户的问题",
+    "用户提出",
+    "用户询问",
+    "这个问题",
+    "这道题",
+    "让我",
+    )
+
+
+def _check_strong_reasoning_line(text: str) -> str | None:
+    """Check if text looks like a strong reasoning line.
+
+    Returns: "definite" / "tentative" / None.
+    """
     sample = text.lstrip()
     if not sample:
-        return False
+        return None
     lowered = sample.lower()
+    # Definite checks (no length limit)
     if _looks_like_meta_reasoning_sentence(sample):
-        return True
+        return "definite"
     if _looks_like_emphasized_reasoning_label(sample):
-        return True
-    markers = (
-        "usually, this means",
-        "this implies",
-        "user says",
-        "intent is",
-        "response should",
-        "keep it short",
-        "revised plan:",
-        "thinking block:",
-        "thinking:",
-        "user:",
-        "model:",
-        "input:",
-        "language:",
-        "meaning:",
-        "intent:",
-        "final output:",
-        "final answer:",
-        "final choice:",
-        "final decision:",
-        "response:",
-        "answer:",
-        "constraint check:",
-        "thinking block lines:",
-        "actually, looking at",
-        "let's check the system instruction again",
-        "let's check the instruction again",
-        "the instruction says",
-        "let's just respond",
-        "refinement:",
-        "draft:",
-        "review:",
-        "analysis:",
-        "reasoning:",
-        "self-correction:",
-        "wait,",
-        "wait ",
-        "okay,",
-        "okay ",
-        "输入：",
-        "输入:",
-        "最终输出：",
-        "最终输出:",
-        "最终决定：",
-        "最终决定:",
-        "回答：",
-        "回答:",
-        "答案：",
-        "答案:",
-        "回复：",
-        "回复:",
-        "总结：",
-        "总结:",
-    )
-    return any(lowered.startswith(marker) for marker in markers)
+        return "definite"
+    if any(lowered.startswith(marker) for marker in _STRONG_REASONING_MARKERS):
+        return "definite"
+    # Tentative checks (with length limit)
+    if len(lowered) > 40:
+        return None
+    if any(candidate.startswith(lowered) for candidate in _META_REASONING_PREFIX_CANDIDATES):
+        return "tentative"
+    if any(candidate.startswith(lowered) for candidate in _STRONG_REASONING_MARKERS):
+        return "tentative"
+    return None
+
+
+def _looks_like_strong_reasoning_line(text: str) -> bool:
+    return _check_strong_reasoning_line(text) == "definite"
 
 
 def _might_be_strong_reasoning_line(text: str) -> bool:
-    sample = text.lstrip().lower()
-    if not sample:
-        return False
-    if len(sample) > 40:
-        return False
-    if any(candidate.startswith(sample) for candidate in _META_REASONING_PREFIX_CANDIDATES):
-        return True
-    candidates = (
-        "usually, this means",
-        "this implies",
-        "user says",
-        "intent is",
-        "response should",
-        "keep it short",
-        "revised plan:",
-        "thinking block:",
-        "thinking:",
-        "user:",
-        "model:",
-        "input:",
-        "language:",
-        "meaning:",
-        "intent:",
-        "final output:",
-        "final answer:",
-        "final choice:",
-        "final decision:",
-        "response:",
-        "answer:",
-        "constraint check:",
-        "thinking block lines:",
-        "actually, looking at",
-        "let's check the system instruction again",
-        "let's check the instruction again",
-        "the instruction says",
-        "let's just respond",
-        "refinement:",
-        "draft:",
-        "review:",
-        "analysis:",
-        "reasoning:",
-        "self-correction:",
-        "wait,",
-        "wait ",
-        "okay,",
-        "okay ",
-        "输入：",
-        "输入:",
-        "最终输出：",
-        "最终输出:",
-        "最终决定：",
-        "最终决定:",
-        "回答：",
-        "回答:",
-        "答案：",
-        "答案:",
-        "回复：",
-        "回复:",
-        "总结：",
-        "总结:",
-    )
-    return any(candidate.startswith(sample) for candidate in candidates)
+    return _check_strong_reasoning_line(text) == "tentative"
 
 
 def _can_start_late_implicit_reasoning(visible_tail: str) -> bool:
@@ -1908,6 +1915,37 @@ def _print_final_body(text: str) -> None:
         stream.flush()
 
 
+def _finalize_output_text(full_text: str, candidate_text: str, parser: _ReasoningParser) -> str:
+    """Determine final visible text after streaming.
+
+    Three paths:
+    1. Explicit tags -> trust separation, minimal cleanup
+    2. Implicit reasoning -> _recover_final_output heuristic
+    3. No reasoning -> _clean_final_output_from_reasoning_leak
+    """
+    if parser.saw_reasoning:
+        if parser.saw_think_tags:
+            result = full_text.strip()
+            if not result:
+                result = (candidate_text or "").strip()
+            if not result:
+                result = _recover_final_output("", parser.reasoning_text)
+            if not result and parser.reasoning_text.strip():
+                # Model put everything inside <think> with no visible answer.
+                # Force-extract: try paragraphs first, then lines.
+                paragraphs = [
+                    p.strip() for p in re.split(r"\n\s*\n", parser.reasoning_text) if p.strip()
+                ]
+                if paragraphs:
+                    result = paragraphs[-1]
+                else:
+                    # Single paragraph — use it directly
+                    result = parser.reasoning_text.strip()
+            return result
+        return _recover_final_output(full_text or candidate_text, parser.reasoning_text)
+    return _clean_final_output_from_reasoning_leak(full_text)
+
+
 def _stream_response(
     model,
     tokenizer,
@@ -1933,7 +1971,29 @@ def _stream_response(
     stream_to_stdout = not err_console.is_terminal
     parser = _ReasoningParser()
     prev_reasoning = False
-    saw_reasoning = False
+    # Check if the chat template already starts the model inside <think>.
+    # Qwen3.5 templates with has_thinking=True append <think>\n to the prompt,
+    # so the model's first generated tokens are reasoning content (no <think> tag).
+    # Pre-initialize the parser in reasoning mode so these tokens are correctly
+    # classified as reasoning instead of leaking to visible text.
+    _prompt_starts_in_think = False
+    if hasattr(tokenizer, "apply_chat_template"):
+        try:
+            _probe = tokenizer.apply_chat_template(
+                [{"role": "user", "content": "x"}],
+                tokenize=False,
+                add_generation_prompt=True,
+                **(chat_template_kwargs or {}),
+            )
+            _prompt_starts_in_think = isinstance(_probe, str) and _probe.rstrip().endswith("<think>")
+        except Exception:
+            pass
+    if _prompt_starts_in_think:
+        parser.saw_reasoning = True
+        parser.saw_think_tags = True
+        parser.in_reasoning = True
+    _had_reasoning = False
+    _reasoning_elapsed = None
 
     with daydreaming_status(err_console, model_label, cli_page_mode=cli_page_mode, draft_active=draft_model is not None) as status:
         for response in engine.generate_stream(
@@ -1948,14 +2008,15 @@ def _stream_response(
             raw_chunk = response.text or ""
             text_chunk, reasoning_chunk, reasoning_closed = parser.feed(raw_chunk)
             entered_reasoning = parser.in_reasoning and not prev_reasoning
-            if reasoning_chunk or entered_reasoning or reasoning_closed or parser.saw_reasoning:
-                saw_reasoning = True
 
-            # Reasoning state transitions → drive the status display
-            if reasoning_chunk and not prev_reasoning and not status.had_reasoning:
-                status.start_reasoning()
+            # Reasoning state transitions → drive the status display.
+            has_real_reasoning = reasoning_chunk and reasoning_chunk.strip()
+            first_reasoning = not status.had_reasoning
             if entered_reasoning:
-                if streamed_output and full_text.strip():
+                # On FIRST reasoning entry: clear echo/preamble that was
+                # already streamed as visible text.
+                # On re-entry: preserve already-streamed answer text.
+                if first_reasoning and streamed_output and full_text.strip():
                     full_text = ""
                     if hasattr(status, "clear_output"):
                         status.clear_output()
@@ -1966,11 +2027,30 @@ def _stream_response(
                             pass
                     streamed_output = False
                 candidate_text = ""
-                if not status.had_reasoning:
-                    status.start_reasoning()
+            # Start reasoning box (only when there's real non-whitespace content)
+            if has_real_reasoning and not status.had_reasoning:
+                status.start_reasoning()
             if reasoning_chunk:
                 status.append_reasoning(reasoning_chunk)
             if reasoning_closed:
+                # Retroactive reasoning: </think> found after visible text
+                # was already streamed (model didn't output <think> first).
+                # Move all streamed visible text into the reasoning box.
+                if streamed_output and not status.had_reasoning and full_text.strip():
+                    status.start_reasoning()
+                    retroactive = full_text.strip()
+                    status.append_reasoning(retroactive)
+                    parser.reasoning_text = retroactive + "\n" + parser.reasoning_text
+                    full_text = ""
+                    candidate_text = ""
+                    if hasattr(status, "clear_output"):
+                        status.clear_output()
+                    elif hasattr(status, "output"):
+                        try:
+                            status.output = ""
+                        except Exception:
+                            pass
+                    streamed_output = False
                 status.end_reasoning()
             prev_reasoning = parser.in_reasoning
 
@@ -1982,8 +2062,8 @@ def _stream_response(
             # - Before any reasoning: stream directly
             # - After reasoning ended (</think> seen): stream directly
             # - During reasoning: buffer in candidate_text
-            reasoning_ended = saw_reasoning and not parser.in_reasoning
-            if text_chunk and (not saw_reasoning or reasoning_ended):
+            reasoning_ended = parser.saw_reasoning and not parser.in_reasoning
+            if text_chunk and (not parser.saw_reasoning or reasoning_ended):
                 if not streamed_output:
                     status.ensure_minimum_wait(0.28)
                     status.update(waiting=False, phase=None)
@@ -1997,7 +2077,7 @@ def _stream_response(
                 if response.generation_tps:
                     status.update(phase=None, tokens_per_second=response.generation_tps)
             elif text_chunk:
-                # Inside reasoning — hold visible text
+                # Inside reasoning or holding for <think> — buffer visible text
                 candidate_text += text_chunk
                 last_response = response
                 if response.generation_tps:
@@ -2008,36 +2088,72 @@ def _stream_response(
             if response.finish_reason:
                 break
 
-    if saw_reasoning:
-        full_text = _recover_final_output(candidate_text or full_text, parser.reasoning_text)
-    else:
-        full_text = _clean_final_output_from_reasoning_leak(full_text)
-    full_text = full_text.lstrip("\n")
-    if status.had_reasoning and full_text:
-        full_text = full_text.rstrip()
+        # Flush remaining parser buffer
+        flush_visible, flush_reasoning, flush_closed = parser.flush()
+        if flush_reasoning:
+            status.append_reasoning(flush_reasoning)
+        if flush_closed and not status.had_reasoning and full_text.strip():
+            # Implicit reasoning consumed everything -> retroactive move
+            status.start_reasoning()
+            status.append_reasoning(full_text.strip())
+            parser.reasoning_text = full_text.strip() + "\n" + parser.reasoning_text
+            full_text = ""
+            candidate_text = ""
+            if hasattr(status, "clear_output"):
+                status.clear_output()
+            streamed_output = False
+            status.end_reasoning()
+        if flush_visible:
+            full_text += flush_visible
+            if not stream_to_stdout:
+                status.append_output(flush_visible)
+            streamed_output = True
 
+        # Ensure reasoning display is properly finalized (handles cases
+        # where <think> was opened but model stopped before </think>).
+        # end_reasoning() is idempotent — safe to call even if already ended.
+        if status.had_reasoning:
+            status.end_reasoning()
+
+        # Pre-compute final text and snapshot status WHILE overlay is still
+        # active, so the teardown→print gap is minimal.
+        full_text = _finalize_output_text(full_text, candidate_text, parser)
+        full_text = full_text.lstrip("\n")
+        if status.had_reasoning and full_text:
+            full_text = full_text.rstrip()
+        _had_reasoning = status.had_reasoning
+        _reasoning_elapsed = status.reasoning_elapsed
+
+    # Overlay is now torn down — print final output immediately.
     if not stream_to_stdout:
-        if status.had_reasoning and status.reasoning_elapsed is not None:
-            err_console.print(render_reasoning_line(status.reasoning_elapsed, active=False))
+        if _had_reasoning and _reasoning_elapsed is not None:
+            err_console.print(render_reasoning_line(_reasoning_elapsed, active=False))
             _print_gap(cli_page_mode)
         if full_text:
             err_console.print(f"[bold cyan]{model_label}[/bold cyan]")
-            _print_final_body(full_text)
+            if streamed_output:
+                # User already saw text stream live — print instantly,
+                # no point re-animating what they already read.
+                err_console.print(full_text, markup=False, highlight=False)
+            else:
+                # Text was extracted from reasoning (never shown live) —
+                # use character animation for a polished reveal.
+                _print_final_body(full_text)
             _print_gap(cli_page_mode)
-        if status.had_reasoning:
+        if _had_reasoning:
             err_console.print("[dim]Use /t to expand reasoning[/dim]")
             _print_gap(cli_page_mode)
 
-    elif full_text and saw_reasoning:
+    elif full_text and parser.saw_reasoning:
         print(full_text)
 
-    if streamed_output and stream_to_stdout and not saw_reasoning:
+    if streamed_output and stream_to_stdout and not parser.saw_reasoning:
         print()
 
     if verbose and last_response:
         _print_stats(last_response)
 
-    return full_text, last_response, parser.reasoning_text, status.reasoning_elapsed
+    return full_text, last_response, parser.reasoning_text, _reasoning_elapsed
 
 
 def _promote_terminal_output_to_scrollback() -> None:

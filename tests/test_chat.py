@@ -729,7 +729,8 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(_effort_chat_template_kwargs("instant", tokenizer), {"enable_thinking": False})
         self.assertEqual(_effort_chat_template_kwargs("short", tokenizer), {"enable_thinking": True, "thinking_budget": 200})
         self.assertEqual(_effort_chat_template_kwargs("long", tokenizer), {"enable_thinking": True, "thinking_budget": 10000})
-        self.assertEqual(_effort_chat_template_kwargs("default", tokenizer), {})
+        # Default effort still enables thinking to ensure <think> tags are produced
+        self.assertEqual(_effort_chat_template_kwargs("default", tokenizer), {"enable_thinking": True, "thinking_budget": 10000})
 
     def test_build_request_messages_includes_effort_system_prompt(self) -> None:
         request = _build_request_messages(
@@ -1324,7 +1325,8 @@ class ChatTests(unittest.TestCase):
             run_chat("foo")
 
         self.assertEqual(len(captured_statuses), 1)
-        self.assertEqual(captured_statuses[0].output, "")
+        # Text after </think> is streamed in real-time via append_output
+        self.assertEqual(captured_statuses[0].output, "Hello from Daydream.")
         printed = " ".join(
             str(call.args[0])
             for call in fake_err_console.print.call_args_list
@@ -1406,7 +1408,8 @@ class ChatTests(unittest.TestCase):
             run_chat("foo")
 
         self.assertEqual(len(captured_statuses), 1)
-        self.assertEqual(captured_statuses[0].output, "")
+        # Text after </think> is streamed in real-time via append_output
+        self.assertEqual(captured_statuses[0].output, "Hello from persistent memory.")
         printed = " ".join(
             str(call.args[0])
             for call in fake_err_console.print.call_args_list
@@ -1721,7 +1724,8 @@ class ChatTests(unittest.TestCase):
             run_chat("foo")
 
         self.assertEqual(len(captured_statuses), 1)
-        self.assertEqual(captured_statuses[0].output, "")
+        # Text after </think> is streamed in real-time via append_output
+        self.assertEqual(captured_statuses[0].output, "First line. Second line.")
         printed = " ".join(
             str(call.args[0])
             for call in fake_err_console.print.call_args_list

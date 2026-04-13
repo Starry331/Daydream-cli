@@ -20,6 +20,7 @@ from daydream.chat import (
     _ReasoningParser,
     _clean_final_output_from_reasoning_leak,
     _extract_answer_labeled_text,
+    _finalize_output_text,
     _recover_final_output,
 )
 from daydream.config import (
@@ -79,12 +80,9 @@ def _finalize_runtime_response_text(
         if content and reasoning.strip().endswith(content):
             reasoning = reasoning[: reasoning.rfind(content)].rstrip()
         return content, reasoning.strip()
-    if parser.saw_reasoning:
-        content = _recover_final_output(candidate_text, parser.reasoning_text)
-        if not content:
-            content = _clean_final_output_from_reasoning_leak(parser.reasoning_text).strip()
-    else:
-        content = _clean_final_output_from_reasoning_leak(candidate_text)
+    content = _finalize_output_text(candidate_text, candidate_text, parser)
+    if not content and parser.saw_reasoning:
+        content = _clean_final_output_from_reasoning_leak(parser.reasoning_text).strip()
     content = content.lstrip("\n")
     if parser.saw_reasoning and content:
         content = content.rstrip()
@@ -405,6 +403,34 @@ def _run_runtime_server(
                     except (BrokenPipeError, ConnectionResetError):
                         return
 
+                    # Flush remaining parser buffer
+                    flush_visible, flush_reasoning, _ = parser.flush()
+                    if flush_visible or flush_reasoning:
+                        flush_delta: dict = {}
+                        if flush_reasoning:
+                            flush_delta["reasoning_content"] = flush_reasoning
+                        if flush_visible:
+                            flush_delta["content"] = flush_visible
+                        if flush_delta:
+                            try:
+                                self._send_sse_chunk(
+                                    {
+                                        "id": "chatcmpl-daydream-stream",
+                                        "object": "chat.completion.chunk",
+                                        "created": 0,
+                                        "model": repo_id,
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": flush_delta,
+                                                "finish_reason": None,
+                                            }
+                                        ],
+                                    }
+                                )
+                            except (BrokenPipeError, ConnectionResetError):
+                                return
+
                     finish_reason = getattr(last_response, "finish_reason", "stop") if last_response else "stop"
                     try:
                         self._send_sse_chunk(
@@ -434,6 +460,11 @@ def _run_runtime_server(
                     text, _, _ = parser.feed(raw_chunk)
                     if text:
                         chunks.append(text)
+
+                # Flush remaining parser buffer
+                flush_visible, _, _ = parser.flush()
+                if flush_visible:
+                    chunks.append(flush_visible)
 
             full_text, reasoning_text = _finalize_runtime_response_text("".join(chunks), parser)
             prompt_tokens = getattr(last_response, "prompt_tokens", 0) or 0
