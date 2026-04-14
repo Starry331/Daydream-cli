@@ -50,12 +50,23 @@ Not supported:
 Interactive installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Starry331/Daydream-cli/main/install.sh -o install.sh
-chmod +x install.sh
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/Starry331/Daydream-cli/main/install.sh -o /tmp/daydream-install.sh
+zsh /tmp/daydream-install.sh
 ```
 
-The installer will clone or update Daydream in `~/Daydream-cli` by default, create a virtual environment, install dependencies, and optionally add `daydream` plus `HF_TOKEN` to your shell profile.
+Run it in macOS Terminal. If the installer seems blank, do not use `sh install.sh` and do not double-click the file in Finder.
+
+The installer will clone or update Daydream in `~/Daydream-cli` by default, create a virtual environment, help you configure `HF_TOKEN` if you want it, optionally add `daydream` to your shell profile, and show a final success screen with next steps.
+
+Hugging Face token inside the installer:
+
+- Open `https://huggingface.co/settings/tokens`
+- Click `New token`
+- Name it something like `daydream-local`
+- For Daydream on a local Mac, choose `read`
+- Paste the generated `hf_...` token back into the installer
+
+Use `read` for normal model downloads and inference. Only use `write` if you need to upload or push to Hugging Face.
 
 Manual install:
 
@@ -659,12 +670,23 @@ README 里大多数模型示例都已经改成 `<模型名>`、`<短名称>` 和
 交互式安装器：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Starry331/Daydream-cli/main/install.sh -o install.sh
-chmod +x install.sh
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/Starry331/Daydream-cli/main/install.sh -o /tmp/daydream-install.sh
+zsh /tmp/daydream-install.sh
 ```
 
-安装器默认会把 Daydream 克隆或更新到 `~/Daydream-cli`，创建虚拟环境，安装依赖，并可选把 `daydream` 和 `HF_TOKEN` 写入你的 shell profile。
+请在 macOS Terminal 里运行。如果看起来“没反应”，不要用 `sh install.sh`，也不要在 Finder 里双击脚本。
+
+安装器默认会把 Daydream 克隆或更新到 `~/Daydream-cli`，创建虚拟环境，按需引导你配置 `HF_TOKEN`，可选把 `daydream` 写入 shell profile，并在安装完成后显示明确的成功提示和下一步命令。
+
+安装器里的 Hugging Face token 配置步骤：
+
+- 打开 `https://huggingface.co/settings/tokens`
+- 点击 `New token`
+- 名称可以填 `daydream-local`
+- 如果看到 `fine-grained / read / write`，Daydream 本地使用请选择 `read`
+- 把生成的 `hf_...` token 粘贴回安装器
+
+日常本地下载和运行模型，用 `read` 就够了。只有在你需要上传或推送到 Hugging Face 时，才需要 `write`。
 
 手动安装：
 
