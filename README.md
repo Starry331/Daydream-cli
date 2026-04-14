@@ -118,6 +118,14 @@ Run a model directly from Hugging Face:
 daydream run hf.co/<modelname>
 ```
 
+<img width="1262" height="385" alt="sample" src="https://github.com/user-attachments/assets/ee815682-075a-491a-93e6-17d235a3899d" />
+
+### Sample
+
+```bash
+daydream run hf.co/mlx-community/Qwen3.5-9B-MLX-4bit
+```
+
 Daydream will:
 
 1. resolve the `hf.co/...` reference
@@ -738,6 +746,14 @@ export HF_TOKEN=你的_huggingface_token
 
 ```bash
 daydream run hf.co/<模型名>
+```
+
+<img width="1262" height="385" alt="sample" src="https://github.com/user-attachments/assets/fbb743d2-73e7-4d46-84f1-409d9f2aefd2" />
+
+### 示例
+
+```bash
+daydream run hf.co/mlx-community/Qwen3.5-9B-MLX-4bit
 ```
 
 Daydream 会自动：
