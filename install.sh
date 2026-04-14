@@ -21,8 +21,11 @@ SHOW_CURSOR=$'\033[?25h'
 INSTALL_DIR="$HOME/Daydream-cli"
 PYTHON_CMD=""
 HF_TOKEN=""
+HF_TOKEN_CONFIGURED=false
 SHELL_INTEGRATE=true
 REPO_URL="https://github.com/Starry331/Daydream-cli.git"
+HF_TOKEN_URL="https://huggingface.co/settings/tokens"
+HF_TOKEN_RECOMMENDED_ROLE="read"
 PYTHON_CANDIDATES=()
 PYTHON_VERSIONS=()
 
@@ -34,6 +37,22 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ── Utility functions ─────────────────────────────────────────────────
+ensure_interactive_terminal() {
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        print ""
+        print "  ${RED}${BOLD}This installer needs an interactive Terminal window.${RESET}"
+        print ""
+        print "  ${DIM}Run it like this:${RESET}"
+        print ""
+        print "    ${BOLD}curl -fsSL https://raw.githubusercontent.com/Starry331/Daydream-cli/main/install.sh -o /tmp/daydream-install.sh${RESET}"
+        print "    ${BOLD}zsh /tmp/daydream-install.sh${RESET}"
+        print ""
+        print "  ${DIM}Do not run it with sh or by piping it into another shell.${RESET}"
+        print ""
+        exit 1
+    fi
+}
+
 print_step() {
     print "  ${GREEN}✓${RESET} $1"
 }
@@ -170,6 +189,45 @@ secret_input() {
     read -rs input
     print ""
     SECRET_RESULT="$input"
+}
+
+show_hf_token_setup_guide() {
+    print "  ${BOLD}How to get a Hugging Face token${RESET}"
+    print "  ${DIM}1. Open: ${HF_TOKEN_URL}${RESET}"
+    print "  ${DIM}2. Click: New token${RESET}"
+    print "  ${DIM}3. Name it something like: daydream-local${RESET}"
+    print "  ${DIM}4. If you see fine-grained / read / write, choose: ${HF_TOKEN_RECOMMENDED_ROLE}${RESET}"
+    print "  ${DIM}   Use ${HF_TOKEN_RECOMMENDED_ROLE} for normal local downloads and inference.${RESET}"
+    print "  ${DIM}   Only choose write if you need to upload or push to Hugging Face.${RESET}"
+    print "  ${DIM}5. Copy the token that starts with hf_${RESET}"
+}
+
+prompt_for_hf_token() {
+    while true; do
+        secret_input "Paste your token (hidden, press Enter to skip)"
+        HF_TOKEN="$SECRET_RESULT"
+
+        if [[ -z "$HF_TOKEN" ]]; then
+            print_info "Skipped — no token entered"
+            return 0
+        fi
+
+        HF_TOKEN_CONFIGURED=true
+        if [[ "$HF_TOKEN" == hf_* ]]; then
+            print_step "Token saved (will be added to shell profile)"
+            return 0
+        fi
+
+        print_warn "This token does not start with hf_"
+        if confirm "Keep it anyway?" "n"; then
+            print_step "Token saved (will be added to shell profile)"
+            return 0
+        fi
+
+        HF_TOKEN=""
+        HF_TOKEN_CONFIGURED=false
+        print ""
+    done
 }
 
 # ── Yes/No confirm ───────────────────────────────────────────────────
@@ -356,23 +414,24 @@ configure() {
     # ── HF Token ──────────────────────────────────────────────────
     print "  ${BOLD}Hugging Face Token${RESET}  ${DIM}(optional)${RESET}"
     print "  ${DIM}Higher rate limits & faster model downloads.${RESET}"
-    print "  ${DIM}Get a free token: https://huggingface.co/settings/tokens${RESET}"
+    print "  ${DIM}Token page: ${HF_TOKEN_URL}${RESET}"
+    print "  ${DIM}Recommended role for Daydream: ${HF_TOKEN_RECOMMENDED_ROLE}${RESET}"
     print ""
 
     if [[ -n "${HF_TOKEN:-}" ]] || [[ -n "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
         print_step "HF_TOKEN already set in environment"
+        print_info "Using the existing token from your environment"
+        HF_TOKEN_CONFIGURED=true
         HF_TOKEN=""  # don't overwrite
     else
-        if confirm "Set up HF_TOKEN?" "n"; then
-            secret_input "Paste your token (hidden)"
-            HF_TOKEN="$SECRET_RESULT"
-            if [[ -n "$HF_TOKEN" ]]; then
-                print_step "Token saved (will be added to shell profile)"
-            else
-                print_info "Skipped — no token entered"
-            fi
+        if confirm "Set up HF_TOKEN now?" "n"; then
+            print ""
+            show_hf_token_setup_guide
+            print ""
+            prompt_for_hf_token
         else
-            print_info "Skipped — you can set it later with: export HF_TOKEN=your_token"
+            print_info "Skipped — you can set it later from: ${HF_TOKEN_URL}"
+            print_info "For Daydream on a local Mac, choose: ${HF_TOKEN_RECOMMENDED_ROLE}"
         fi
     fi
     print ""
@@ -402,8 +461,12 @@ show_summary() {
     print ""
     print "  ${CYAN}Location${RESET}       ${INSTALL_DIR}"
     print "  ${CYAN}Python${RESET}         ${PYTHON_CMD}"
-    if [[ -n "$HF_TOKEN" ]]; then
-        print "  ${CYAN}HF Token${RESET}       hf_****${HF_TOKEN: -4}"
+    if [[ "$HF_TOKEN_CONFIGURED" == true ]]; then
+        if [[ -n "$HF_TOKEN" ]]; then
+            print "  ${CYAN}HF Token${RESET}       hf_****${HF_TOKEN: -4}"
+        else
+            print "  ${CYAN}HF Token${RESET}       ${DIM}already set in environment${RESET}"
+        fi
     else
         print "  ${CYAN}HF Token${RESET}       ${DIM}not set${RESET}"
     fi
@@ -555,6 +618,18 @@ run_install() {
     print ""
     print "  ${GREEN}${BOLD}Installation complete!${RESET}"
     print ""
+    print "  ${CYAN}Install location${RESET}  ${INSTALL_DIR}"
+    print "  ${CYAN}CLI command${RESET}       ${DAYDREAM_CMD}"
+    if [[ "$HF_TOKEN_CONFIGURED" == true ]]; then
+        if [[ -n "$HF_TOKEN" ]]; then
+            print "  ${CYAN}HF Token${RESET}          ${DIM}saved to your shell profile${RESET}"
+        else
+            print "  ${CYAN}HF Token${RESET}          ${DIM}already available in your environment${RESET}"
+        fi
+    else
+        print "  ${CYAN}HF Token${RESET}          ${DIM}not set${RESET}"
+    fi
+    print ""
 
     if [[ "$WROTE_PROFILE" == true ]]; then
         print "  ${YELLOW}→${RESET} Restart your terminal or run:"
@@ -589,6 +664,13 @@ run_install() {
         print "  ${WHITE}${DAYDREAM_BIN}/daydream run qwen3${RESET}"
     fi
 
+    if [[ "$HF_TOKEN_CONFIGURED" == false ]]; then
+        print ""
+        print "  ${YELLOW}Optional: add a Hugging Face token later${RESET}"
+        print "  ${DIM}${HF_TOKEN_URL}${RESET}"
+        print "  ${DIM}Choose ${HF_TOKEN_RECOMMENDED_ROLE} for local downloads and inference.${RESET}"
+    fi
+
     print ""
     print "  ${DIM}Documentation: https://github.com/Starry331/Daydream-cli${RESET}"
     print "  ${DIM}Need help?     daydream --help${RESET}"
@@ -599,6 +681,7 @@ run_install() {
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════
 main() {
+    ensure_interactive_terminal
     clear
     show_banner
     check_system
