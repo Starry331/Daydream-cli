@@ -672,8 +672,9 @@ run_install() {
 
     # ── 4. Install Daydream CLI ───────────────────────────────────
     print_info "Installing Daydream CLI and dependencies. This may take a while."
-    print_info "Live spinner disabled here to avoid terminal repaint issues."
-    if "$PIP" install -e "$INSTALL_DIR" > /tmp/daydream-install.log 2>&1; then
+    print_info "Streaming install output below."
+    print ""
+    if run_streaming_step /tmp/daydream-install.log "$PIP" install -e "$INSTALL_DIR"; then
         print_step "Daydream CLI installed"
     else
         print_fail "Failed to install Daydream CLI"
