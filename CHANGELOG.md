@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.1.8
+
+### Added
+
+- Installer now supports optional guided model download during setup and can launch the downloaded model immediately after installation.
+
+### Changed
+
+- Improved installer UX with cleaner step execution, better menu handling, and clearer prompts for token setup and model selection.
+- Repository setup, dependency install, and model download steps now stream output more predictably during installation.
+
+### Fixed
+
+- Reduced installer shell noise by disabling shell trace/verbose output during setup.
+- Improved installer menu cleanup and cursor restoration so interactive screens leave the terminal in a cleaner state.
+
 ## v0.1.7
 
 ### Added
