@@ -35,9 +35,14 @@ MODEL_DOWNLOAD_COMPLETED=false
 MODEL_DOWNLOAD_FAILED=false
 PYTHON_CANDIDATES=()
 PYTHON_VERSIONS=()
+MENU_ALT_ACTIVE=false
+MENU_ALT_LEAVE=""
 
 # ── Cleanup trap ──────────────────────────────────────────────────────
 cleanup() {
+    if [[ "$MENU_ALT_ACTIVE" == true ]] && [[ -n "$MENU_ALT_LEAVE" ]]; then
+        print -n "$MENU_ALT_LEAVE"
+    fi
     print -n "${SHOW_CURSOR}"
     stty sane 2>/dev/null || true
 }
@@ -114,9 +119,17 @@ menu_select() {
     local options=("$@")
     local selected=1  # zsh 1-indexed
     local total=${#options[@]}
-    local menu_height=$(( total + 4 ))
+    local enter_alt leave_alt move_home clear_to_end hide_cursor show_cursor
+
+    enter_alt=$(tput smcup 2>/dev/null || printf '\033[?1049h')
+    leave_alt=$(tput rmcup 2>/dev/null || printf '\033[?1049l')
+    move_home=$(tput home 2>/dev/null || printf '\033[H')
+    clear_to_end=$(tput ed 2>/dev/null || printf '\033[J')
+    hide_cursor=$(tput civis 2>/dev/null || printf '%s' "${HIDE_CURSOR}")
+    show_cursor=$(tput cnorm 2>/dev/null || printf '%s' "${SHOW_CURSOR}")
 
     _menu_draw() {
+        printf '%s%s' "$move_home" "$clear_to_end"
         print "  ${BOLD}${title}${RESET}"
         print ""
         local i
@@ -131,7 +144,9 @@ menu_select() {
         print "  ${DIM}↑/↓ move  Enter confirm${RESET}"
     }
 
-    print -n "${HIDE_CURSOR}"
+    MENU_ALT_ACTIVE=true
+    MENU_ALT_LEAVE="$leave_alt"
+    printf '%s%s' "$hide_cursor" "$enter_alt"
     _menu_draw
     while true; do
         local key
@@ -146,20 +161,21 @@ menu_select() {
                 esac
                 ;;
             $'\n'|$'\r')
-                clear_lines "$menu_height"
-                print -n "${SHOW_CURSOR}"
+                MENU_ALT_ACTIVE=false
+                MENU_ALT_LEAVE=""
+                printf '%s%s' "$leave_alt" "$show_cursor"
                 print "  ${GREEN}✓${RESET} ${BOLD}${title}${RESET}  ${DIM}${options[$selected]}${RESET}"
                 MENU_RESULT=$(( selected - 1 ))  # convert to 0-indexed for array access later
                 return 0
                 ;;
             $'\x03')
-                clear_lines "$menu_height"
-                print -n "${SHOW_CURSOR}"
+                MENU_ALT_ACTIVE=false
+                MENU_ALT_LEAVE=""
+                printf '%s%s' "$leave_alt" "$show_cursor"
                 print ""
                 exit 1
                 ;;
         esac
-        clear_lines "$menu_height"
         _menu_draw
     done
 }
