@@ -116,7 +116,6 @@ Run a model directly from Hugging Face:
 daydream run hf.co/<modelname>
 ```
 <img width="1262" height="385" alt="sample" src="https://github.com/user-attachments/assets/ee815682-075a-491a-93e6-17d235a3899d" />
-<img width="1262" height="385" alt="sample" src="https://github.com/user-attachments/assets/b561ec15-eed2-4b4c-9968-0915b7d2ad5c" />
 
 Daydream will:
 
