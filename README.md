@@ -47,6 +47,18 @@ Not supported:
 
 ## Installation
 
+Interactive installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Starry331/Daydream-cli/main/install.sh -o install.sh
+chmod +x install.sh
+./install.sh
+```
+
+The installer will clone or update Daydream in `~/Daydream-cli` by default, create a virtual environment, install dependencies, and optionally add `daydream` plus `HF_TOKEN` to your shell profile.
+
+Manual install:
+
 Clone the repo:
 
 ```bash
@@ -643,6 +655,18 @@ README 里大多数模型示例都已经改成 `<模型名>`、`<短名称>` 和
 - 未量化的 MLX 模型仓库
 
 ### 安装
+
+交互式安装器：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Starry331/Daydream-cli/main/install.sh -o install.sh
+chmod +x install.sh
+./install.sh
+```
+
+安装器默认会把 Daydream 克隆或更新到 `~/Daydream-cli`，创建虚拟环境，安装依赖，并可选把 `daydream` 和 `HF_TOKEN` 写入你的 shell profile。
+
+手动安装：
 
 克隆仓库：
 
