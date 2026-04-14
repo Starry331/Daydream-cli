@@ -38,6 +38,7 @@ from daydream.registry import (
 from daydream.utils import terminal_title_status
 
 console = Console()
+progress_console = Console(stderr=True)
 
 # Same file patterns mlx-lm uses for downloads
 MODEL_FILE_PATTERNS = [
@@ -155,6 +156,34 @@ def _read_config_json(model_path: Path) -> dict:
     with config_path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
     return data if isinstance(data, dict) else {}
+
+
+def _model_dir_looks_incomplete(path: Path) -> bool:
+    path = path.expanduser()
+    if not path.exists() or not path.is_dir():
+        return False
+
+    if (path / "daydream_fixture.json").exists():
+        return False
+
+    # Partially downloaded Hugging Face snapshots commonly miss one of the
+    # required MLX files or leave config.json truncated.
+    if not is_local_model_dir(path):
+        return True
+
+    try:
+        _read_config_json(path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return True
+
+    return False
+
+
+def _cached_repo_needs_resume(repo_id: str) -> bool:
+    model_path = _get_model_path(repo_id)
+    if model_path is None:
+        return False
+    return _model_dir_looks_incomplete(model_path)
 
 
 def _is_quantized_config(config: dict) -> bool:
@@ -303,26 +332,54 @@ def pull_model(name: str, *, register_alias: bool = False) -> None:
     total_bytes = _estimate_download_bytes(repo_id)
     download_total = total_bytes if total_bytes and total_bytes > 0 else None
 
+    use_live_progress = bool(progress_console.is_terminal and getattr(progress_console.file, "isatty", lambda: False)())
     with terminal_title_status(f"Downloading {short}"):
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}", style="dim"),
-            BarColumn(bar_width=24, complete_style="cyan", finished_style="dim", pulse_style="grey37"),
-            TaskProgressColumn(text_format="[progress.percentage]{task.percentage:>3.0f}%"),
-            DownloadColumn(binary_units=True),
-            TransferSpeedColumn(),
-            TimeElapsedColumn(),
-            console=console,
-            transient=True,
-        ) as progress:
-            task = progress.add_task("Downloading model", total=download_total, completed=0)
-            stop_event = threading.Event()
-            watcher = threading.Thread(
-                target=_watch_downloaded_bytes,
-                args=(progress, task, storage_dir, initial_bytes, download_total, stop_event),
-                daemon=True,
-            )
-            watcher.start()
+        if use_live_progress:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}", style="dim"),
+                BarColumn(bar_width=24, complete_style="cyan", finished_style="dim", pulse_style="grey37"),
+                TaskProgressColumn(text_format="[progress.percentage]{task.percentage:>3.0f}%"),
+                DownloadColumn(binary_units=True),
+                TransferSpeedColumn(),
+                TimeElapsedColumn(),
+                console=progress_console,
+                transient=True,
+            ) as progress:
+                task = progress.add_task("Downloading model", total=download_total, completed=0)
+                stop_event = threading.Event()
+                watcher = threading.Thread(
+                    target=_watch_downloaded_bytes,
+                    args=(progress, task, storage_dir, initial_bytes, download_total, stop_event),
+                    daemon=True,
+                )
+                watcher.start()
+                try:
+                    path = snapshot_download(
+                        repo_id,
+                        allow_patterns=MODEL_FILE_PATTERNS,
+                        cache_dir=str(MODEL_CACHE_DIR),
+                    )
+                except Exception as e:
+                    stop_event.set()
+                    watcher.join(timeout=0.2)
+                    path = _install_fixture_model(repo_id)
+                    if path is None:
+                        console.print(f"[red]Error:[/] {e}")
+                        _print_hf_token_hint(e)
+                        raise SystemExit(1)
+                    progress.update(task, description="Installed offline fixture")
+                    console.print("[yellow]Hub unavailable.[/] Installed local offline fixture for testing.")
+                else:
+                    stop_event.set()
+                    watcher.join(timeout=0.2)
+                    final_completed = download_total
+                    if final_completed is None:
+                        current_bytes = _dir_size(storage_dir) if storage_dir.exists() else initial_bytes
+                        final_completed = max(0, current_bytes - initial_bytes)
+                    progress.update(task, completed=final_completed, total=final_completed or 1, description="Download complete")
+        else:
+            console.print(f"[dim]Downloading {short}...[/dim]")
             try:
                 path = snapshot_download(
                     repo_id,
@@ -330,23 +387,12 @@ def pull_model(name: str, *, register_alias: bool = False) -> None:
                     cache_dir=str(MODEL_CACHE_DIR),
                 )
             except Exception as e:
-                stop_event.set()
-                watcher.join(timeout=0.2)
                 path = _install_fixture_model(repo_id)
                 if path is None:
                     console.print(f"[red]Error:[/] {e}")
                     _print_hf_token_hint(e)
                     raise SystemExit(1)
-                progress.update(task, description="Installed offline fixture")
                 console.print("[yellow]Hub unavailable.[/] Installed local offline fixture for testing.")
-            else:
-                stop_event.set()
-                watcher.join(timeout=0.2)
-                final_completed = download_total
-                if final_completed is None:
-                    current_bytes = _dir_size(storage_dir) if storage_dir.exists() else initial_bytes
-                    final_completed = max(0, current_bytes - initial_bytes)
-                progress.update(task, completed=final_completed, total=final_completed or 1, description="Download complete")
 
     validate_runtime_model(repo_id, source_name=short)
 
@@ -370,7 +416,11 @@ def ensure_runtime_model(name: str, *, auto_pull: bool = False, register_alias: 
         return resolved
 
     repo_id = resolved
-    if _get_model_path(repo_id) is None:
+    needs_pull = _get_model_path(repo_id) is None
+    if not needs_pull and auto_pull and _cached_repo_needs_resume(repo_id):
+        needs_pull = True
+
+    if needs_pull:
         if not auto_pull:
             return repo_id
         pull_model(repo_id, register_alias=register_alias)

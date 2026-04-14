@@ -122,6 +122,75 @@ class AutoPullTests(unittest.TestCase):
                             register_alias=True,
                         )
 
+    def test_ensure_runtime_model_resumes_incomplete_cached_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            cache = Path(tmpdir) / "cache"
+            partial = Path(tmpdir) / "partial"
+            full = Path(tmpdir) / "full"
+
+            partial.mkdir(parents=True, exist_ok=True)
+            (partial / "config.json").write_text(json.dumps({"model_type": "qwen"}), encoding="utf-8")
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "DAYDREAM_HOME": str(home),
+                    "DAYDREAM_CACHE_DIR": str(cache),
+                },
+                clear=False,
+            ):
+                reload_module("daydream.config")
+                reload_module("daydream.registry")
+                models = reload_module("daydream.models")
+
+                state = {"downloaded": False}
+
+                def fake_get_model_path(repo_id):
+                    return full if state["downloaded"] else partial
+
+                def fake_pull_model(repo_id, *, register_alias=False):
+                    write_remote_cache_model(full, quantized=True)
+                    state["downloaded"] = True
+
+                with mock.patch.object(models, "_get_model_path", side_effect=fake_get_model_path), \
+                    mock.patch.object(models, "pull_model", side_effect=fake_pull_model) as pull_model:
+                    resolved = models.ensure_runtime_model(
+                        "hf.co/acme/Qwen3.5-27B-MLX-4bit",
+                        auto_pull=True,
+                        register_alias=False,
+                    )
+
+                self.assertEqual(resolved, "acme/Qwen3.5-27B-MLX-4bit")
+                pull_model.assert_called_once_with("acme/Qwen3.5-27B-MLX-4bit", register_alias=False)
+
+    def test_ensure_runtime_model_does_not_retry_incomplete_local_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            cache = Path(tmpdir) / "cache"
+            local_model = Path(tmpdir) / "local-model"
+
+            local_model.mkdir(parents=True, exist_ok=True)
+            (local_model / "config.json").write_text(json.dumps({"model_type": "qwen"}), encoding="utf-8")
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "DAYDREAM_HOME": str(home),
+                    "DAYDREAM_CACHE_DIR": str(cache),
+                },
+                clear=False,
+            ):
+                reload_module("daydream.config")
+                reload_module("daydream.registry")
+                models = reload_module("daydream.models")
+
+                with mock.patch.object(models, "pull_model") as pull_model:
+                    with self.assertRaisesRegex(ValueError, "Not a valid local MLX model directory"):
+                        models.ensure_runtime_model(str(local_model), auto_pull=True, register_alias=False)
+
+                pull_model.assert_not_called()
+
     def test_ensure_runtime_model_rejects_gguf_early(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir) / "home"
