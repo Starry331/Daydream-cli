@@ -81,24 +81,25 @@ print_info() {
     print "  ${DIM}$1${RESET}"
 }
 
-# Spinner for long operations
-spinner() {
-    local pid=$1
-    local msg=$2
-    local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-    local i=1
-    local nframes=${#frames[@]}
-    print -n "${HIDE_CURSOR}"
-    while kill -0 "$pid" 2>/dev/null; do
-        print -n "\r  ${CYAN}${frames[$i]}${RESET} ${DIM}${msg}${RESET}  "
-        i=$(( i % nframes + 1 ))
-        sleep 0.08
-    done
-    wait "$pid" 2>/dev/null
-    local exit_code=$?
-    print -n "\r\033[K"
-    print -n "${SHOW_CURSOR}"
-    return $exit_code
+run_quiet_step() {
+    local start_msg=$1
+    shift
+    print_info "$start_msg"
+    "$@" > /tmp/daydream-install.log 2>&1
+}
+
+run_streaming_step() {
+    local log_file=$1
+    shift
+
+    : > "$log_file"
+    if command -v script >/dev/null 2>&1; then
+        script -q "$log_file" "$@"
+        return $?
+    fi
+
+    "$@" 2>&1 | tee "$log_file"
+    return ${pipestatus[1]:-0}
 }
 
 # Clear N lines above cursor
@@ -627,9 +628,7 @@ run_install() {
 
     # ── 1. Clone or update repo ───────────────────────────────────
     if [[ -d "$INSTALL_DIR/.git" ]]; then
-        print "  ${DIM}Repository already exists, updating...${RESET}"
-        ( cd "$INSTALL_DIR" && git pull --ff-only ) > /tmp/daydream-install.log 2>&1 &
-        if spinner $! "Updating repository"; then
+        if run_quiet_step "Updating existing repository..." git -C "$INSTALL_DIR" pull --ff-only; then
             print_step "Repository updated"
         else
             print_warn "Update failed, continuing with existing code"
@@ -639,8 +638,7 @@ run_install() {
         print "  ${DIM}Please remove it or choose a different location.${RESET}"
         exit 1
     else
-        git clone "$REPO_URL" "$INSTALL_DIR" > /tmp/daydream-install.log 2>&1 &
-        if spinner $! "Cloning repository"; then
+        if run_quiet_step "Cloning repository..." git clone "$REPO_URL" "$INSTALL_DIR"; then
             print_step "Repository cloned"
         else
             print_fail "Failed to clone repository"
@@ -654,8 +652,7 @@ run_install() {
     if [[ -d "$INSTALL_DIR/.venv" ]]; then
         print_step "Virtual environment already exists"
     else
-        "$PYTHON_CMD" -m venv "$INSTALL_DIR/.venv" > /tmp/daydream-install.log 2>&1 &
-        if spinner $! "Creating virtual environment"; then
+        if run_quiet_step "Creating virtual environment..." "$PYTHON_CMD" -m venv "$INSTALL_DIR/.venv"; then
             print_step "Virtual environment created"
         else
             print_fail "Failed to create virtual environment"
@@ -667,16 +664,16 @@ run_install() {
     local PIP="$INSTALL_DIR/.venv/bin/pip"
 
     # ── 3. Upgrade pip, setuptools, wheel ─────────────────────────
-    "$PIP" install -U pip setuptools wheel > /tmp/daydream-install.log 2>&1 &
-    if spinner $! "Upgrading pip, setuptools, wheel"; then
+    if run_quiet_step "Upgrading pip, setuptools, wheel..." "$PIP" install -U pip setuptools wheel; then
         print_step "Build tools upgraded"
     else
         print_warn "Failed to upgrade build tools, continuing..."
     fi
 
     # ── 4. Install Daydream CLI ───────────────────────────────────
-    "$PIP" install -e "$INSTALL_DIR" > /tmp/daydream-install.log 2>&1 &
-    if spinner $! "Installing Daydream CLI and dependencies (this may take a while)"; then
+    print_info "Installing Daydream CLI and dependencies. This may take a while."
+    print_info "Live spinner disabled here to avoid terminal repaint issues."
+    if "$PIP" install -e "$INSTALL_DIR" > /tmp/daydream-install.log 2>&1; then
         print_step "Daydream CLI installed"
     else
         print_fail "Failed to install Daydream CLI"
@@ -749,8 +746,9 @@ run_install() {
         print ""
         print "  ${BOLD}Optional Model Download${RESET}"
         print "  ${DIM}Only quantized MLX models are supported.${RESET}"
-        "$DAYDREAM_CMD" pull "$MODEL_TO_PULL" > /tmp/daydream-install.log 2>&1 &
-        if spinner $! "Downloading ${MODEL_TO_PULL}"; then
+        print "  ${DIM}Streaming download progress below...${RESET}"
+        print ""
+        if run_streaming_step /tmp/daydream-install.log "$DAYDREAM_CMD" pull "$MODEL_TO_PULL"; then
             MODEL_DOWNLOAD_COMPLETED=true
             print_step "Model downloaded: ${MODEL_TO_PULL}"
         else
