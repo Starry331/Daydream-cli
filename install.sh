@@ -98,37 +98,57 @@ clear_lines() {
     done
 }
 
-# ── Numbered selection menu ──────────────────────────────────────────
+# ── Arrow-key interactive menu ───────────────────────────────────────
 # Sets global MENU_RESULT to the selected index
 menu_select() {
     local title=$1
     shift
     local options=("$@")
+    local selected=1  # zsh 1-indexed
     local total=${#options[@]}
 
-    while true; do
+    _menu_draw() {
+        print -n "\0338\033[J"
         print "  ${BOLD}${title}${RESET}"
-        print "  ${DIM}Type a number and press Enter.${RESET}"
         print ""
-
         local i
         for (( i = 1; i <= total; i++ )); do
-            print "  ${CYAN}${i})${RESET} ${options[$i]}"
+            if [[ $i -eq $selected ]]; then
+                print "  ${BOLD}${CYAN}> ${options[$i]}${RESET}"
+            else
+                print "    ${DIM}${options[$i]}${RESET}"
+            fi
         done
-
         print ""
-        print -n "  ${BOLD}Choice${RESET} ${DIM}[1-${total}]${RESET}: "
-        local input
-        read -r input
+        print "  ${DIM}↑/↓ move  Enter confirm${RESET}"
+    }
 
-        if [[ "$input" == <-> ]] && (( input >= 1 && input <= total )); then
-            MENU_RESULT=$(( input - 1 ))
-            print "  ${GREEN}✓${RESET} ${BOLD}${title}${RESET}  ${DIM}${options[$input]}${RESET}"
-            return 0
-        fi
-
-        print_warn "Enter a number between 1 and ${total}"
-        print ""
+    print -n "${HIDE_CURSOR}\0337"
+    while true; do
+        _menu_draw
+        local key
+        read -rsk1 key
+        case "$key" in
+            $'\e')
+                local seq=""
+                read -rsk2 seq
+                case "$seq" in
+                    '[A') selected=$(( (selected - 2 + total) % total + 1 )) ;;
+                    '[B') selected=$(( selected % total + 1 )) ;;
+                esac
+                ;;
+            $'\n'|$'\r')
+                print -n "\0338\033[J${SHOW_CURSOR}"
+                print "  ${GREEN}✓${RESET} ${BOLD}${title}${RESET}  ${DIM}${options[$selected]}${RESET}"
+                MENU_RESULT=$(( selected - 1 ))  # convert to 0-indexed for array access later
+                return 0
+                ;;
+            $'\x03')
+                print -n "\0338\033[J${SHOW_CURSOR}"
+                print ""
+                exit 1
+                ;;
+        esac
     done
 }
 
@@ -180,8 +200,8 @@ show_hf_token_setup_guide() {
 
 prompt_for_hf_token() {
     while true; do
-        secret_input "Paste your token (hidden, press Enter to skip)"
-        HF_TOKEN="$SECRET_RESULT"
+        text_input "Paste your token (press Enter to skip)" ""
+        HF_TOKEN="$INPUT_RESULT"
 
         if [[ -z "$HF_TOKEN" ]]; then
             print_info "Skipped — no token entered"
@@ -401,15 +421,28 @@ configure() {
         HF_TOKEN_CONFIGURED=true
         HF_TOKEN=""  # don't overwrite
     else
-        if confirm "Set up HF_TOKEN now?" "n"; then
-            print ""
-            show_hf_token_setup_guide
-            print ""
-            prompt_for_hf_token
-        else
-            print_info "Skipped — you can set it later from: ${HF_TOKEN_URL}"
-            print_info "For Daydream on a local Mac, choose: ${HF_TOKEN_RECOMMENDED_ROLE}"
-        fi
+        local hf_menu_items=(
+            "I already have a token  —  paste it now"
+            "I need help getting a token  —  show the tutorial first"
+            "Skip for now"
+        )
+        menu_select "HF token setup" "${hf_menu_items[@]}"
+        case "$MENU_RESULT" in
+            0)
+                print ""
+                prompt_for_hf_token
+                ;;
+            1)
+                print ""
+                show_hf_token_setup_guide
+                print ""
+                prompt_for_hf_token
+                ;;
+            *)
+                print_info "Skipped — you can set it later from: ${HF_TOKEN_URL}"
+                print_info "For Daydream on a local Mac, choose: ${HF_TOKEN_RECOMMENDED_ROLE}"
+                ;;
+        esac
     fi
     print ""
 
