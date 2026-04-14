@@ -980,6 +980,10 @@ daydream serve --model hf.co/mlx-community/SmolLM2-135M-Instruct-4bit
 - API Key：`daydream-local`
 - Model：优先填写 `daydream ps` 或 `GET /v1/models` 返回的完整 repo ID
 
+如果你是在 Hugging Face 模型页里手动复制模型名，就点仓库名右侧的复制按钮，把完整 repo ID 粘贴到 `Model` 字段里：
+
+![How to copy the Hugging Face model repo ID](docs/images/model-repo-id-copy-guide.svg)
+
 4. 保存后做一次测试对话。
 
 注意：
