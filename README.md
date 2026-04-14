@@ -58,6 +58,8 @@ Run it in macOS Terminal. If the installer seems blank, do not use `sh install.s
 
 The installer will clone or update Daydream in `~/Daydream-cli` by default, create a virtual environment, help you configure `HF_TOKEN` if you want it, optionally add `daydream` to your shell profile, and show a final success screen with next steps.
 
+The installer can also optionally help you download your first model. Paste a full Hugging Face repo ID such as `mlx-community/Qwen3.5-9B-MLX-4bit`, an `hf.co/...` ref, or the model page URL. Daydream only supports quantized MLX models here, not GGUF repos or non-quantized MLX repos. If you choose a model during install, the installer will download it and then launch `daydream run` for that model automatically.
+
 Hugging Face token inside the installer:
 
 - Open `https://huggingface.co/settings/tokens`
@@ -114,13 +116,6 @@ Run a model directly from Hugging Face:
 
 ```bash
 daydream run hf.co/<modelname>
-```
-<img width="1262" height="385" alt="sample" src="https://github.com/user-attachments/assets/ee815682-075a-491a-93e6-17d235a3899d" />
-
-### Sample
-
-```bash
-daydream run hf.co/mlx-community/Qwen3.5-9B-MLX-4bit
 ```
 
 Daydream will:
@@ -685,6 +680,8 @@ zsh /tmp/daydream-install.sh
 
 安装器默认会把 Daydream 克隆或更新到 `~/Daydream-cli`，创建虚拟环境，按需引导你配置 `HF_TOKEN`，可选把 `daydream` 写入 shell profile，并在安装完成后显示明确的成功提示和下一步命令。
 
+安装器也可以可选帮你下载第一个模型。你只要粘贴完整的 Hugging Face repo ID，例如 `mlx-community/Qwen3.5-9B-MLX-4bit`，或者粘贴 `hf.co/...` 引用、模型页网址都可以。这里明确只支持量化过的 MLX 模型，不支持 GGUF，也不支持未量化的 MLX 仓库。如果你在安装时选了模型，安装器会先下载它，然后自动执行一次 `daydream run` 直接启动。
+
 安装器里的 Hugging Face token 配置步骤：
 
 - 打开 `https://huggingface.co/settings/tokens`
@@ -741,13 +738,6 @@ export HF_TOKEN=你的_huggingface_token
 
 ```bash
 daydream run hf.co/<模型名>
-```
-<img width="1262" height="385" alt="sample" src="https://github.com/user-attachments/assets/fbb743d2-73e7-4d46-84f1-409d9f2aefd2" />
-
-### 示例
-
-```bash
-daydream run hf.co/mlx-community/Qwen3.5-9B-MLX-4bit
 ```
 
 Daydream 会自动：
