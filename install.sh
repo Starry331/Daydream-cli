@@ -98,61 +98,37 @@ clear_lines() {
     done
 }
 
-# ── Arrow-key interactive menu ───────────────────────────────────────
+# ── Numbered selection menu ──────────────────────────────────────────
 # Sets global MENU_RESULT to the selected index
 menu_select() {
     local title=$1
     shift
     local options=("$@")
-    local selected=1  # zsh 1-indexed
     local total=${#options[@]}
 
-    _menu_draw() {
+    while true; do
         print "  ${BOLD}${title}${RESET}"
+        print "  ${DIM}Type a number and press Enter.${RESET}"
         print ""
+
         local i
         for (( i = 1; i <= total; i++ )); do
-            if [[ $i -eq $selected ]]; then
-                print "  ${BOLD}${CYAN}> ${options[$i]}${RESET}"
-            else
-                print "    ${DIM}${options[$i]}${RESET}"
-            fi
+            print "  ${CYAN}${i})${RESET} ${options[$i]}"
         done
+
         print ""
-        print "  ${DIM}↑/↓ move  Enter confirm${RESET}"
-    }
+        print -n "  ${BOLD}Choice${RESET} ${DIM}[1-${total}]${RESET}: "
+        local input
+        read -r input
 
-    print -n "${HIDE_CURSOR}"
-    _menu_draw
-    local draw_lines=$(( total + 4 ))
+        if [[ "$input" == <-> ]] && (( input >= 1 && input <= total )); then
+            MENU_RESULT=$(( input - 1 ))
+            print "  ${GREEN}✓${RESET} ${BOLD}${title}${RESET}  ${DIM}${options[$input]}${RESET}"
+            return 0
+        fi
 
-    while true; do
-        local key
-        read -rsk1 key
-        case "$key" in
-            $'\e')
-                local seq
-                read -rsk2 seq
-                case "$seq" in
-                    '[A') selected=$(( (selected - 2 + total) % total + 1 )) ;;
-                    '[B') selected=$(( selected % total + 1 )) ;;
-                esac
-                ;;
-            $'\n'|$'\r')
-                clear_lines $draw_lines
-                print "  ${GREEN}✓${RESET} ${BOLD}${title}${RESET}  ${DIM}${options[$selected]}${RESET}"
-                print -n "${SHOW_CURSOR}"
-                MENU_RESULT=$(( selected - 1 ))  # convert to 0-indexed for array access later
-                return 0
-                ;;
-            $'\x03')
-                print -n "${SHOW_CURSOR}"
-                print ""
-                exit 1
-                ;;
-        esac
-        clear_lines $draw_lines
-        _menu_draw
+        print_warn "Enter a number between 1 and ${total}"
+        print ""
     done
 }
 
@@ -164,7 +140,7 @@ text_input() {
 
     print -n "${SHOW_CURSOR}"
     if [[ -n "$default" ]]; then
-        print -n "  ${BOLD}${prompt}${RESET} ${DIM}(${default})${RESET}: "
+        print -n "  ${BOLD}${prompt}${RESET} ${DIM}[default: ${default}]${RESET}: "
     else
         print -n "  ${BOLD}${prompt}${RESET}: "
     fi
@@ -389,6 +365,7 @@ configure() {
     print ""
 
     # ── Install Location ──────────────────────────────────────────
+    print_info "Press Enter to keep the default install location."
     text_input "Install location" "$HOME/Daydream-cli"
     INSTALL_DIR="$INPUT_RESULT"
     # Expand tilde
