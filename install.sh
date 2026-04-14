@@ -4,6 +4,9 @@
 # One-click setup for Apple Silicon local model inference
 # ──────────────────────────────────────────────────────────────────────
 set -euo pipefail
+set +x 2>/dev/null || true
+set +v 2>/dev/null || true
+unsetopt xtrace verbose 2>/dev/null || true
 
 # ── Colors & Styles ───────────────────────────────────────────────────
 BOLD=$'\033[1m'
@@ -26,11 +29,20 @@ SHELL_INTEGRATE=true
 REPO_URL="https://github.com/Starry331/Daydream-cli.git"
 HF_TOKEN_URL="https://huggingface.co/settings/tokens"
 HF_TOKEN_RECOMMENDED_ROLE="read"
+MODEL_TO_PULL=""
+MODEL_DOWNLOAD_REQUESTED=false
+MODEL_DOWNLOAD_COMPLETED=false
+MODEL_DOWNLOAD_FAILED=false
 PYTHON_CANDIDATES=()
 PYTHON_VERSIONS=()
+MENU_ALT_ACTIVE=false
+MENU_ALT_LEAVE=""
 
 # ── Cleanup trap ──────────────────────────────────────────────────────
 cleanup() {
+    if [[ "$MENU_ALT_ACTIVE" == true ]] && [[ -n "$MENU_ALT_LEAVE" ]]; then
+        print -n "$MENU_ALT_LEAVE"
+    fi
     print -n "${SHOW_CURSOR}"
     stty sane 2>/dev/null || true
 }
@@ -69,24 +81,25 @@ print_info() {
     print "  ${DIM}$1${RESET}"
 }
 
-# Spinner for long operations
-spinner() {
-    local pid=$1
-    local msg=$2
-    local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-    local i=1
-    local nframes=${#frames[@]}
-    print -n "${HIDE_CURSOR}"
-    while kill -0 "$pid" 2>/dev/null; do
-        print -n "\r  ${CYAN}${frames[$i]}${RESET} ${DIM}${msg}${RESET}  "
-        i=$(( i % nframes + 1 ))
-        sleep 0.08
-    done
-    wait "$pid" 2>/dev/null
-    local exit_code=$?
-    print -n "\r\033[K"
-    print -n "${SHOW_CURSOR}"
-    return $exit_code
+run_quiet_step() {
+    local start_msg=$1
+    shift
+    print_info "$start_msg"
+    "$@" > /tmp/daydream-install.log 2>&1
+}
+
+run_streaming_step() {
+    local log_file=$1
+    shift
+
+    : > "$log_file"
+    if command -v script >/dev/null 2>&1; then
+        script -q "$log_file" "$@"
+        return $?
+    fi
+
+    "$@" 2>&1 | tee "$log_file"
+    return ${pipestatus[1]:-0}
 }
 
 # Clear N lines above cursor
@@ -94,8 +107,9 @@ clear_lines() {
     local n=$1
     local i
     for (( i = 0; i < n; i++ )); do
-        print -n "\033[A\033[K"
+        print -n "\r\033[A\033[2K"
     done
+    print -n "\r"
 }
 
 # ── Arrow-key interactive menu ───────────────────────────────────────
@@ -106,8 +120,17 @@ menu_select() {
     local options=("$@")
     local selected=1  # zsh 1-indexed
     local total=${#options[@]}
+    local enter_alt leave_alt move_home clear_to_end hide_cursor show_cursor
+
+    enter_alt=$(tput smcup 2>/dev/null || printf '\033[?1049h')
+    leave_alt=$(tput rmcup 2>/dev/null || printf '\033[?1049l')
+    move_home=$(tput home 2>/dev/null || printf '\033[H')
+    clear_to_end=$(tput ed 2>/dev/null || printf '\033[J')
+    hide_cursor=$(tput civis 2>/dev/null || printf '%s' "${HIDE_CURSOR}")
+    show_cursor=$(tput cnorm 2>/dev/null || printf '%s' "${SHOW_CURSOR}")
 
     _menu_draw() {
+        printf '%s%s' "$move_home" "$clear_to_end"
         print "  ${BOLD}${title}${RESET}"
         print ""
         local i
@@ -122,16 +145,16 @@ menu_select() {
         print "  ${DIM}↑/↓ move  Enter confirm${RESET}"
     }
 
-    print -n "${HIDE_CURSOR}"
+    MENU_ALT_ACTIVE=true
+    MENU_ALT_LEAVE="$leave_alt"
+    printf '%s%s' "$hide_cursor" "$enter_alt"
     _menu_draw
-    local draw_lines=$(( total + 4 ))
-
     while true; do
         local key
         read -rsk1 key
         case "$key" in
             $'\e')
-                local seq
+                local seq=""
                 read -rsk2 seq
                 case "$seq" in
                     '[A') selected=$(( (selected - 2 + total) % total + 1 )) ;;
@@ -139,19 +162,21 @@ menu_select() {
                 esac
                 ;;
             $'\n'|$'\r')
-                clear_lines $draw_lines
+                MENU_ALT_ACTIVE=false
+                MENU_ALT_LEAVE=""
+                printf '%s%s' "$leave_alt" "$show_cursor"
                 print "  ${GREEN}✓${RESET} ${BOLD}${title}${RESET}  ${DIM}${options[$selected]}${RESET}"
-                print -n "${SHOW_CURSOR}"
                 MENU_RESULT=$(( selected - 1 ))  # convert to 0-indexed for array access later
                 return 0
                 ;;
             $'\x03')
-                print -n "${SHOW_CURSOR}"
+                MENU_ALT_ACTIVE=false
+                MENU_ALT_LEAVE=""
+                printf '%s%s' "$leave_alt" "$show_cursor"
                 print ""
                 exit 1
                 ;;
         esac
-        clear_lines $draw_lines
         _menu_draw
     done
 }
@@ -164,7 +189,7 @@ text_input() {
 
     print -n "${SHOW_CURSOR}"
     if [[ -n "$default" ]]; then
-        print -n "  ${BOLD}${prompt}${RESET} ${DIM}(${default})${RESET}: "
+        print -n "  ${BOLD}${prompt}${RESET} ${DIM}[default: ${default}]${RESET}: "
     else
         print -n "  ${BOLD}${prompt}${RESET}: "
     fi
@@ -204,8 +229,8 @@ show_hf_token_setup_guide() {
 
 prompt_for_hf_token() {
     while true; do
-        secret_input "Paste your token (hidden, press Enter to skip)"
-        HF_TOKEN="$SECRET_RESULT"
+        text_input "Paste your token (press Enter to skip)" ""
+        HF_TOKEN="$INPUT_RESULT"
 
         if [[ -z "$HF_TOKEN" ]]; then
             print_info "Skipped — no token entered"
@@ -227,6 +252,61 @@ prompt_for_hf_token() {
         HF_TOKEN=""
         HF_TOKEN_CONFIGURED=false
         print ""
+    done
+}
+
+show_model_download_guide() {
+    print "  ${BOLD}How to pick a model${RESET}"
+    print "  ${DIM}Paste the full repo ID from the Hugging Face model page.${RESET}"
+    print "  ${DIM}Example: mlx-community/Qwen3.5-9B-MLX-4bit${RESET}"
+    print "  ${DIM}You can also paste:${RESET}"
+    print "  ${DIM}  - hf.co/mlx-community/Qwen3.5-9B-MLX-4bit${RESET}"
+    print "  ${DIM}  - https://huggingface.co/mlx-community/Qwen3.5-9B-MLX-4bit${RESET}"
+    print "  ${YELLOW}Only quantized MLX models are supported.${RESET}"
+    print "  ${DIM}Not supported: GGUF models or non-quantized MLX repos.${RESET}"
+    print "  ${DIM}After the download finishes, the installer will launch the model for you.${RESET}"
+}
+
+normalize_model_ref() {
+    local ref=$1
+
+    # Trim leading/trailing whitespace.
+    ref="${ref#"${ref%%[![:space:]]*}"}"
+    ref="${ref%"${ref##*[![:space:]]}"}"
+
+    ref="${ref%%\?*}"
+    ref="${ref%%\#*}"
+    ref="${ref%/}"
+
+    if [[ "$ref" == https://hf.co/* ]]; then
+        ref="hf.co/${ref#https://hf.co/}"
+    elif [[ "$ref" == http://hf.co/* ]]; then
+        ref="hf.co/${ref#http://hf.co/}"
+    elif [[ "$ref" == https://huggingface.co/* ]]; then
+        ref="${ref#https://huggingface.co/}"
+    elif [[ "$ref" == http://huggingface.co/* ]]; then
+        ref="${ref#http://huggingface.co/}"
+    fi
+
+    print -r -- "$ref"
+}
+
+prompt_for_model_download() {
+    while true; do
+        text_input "Paste a model repo ID or hf.co ref (press Enter to skip)" ""
+        MODEL_TO_PULL=$(normalize_model_ref "$INPUT_RESULT")
+
+        if [[ -z "$MODEL_TO_PULL" ]]; then
+            print_info "Skipped — no model selected"
+            MODEL_DOWNLOAD_REQUESTED=false
+            return 0
+        fi
+
+        MODEL_DOWNLOAD_REQUESTED=true
+        print_step "Will download: ${MODEL_TO_PULL}"
+        print_info "Only quantized MLX models are supported"
+        print_info "The installer will download it, then start it automatically"
+        return 0
     done
 }
 
@@ -389,6 +469,7 @@ configure() {
     print ""
 
     # ── Install Location ──────────────────────────────────────────
+    print_info "Press Enter to keep the default install location."
     text_input "Install location" "$HOME/Daydream-cli"
     INSTALL_DIR="$INPUT_RESULT"
     # Expand tilde
@@ -424,16 +505,62 @@ configure() {
         HF_TOKEN_CONFIGURED=true
         HF_TOKEN=""  # don't overwrite
     else
-        if confirm "Set up HF_TOKEN now?" "n"; then
-            print ""
-            show_hf_token_setup_guide
-            print ""
-            prompt_for_hf_token
-        else
-            print_info "Skipped — you can set it later from: ${HF_TOKEN_URL}"
-            print_info "For Daydream on a local Mac, choose: ${HF_TOKEN_RECOMMENDED_ROLE}"
-        fi
+        local hf_menu_items=(
+            "I already have a token  —  paste it now"
+            "I need help getting a token  —  show the tutorial first"
+            "Skip for now"
+        )
+        menu_select "HF token setup" "${hf_menu_items[@]}"
+        case "$MENU_RESULT" in
+            0)
+                print ""
+                prompt_for_hf_token
+                ;;
+            1)
+                print ""
+                show_hf_token_setup_guide
+                print ""
+                prompt_for_hf_token
+                ;;
+            *)
+                print_info "Skipped — you can set it later from: ${HF_TOKEN_URL}"
+                print_info "For Daydream on a local Mac, choose: ${HF_TOKEN_RECOMMENDED_ROLE}"
+                ;;
+        esac
     fi
+    print ""
+
+    # ── Model Download ────────────────────────────────────────────
+    print "  ${BOLD}Model Download${RESET}  ${DIM}(optional)${RESET}"
+    print "  ${DIM}Paste a model repo ID now and the installer will download it after setup.${RESET}"
+    print "  ${DIM}When the download finishes, the installer will start that model automatically.${RESET}"
+    print "  ${YELLOW}Only quantized MLX models are supported.${RESET}"
+    print "  ${DIM}Not supported: GGUF models or non-quantized MLX repos.${RESET}"
+    print "  ${DIM}Example: mlx-community/Qwen3.5-9B-MLX-4bit${RESET}"
+    print ""
+
+    local model_menu_items=(
+        "I want to download a model now  —  paste the model name"
+        "Show me how to pick a model  —  then paste it"
+        "Skip for now"
+    )
+    menu_select "Model download" "${model_menu_items[@]}"
+    case "$MENU_RESULT" in
+        0)
+            print ""
+            prompt_for_model_download
+            ;;
+        1)
+            print ""
+            show_model_download_guide
+            print ""
+            prompt_for_model_download
+            ;;
+        *)
+            print_info "Skipped — you can download a model later with: daydream pull <model>"
+            print_info "Use a quantized MLX repo such as: mlx-community/Qwen3.5-9B-MLX-4bit"
+            ;;
+    esac
     print ""
 
     # ── Shell Integration ─────────────────────────────────────────
@@ -470,6 +597,11 @@ show_summary() {
     else
         print "  ${CYAN}HF Token${RESET}       ${DIM}not set${RESET}"
     fi
+    if [[ "$MODEL_DOWNLOAD_REQUESTED" == true ]] && [[ -n "$MODEL_TO_PULL" ]]; then
+        print "  ${CYAN}Model${RESET}          ${MODEL_TO_PULL}"
+    else
+        print "  ${CYAN}Model${RESET}          ${DIM}not set${RESET}"
+    fi
     if [[ "$SHELL_INTEGRATE" == true ]]; then
         print "  ${CYAN}Shell PATH${RESET}     yes"
     else
@@ -496,9 +628,7 @@ run_install() {
 
     # ── 1. Clone or update repo ───────────────────────────────────
     if [[ -d "$INSTALL_DIR/.git" ]]; then
-        print "  ${DIM}Repository already exists, updating...${RESET}"
-        ( cd "$INSTALL_DIR" && git pull --ff-only ) > /tmp/daydream-install.log 2>&1 &
-        if spinner $! "Updating repository"; then
+        if run_quiet_step "Updating existing repository..." git -C "$INSTALL_DIR" pull --ff-only; then
             print_step "Repository updated"
         else
             print_warn "Update failed, continuing with existing code"
@@ -508,8 +638,7 @@ run_install() {
         print "  ${DIM}Please remove it or choose a different location.${RESET}"
         exit 1
     else
-        git clone "$REPO_URL" "$INSTALL_DIR" > /tmp/daydream-install.log 2>&1 &
-        if spinner $! "Cloning repository"; then
+        if run_quiet_step "Cloning repository..." git clone "$REPO_URL" "$INSTALL_DIR"; then
             print_step "Repository cloned"
         else
             print_fail "Failed to clone repository"
@@ -523,8 +652,7 @@ run_install() {
     if [[ -d "$INSTALL_DIR/.venv" ]]; then
         print_step "Virtual environment already exists"
     else
-        "$PYTHON_CMD" -m venv "$INSTALL_DIR/.venv" > /tmp/daydream-install.log 2>&1 &
-        if spinner $! "Creating virtual environment"; then
+        if run_quiet_step "Creating virtual environment..." "$PYTHON_CMD" -m venv "$INSTALL_DIR/.venv"; then
             print_step "Virtual environment created"
         else
             print_fail "Failed to create virtual environment"
@@ -536,16 +664,17 @@ run_install() {
     local PIP="$INSTALL_DIR/.venv/bin/pip"
 
     # ── 3. Upgrade pip, setuptools, wheel ─────────────────────────
-    "$PIP" install -U pip setuptools wheel > /tmp/daydream-install.log 2>&1 &
-    if spinner $! "Upgrading pip, setuptools, wheel"; then
+    if run_quiet_step "Upgrading pip, setuptools, wheel..." "$PIP" install -U pip setuptools wheel; then
         print_step "Build tools upgraded"
     else
         print_warn "Failed to upgrade build tools, continuing..."
     fi
 
     # ── 4. Install Daydream CLI ───────────────────────────────────
-    "$PIP" install -e "$INSTALL_DIR" > /tmp/daydream-install.log 2>&1 &
-    if spinner $! "Installing Daydream CLI and dependencies (this may take a while)"; then
+    print_info "Installing Daydream CLI and dependencies. This may take a while."
+    print_info "Streaming install output below."
+    print ""
+    if run_streaming_step /tmp/daydream-install.log "$PIP" install -e "$INSTALL_DIR"; then
         print_step "Daydream CLI installed"
     else
         print_fail "Failed to install Daydream CLI"
@@ -598,6 +727,10 @@ run_install() {
         print_step "Updated ${SHELL_PROFILE}"
     fi
 
+    if [[ -n "$HF_TOKEN" ]]; then
+        export HF_TOKEN
+    fi
+
     # ── 6. Verify ─────────────────────────────────────────────────
     print ""
     local DAYDREAM_CMD="$INSTALL_DIR/.venv/bin/daydream"
@@ -607,6 +740,24 @@ run_install() {
         print_step "Verified: ${dd_version}"
     else
         print_warn "daydream binary not found at expected path"
+    fi
+
+    # ── 7. Optional model download ────────────────────────────────
+    if [[ "$MODEL_DOWNLOAD_REQUESTED" == true ]] && [[ -n "$MODEL_TO_PULL" ]] && [[ -x "$DAYDREAM_CMD" ]]; then
+        print ""
+        print "  ${BOLD}Optional Model Download${RESET}"
+        print "  ${DIM}Only quantized MLX models are supported.${RESET}"
+        print "  ${DIM}Streaming download progress below...${RESET}"
+        print ""
+        if run_streaming_step /tmp/daydream-install.log "$DAYDREAM_CMD" pull "$MODEL_TO_PULL"; then
+            MODEL_DOWNLOAD_COMPLETED=true
+            print_step "Model downloaded: ${MODEL_TO_PULL}"
+        else
+            MODEL_DOWNLOAD_FAILED=true
+            print_warn "Model download failed: ${MODEL_TO_PULL}"
+            print_info "Daydream only supports quantized MLX models"
+            tail -20 /tmp/daydream-install.log 2>/dev/null || true
+        fi
     fi
 
     print ""
@@ -628,6 +779,15 @@ run_install() {
         fi
     else
         print "  ${CYAN}HF Token${RESET}          ${DIM}not set${RESET}"
+    fi
+    if [[ "$MODEL_DOWNLOAD_COMPLETED" == true ]]; then
+        print "  ${CYAN}Model${RESET}             ${DIM}downloaded: ${MODEL_TO_PULL}${RESET}"
+    elif [[ "$MODEL_DOWNLOAD_FAILED" == true ]]; then
+        print "  ${CYAN}Model${RESET}             ${DIM}download failed: ${MODEL_TO_PULL}${RESET}"
+    elif [[ "$MODEL_DOWNLOAD_REQUESTED" == true ]]; then
+        print "  ${CYAN}Model${RESET}             ${DIM}queued: ${MODEL_TO_PULL}${RESET}"
+    else
+        print "  ${CYAN}Model${RESET}             ${DIM}not downloaded${RESET}"
     fi
     print ""
 
@@ -664,6 +824,12 @@ run_install() {
         print "  ${WHITE}${DAYDREAM_BIN}/daydream run qwen3${RESET}"
     fi
 
+    if [[ "$MODEL_DOWNLOAD_COMPLETED" == true ]]; then
+        print ""
+        print "  ${CYAN}# Starting the downloaded model now${RESET}"
+        print "  ${WHITE}${DAYDREAM_CMD} run ${MODEL_TO_PULL}${RESET}"
+    fi
+
     if [[ "$HF_TOKEN_CONFIGURED" == false ]]; then
         print ""
         print "  ${YELLOW}Optional: add a Hugging Face token later${RESET}"
@@ -671,10 +837,33 @@ run_install() {
         print "  ${DIM}Choose ${HF_TOKEN_RECOMMENDED_ROLE} for local downloads and inference.${RESET}"
     fi
 
+    if [[ "$MODEL_DOWNLOAD_REQUESTED" == false ]]; then
+        print ""
+        print "  ${YELLOW}Optional: download a model later${RESET}"
+        print "  ${DIM}Paste a quantized MLX repo ID like:${RESET}"
+        print "  ${DIM}mlx-community/Qwen3.5-9B-MLX-4bit${RESET}"
+        print "  ${DIM}Then run: daydream pull <model>${RESET}"
+    fi
+
     print ""
     print "  ${DIM}Documentation: https://github.com/Starry331/Daydream-cli${RESET}"
     print "  ${DIM}Need help?     daydream --help${RESET}"
     print ""
+
+    if [[ "$MODEL_DOWNLOAD_COMPLETED" == true ]]; then
+        print "  ${BOLD}Launching your model${RESET}"
+        print "  ${DIM}Type /quit when you want to leave the chat and return to the shell.${RESET}"
+        print ""
+        if "$DAYDREAM_CMD" run "$MODEL_TO_PULL"; then
+            print ""
+            print_step "Model session ended"
+        else
+            print ""
+            print_warn "Could not start ${MODEL_TO_PULL} automatically"
+            print_info "Try again with: ${DAYDREAM_CMD} run ${MODEL_TO_PULL}"
+        fi
+        print ""
+    fi
 }
 
 # ══════════════════════════════════════════════════════════════════════
