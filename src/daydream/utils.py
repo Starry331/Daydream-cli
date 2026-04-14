@@ -861,7 +861,9 @@ class ConversationStatus:
 
                 # ── Streamed output ──
                 if self._output:
-                    parts.append(Text(self._output))
+                    # Re-trim to current terminal size so overlay fits.
+                    trimmed = _trim_live_output(self._output)
+                    parts.append(Text(trimmed))
                     if not compact:
                         parts.append(Text())
 
@@ -1069,12 +1071,18 @@ class BottomTerminalRenderer:
 
         lines = self._renderable_to_lines(renderable)
         size = self._terminal_size()
+
+        # Clamp overlay to fit within terminal — if it exceeds visible rows,
+        # keep only the tail so the bottom (footer/status) is always visible.
+        if len(lines) > size.lines:
+            lines = lines[-(size.lines):]
+
         start_row = max(1, size.lines - len(lines) + 1)
 
         # Detect terminal size change — reflow makes row tracking unreliable,
         # so clear the entire visible screen and re-render from scratch.
-        width_changed = self._start_row is not None and self._last_size != size
-        if width_changed:
+        size_changed = self._start_row is not None and self._last_size != size
+        if size_changed:
             self.stream.write("\x1b[H\x1b[J")
             self._start_row = None
             self._line_count = 0
@@ -1088,7 +1096,7 @@ class BottomTerminalRenderer:
         # This keeps prior chat history in scrollback instead of letting the
         # growing overlay wipe lines that were already printed above it.
         if first_render:
-            if self._scroll_on_first_render and not width_changed:
+            if self._scroll_on_first_render and not size_changed:
                 self._scroll_up(len(lines), rows=size.lines)
             clear_from = start_row
         elif grows_upward:
@@ -1132,12 +1140,18 @@ class BottomTerminalRenderer:
                 return True
 
     def finish(self) -> None:
-        if self._line_count and self._start_row is not None and self._clear_on_finish:
-            self._clear_from(self._start_row)
-            self._move_to(self._start_row)
-            if self._collapse_on_finish:
-                self.stream.write(f"\x1b[{self._line_count}M")
+        if self._clear_on_finish and (self._line_count or self._start_row is not None):
+            if self._start_row is not None:
+                self._clear_from(self._start_row)
                 self._move_to(self._start_row)
+                if self._collapse_on_finish:
+                    self.stream.write(f"\x1b[{self._line_count}M")
+                    self._move_to(self._start_row)
+            else:
+                # start_row was lost (e.g. after resize) — clear whole screen
+                size = self._terminal_size()
+                self.stream.write("\x1b[H\x1b[J")
+                self._move_to(size.lines, 1)
         if self._cursor_hidden:
             self.stream.write("\x1b[?25h")
             self._cursor_hidden = False
@@ -1192,6 +1206,10 @@ class InlineFlowRenderer(BottomTerminalRenderer):
 
         lines = self._renderable_to_lines(renderable)
         size = self._terminal_size()
+
+        # Clamp to terminal height.
+        if len(lines) > size.lines:
+            lines = lines[-(size.lines):]
 
         # Size change — reflow makes position tracking unreliable.
         if self._line_count > 0 and self._last_size != size:

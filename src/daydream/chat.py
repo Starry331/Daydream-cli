@@ -990,11 +990,6 @@ def _read_live_boxed_message(*, cli_page_mode: str = "loose") -> str:
         finally:
             renderer.finish()
 
-    if buffer.strip():
-        err_console.print(f"[bold green]You[/bold green]")
-        err_console.print(buffer, markup=False, highlight=False)
-        _print_gap(cli_page_mode)
-
     return buffer
 
 
@@ -1974,6 +1969,7 @@ def _stream_response(
     prefill_step_size: int | None = None,
     prompt_cache=None,
     cli_page_mode: str = "loose",
+    skip_final_print: bool = False,
 ):
     """Stream a response, collecting the full text."""
     full_text = ""
@@ -2137,7 +2133,8 @@ def _stream_response(
         _reasoning_elapsed = status.reasoning_elapsed
 
     # Overlay is now torn down — print final output immediately.
-    if not stream_to_stdout:
+    # skip_final_print is used when the caller will repack the full page.
+    if not stream_to_stdout and not skip_final_print:
         if _had_reasoning and _reasoning_elapsed is not None:
             err_console.print(render_reasoning_line(_reasoning_elapsed, active=False))
             _print_gap(cli_page_mode)
@@ -2156,10 +2153,10 @@ def _stream_response(
             err_console.print("[dim]Use /t to expand reasoning[/dim]")
             _print_gap(cli_page_mode)
 
-    elif full_text and parser.saw_reasoning:
+    elif full_text and parser.saw_reasoning and not skip_final_print:
         print(full_text)
 
-    if streamed_output and stream_to_stdout and not parser.saw_reasoning:
+    if streamed_output and stream_to_stdout and not parser.saw_reasoning and not skip_final_print:
         print()
 
     if verbose and last_response:
@@ -2874,6 +2871,7 @@ def run_chat(
             prefill_step_size=2048,
             prompt_cache=prompt_cache,
             cli_page_mode=cli_page_mode,
+            skip_final_print=True,
         )
         if len(stream_result) == 4:
             full_text, _, reasoning_text, reasoning_elapsed = stream_result
