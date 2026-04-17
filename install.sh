@@ -37,6 +37,8 @@ PYTHON_CANDIDATES=()
 PYTHON_VERSIONS=()
 MENU_ALT_ACTIVE=false
 MENU_ALT_LEAVE=""
+DAYDREAM_LAUNCHER=""
+DAYDREAM_READY_IN_CURRENT_SHELL=false
 
 # ── Cleanup trap ──────────────────────────────────────────────────────
 cleanup() {
@@ -81,25 +83,94 @@ print_info() {
     print "  ${DIM}$1${RESET}"
 }
 
-run_quiet_step() {
-    local start_msg=$1
+# Run a long command in the background with a single-line spinner animation.
+# The spinner overwrites itself on one line using \r, so it never floods the screen.
+run_spinner_step() {
+    local msg=$1
     shift
-    print_info "$start_msg"
-    "$@" > /tmp/daydream-install.log 2>&1
+
+    "$@" > /tmp/daydream-install.log 2>&1 &
+    local pid=$!
+    local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local nframes=${#frames[@]}
+    local i=1
+
+    print -n "${HIDE_CURSOR}"
+    while kill -0 "$pid" 2>/dev/null; do
+        print -n "\r  ${CYAN}${frames[$i]}${RESET} ${DIM}${msg}${RESET}\033[K"
+        i=$(( i % nframes + 1 ))
+        sleep 0.08
+    done
+    wait "$pid" 2>/dev/null
+    local exit_code=$?
+    print -n "\r\033[K"
+    print -n "${SHOW_CURSOR}"
+    return $exit_code
 }
 
-run_streaming_step() {
-    local log_file=$1
-    shift
+path_has_dir() {
+    local needle=$1
+    local dir
+    for dir in ${(s/:/)PATH}; do
+        if [[ "$dir" == "$needle" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
 
-    : > "$log_file"
-    if command -v script >/dev/null 2>&1; then
-        script -q "$log_file" "$@"
-        return $?
-    fi
+install_daydream_launcher() {
+    local target=$1
+    local dir launcher_path existing_target
+    typeset -A seen_dirs
+    local -a candidates=()
 
-    "$@" 2>&1 | tee "$log_file"
-    return ${pipestatus[1]:-0}
+    for dir in "$HOME/.npm-global/bin" "$HOME/.local/bin" "$HOME/bin"; do
+        if path_has_dir "$dir"; then
+            candidates+=("$dir")
+        fi
+    done
+    candidates+=("$HOME/.npm-global/bin" "$HOME/.local/bin" "$HOME/bin")
+
+    for dir in "${candidates[@]}"; do
+        [[ -n "$dir" ]] || continue
+        [[ -n "${seen_dirs[$dir]:-}" ]] && continue
+        seen_dirs[$dir]=1
+
+        if [[ ! -d "$dir" ]]; then
+            mkdir -p "$dir" 2>/dev/null || continue
+        fi
+
+        [[ -w "$dir" ]] || continue
+
+        launcher_path="$dir/daydream"
+        if [[ -L "$launcher_path" ]]; then
+            existing_target=$(readlink "$launcher_path" 2>/dev/null || true)
+            if [[ -n "$existing_target" ]] && [[ "$existing_target" != "$target" ]]; then
+                continue
+            fi
+        elif [[ -e "$launcher_path" ]]; then
+            if ! grep -q "daydream installer launcher" "$launcher_path" 2>/dev/null; then
+                continue
+            fi
+        fi
+
+        {
+            print "#!/bin/sh"
+            print "# daydream installer launcher"
+            print "exec \"${target}\" \"\$@\""
+        } > "$launcher_path" 2>/dev/null || continue
+
+        chmod +x "$launcher_path" 2>/dev/null || continue
+        DAYDREAM_LAUNCHER="$launcher_path"
+
+        if path_has_dir "$dir"; then
+            DAYDREAM_READY_IN_CURRENT_SHELL=true
+        fi
+        return 0
+    done
+
+    return 1
 }
 
 # Clear N lines above cursor
@@ -149,34 +220,37 @@ menu_select() {
     MENU_ALT_LEAVE="$leave_alt"
     printf '%s%s' "$hide_cursor" "$enter_alt"
     _menu_draw
+
+    # Suppress all tracing inside the input loop to prevent
+    # debug output like (key=$'\C-[') leaking to the terminal.
+    {
+        setopt localoptions noxtrace noverbose nolog
+    } 2>/dev/null
+
     while true; do
-        local key
-        read -rsk1 key
-        case "$key" in
-            $'\e')
-                local seq=""
-                read -rsk2 seq
-                case "$seq" in
-                    '[A') selected=$(( (selected - 2 + total) % total + 1 )) ;;
-                    '[B') selected=$(( selected % total + 1 )) ;;
-                esac
-                ;;
-            $'\n'|$'\r')
-                MENU_ALT_ACTIVE=false
-                MENU_ALT_LEAVE=""
-                printf '%s%s' "$leave_alt" "$show_cursor"
-                print "  ${GREEN}✓${RESET} ${BOLD}${title}${RESET}  ${DIM}${options[$selected]}${RESET}"
-                MENU_RESULT=$(( selected - 1 ))  # convert to 0-indexed for array access later
-                return 0
-                ;;
-            $'\x03')
-                MENU_ALT_ACTIVE=false
-                MENU_ALT_LEAVE=""
-                printf '%s%s' "$leave_alt" "$show_cursor"
-                print ""
-                exit 1
-                ;;
-        esac
+        local key=""
+        read -rsk1 key 2>/dev/null
+        if [[ "$key" == $'\e' ]]; then
+            local seq=""
+            read -rsk2 seq 2>/dev/null
+            case "$seq" in
+                '[A') selected=$(( (selected - 2 + total) % total + 1 )) ;;
+                '[B') selected=$(( selected % total + 1 )) ;;
+            esac
+        elif [[ "$key" == $'\n' || "$key" == $'\r' || -z "$key" ]]; then
+            MENU_ALT_ACTIVE=false
+            MENU_ALT_LEAVE=""
+            printf '%s%s' "$leave_alt" "$show_cursor"
+            print "  ${GREEN}✓${RESET} ${BOLD}${title}${RESET}  ${DIM}${options[$selected]}${RESET}"
+            MENU_RESULT=$(( selected - 1 ))  # convert to 0-indexed for array access later
+            return 0
+        elif [[ "$key" == $'\x03' ]]; then
+            MENU_ALT_ACTIVE=false
+            MENU_ALT_LEAVE=""
+            printf '%s%s' "$leave_alt" "$show_cursor"
+            print ""
+            exit 1
+        fi
         _menu_draw
     done
 }
@@ -349,7 +423,7 @@ BANNER
     print -n "${RESET}"
     print ""
     print "  ${BOLD}Apple Silicon Local Model CLI${RESET}"
-    print "  ${DIM}Ollama UX  ·  MLX Engine  ·  Hugging Face Models${RESET}"
+    print "  ${DIM}MLX Engine  ·  Hugging Face Models${RESET}"
     print ""
     print "  ${DIM}────────────────────────────────────────────────${RESET}"
     print ""
@@ -628,7 +702,7 @@ run_install() {
 
     # ── 1. Clone or update repo ───────────────────────────────────
     if [[ -d "$INSTALL_DIR/.git" ]]; then
-        if run_quiet_step "Updating existing repository..." git -C "$INSTALL_DIR" pull --ff-only; then
+        if run_spinner_step "Updating existing repository" git -C "$INSTALL_DIR" pull --ff-only; then
             print_step "Repository updated"
         else
             print_warn "Update failed, continuing with existing code"
@@ -638,7 +712,7 @@ run_install() {
         print "  ${DIM}Please remove it or choose a different location.${RESET}"
         exit 1
     else
-        if run_quiet_step "Cloning repository..." git clone "$REPO_URL" "$INSTALL_DIR"; then
+        if run_spinner_step "Cloning repository" git clone "$REPO_URL" "$INSTALL_DIR"; then
             print_step "Repository cloned"
         else
             print_fail "Failed to clone repository"
@@ -652,7 +726,7 @@ run_install() {
     if [[ -d "$INSTALL_DIR/.venv" ]]; then
         print_step "Virtual environment already exists"
     else
-        if run_quiet_step "Creating virtual environment..." "$PYTHON_CMD" -m venv "$INSTALL_DIR/.venv"; then
+        if run_spinner_step "Creating virtual environment" "$PYTHON_CMD" -m venv "$INSTALL_DIR/.venv"; then
             print_step "Virtual environment created"
         else
             print_fail "Failed to create virtual environment"
@@ -664,17 +738,14 @@ run_install() {
     local PIP="$INSTALL_DIR/.venv/bin/pip"
 
     # ── 3. Upgrade pip, setuptools, wheel ─────────────────────────
-    if run_quiet_step "Upgrading pip, setuptools, wheel..." "$PIP" install -U pip setuptools wheel; then
+    if run_spinner_step "Upgrading pip, setuptools, wheel" "$PIP" install -U pip setuptools wheel; then
         print_step "Build tools upgraded"
     else
         print_warn "Failed to upgrade build tools, continuing..."
     fi
 
     # ── 4. Install Daydream CLI ───────────────────────────────────
-    print_info "Installing Daydream CLI and dependencies. This may take a while."
-    print_info "Streaming install output below."
-    print ""
-    if run_streaming_step /tmp/daydream-install.log "$PIP" install -e "$INSTALL_DIR"; then
+    if run_spinner_step "Installing Daydream CLI and dependencies (this may take a while)" "$PIP" install -e "$INSTALL_DIR"; then
         print_step "Daydream CLI installed"
     else
         print_fail "Failed to install Daydream CLI"
@@ -725,10 +796,27 @@ run_install() {
 
         WROTE_PROFILE=true
         print_step "Updated ${SHELL_PROFILE}"
+
+        # Apply PATH change to the CURRENT shell session immediately,
+        # so `daydream` works right after install without restarting the terminal.
+        if [[ "$SHELL_INTEGRATE" == true ]]; then
+            export PATH="${DAYDREAM_BIN}:$PATH"
+        fi
     fi
 
     if [[ -n "$HF_TOKEN" ]]; then
         export HF_TOKEN
+    fi
+
+    # Also create a symlink in /usr/local/bin (fallback for sessions that
+    # haven't sourced the profile yet).  Silently skip if not writable.
+    if [[ "$SHELL_INTEGRATE" == true ]] && [[ -x "$INSTALL_DIR/.venv/bin/daydream" ]]; then
+        local link_target="$INSTALL_DIR/.venv/bin/daydream"
+        local link_path="/usr/local/bin/daydream"
+        if [[ -w /usr/local/bin ]] || [[ -w "$(dirname "$link_path")" ]]; then
+            ln -sf "$link_target" "$link_path" 2>/dev/null && \
+                print_step "Symlinked daydream → ${link_path}" || true
+        fi
     fi
 
     # ── 6. Verify ─────────────────────────────────────────────────
@@ -738,6 +826,13 @@ run_install() {
         local dd_version
         dd_version=$("$DAYDREAM_CMD" --version 2>&1 || echo "unknown")
         print_step "Verified: ${dd_version}"
+        if install_daydream_launcher "$DAYDREAM_CMD"; then
+            if [[ "$DAYDREAM_READY_IN_CURRENT_SHELL" == true ]]; then
+                print_step "Installed launcher: ${DAYDREAM_LAUNCHER}"
+            else
+                print_info "Installed launcher: ${DAYDREAM_LAUNCHER}"
+            fi
+        fi
     else
         print_warn "daydream binary not found at expected path"
     fi
@@ -747,9 +842,8 @@ run_install() {
         print ""
         print "  ${BOLD}Optional Model Download${RESET}"
         print "  ${DIM}Only quantized MLX models are supported.${RESET}"
-        print "  ${DIM}Streaming download progress below...${RESET}"
         print ""
-        if run_streaming_step /tmp/daydream-install.log "$DAYDREAM_CMD" pull "$MODEL_TO_PULL"; then
+        if run_spinner_step "Downloading ${MODEL_TO_PULL} (this may take a while)" "$DAYDREAM_CMD" pull "$MODEL_TO_PULL"; then
             MODEL_DOWNLOAD_COMPLETED=true
             print_step "Model downloaded: ${MODEL_TO_PULL}"
         else
@@ -791,7 +885,13 @@ run_install() {
     fi
     print ""
 
-    if [[ "$WROTE_PROFILE" == true ]]; then
+    # Check if daydream is now available in this session
+    if command -v daydream &>/dev/null; then
+        print "  ${GREEN}→${RESET} daydream is ready — you can use it now:"
+        print ""
+        print "    ${BOLD}daydream --help${RESET}"
+        print ""
+    elif [[ "$WROTE_PROFILE" == true ]]; then
         print "  ${YELLOW}→${RESET} Restart your terminal or run:"
         print ""
         print "    ${BOLD}source ${SHELL_PROFILE}${RESET}"
