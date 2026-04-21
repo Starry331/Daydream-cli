@@ -755,7 +755,27 @@ run_install() {
         exit 1
     fi
 
-    # ── 5. Shell profile integration ──────────────────────────────
+    # ── 5. Install the `daydream` launcher into a user bin dir ───
+    # IMPORTANT: We only expose a `daydream` launcher on PATH — never the
+    # venv's bin directory. Prepending the venv to PATH would shadow the
+    # user's `python` / `pip` with the venv copies, which is a footgun.
+    local DAYDREAM_CMD="$INSTALL_DIR/.venv/bin/daydream"
+    local DAYDREAM_BIN="$INSTALL_DIR/.venv/bin"
+    local LAUNCHER_DIR=""
+    local LAUNCHER_NEEDS_PATH=false
+
+    if [[ "$SHELL_INTEGRATE" == true ]] && [[ -x "$DAYDREAM_CMD" ]]; then
+        if install_daydream_launcher "$DAYDREAM_CMD"; then
+            LAUNCHER_DIR=$(dirname "$DAYDREAM_LAUNCHER")
+            if ! path_has_dir "$LAUNCHER_DIR"; then
+                LAUNCHER_NEEDS_PATH=true
+            fi
+        else
+            print_warn "Could not install launcher to a user bin dir"
+        fi
+    fi
+
+    # ── 6. Shell profile integration ──────────────────────────────
     local SHELL_PROFILE=""
     local CURRENT_SHELL
     CURRENT_SHELL=$(basename "$SHELL")
@@ -766,27 +786,51 @@ run_install() {
         *)    SHELL_PROFILE="$HOME/.profile" ;;
     esac
 
-    local DAYDREAM_BIN="$INSTALL_DIR/.venv/bin"
     local WROTE_PROFILE=false
+    local MARKER="# >>> daydream >>>"
+    local MARKER_END="# <<< daydream <<<"
+    local LEGACY_CLEANED=false
 
-    if [[ "$SHELL_INTEGRATE" == true ]] || [[ -n "$HF_TOKEN" ]]; then
-        local MARKER="# >>> daydream >>>"
-        local MARKER_END="# <<< daydream <<<"
+    # Always scrub any existing daydream block first. This auto-heals installs
+    # from older versions of this script that prepended the venv bin to PATH
+    # (shadowing the user's system python / pip).
+    if [[ -f "$SHELL_PROFILE" ]] && grep -q "$MARKER" "$SHELL_PROFILE"; then
+        local tmp_profile
+        tmp_profile=$(mktemp)
+        awk "/$MARKER/{skip=1; next} /$MARKER_END/{skip=0; next} !skip" "$SHELL_PROFILE" > "$tmp_profile"
+        mv "$tmp_profile" "$SHELL_PROFILE"
+        LEGACY_CLEANED=true
 
-        # Remove old daydream block if exists
-        if [[ -f "$SHELL_PROFILE" ]] && grep -q "$MARKER" "$SHELL_PROFILE"; then
-            local tmp_profile
-            tmp_profile=$(mktemp)
-            awk "/$MARKER/{skip=1; next} /$MARKER_END/{skip=0; next} !skip" "$SHELL_PROFILE" > "$tmp_profile"
-            mv "$tmp_profile" "$SHELL_PROFILE"
+        # Also detox the CURRENT shell session: if the legacy block already
+        # prepended the venv bin, PATH is still poisoned until the user
+        # restarts the shell. Strip that entry from our exported PATH so the
+        # rest of this install (and any child command we run) sees the real
+        # system python / pip.
+        if path_has_dir "$DAYDREAM_BIN"; then
+            local _cleaned_path="" _dir
+            for _dir in ${(s/:/)PATH}; do
+                [[ "$_dir" == "$DAYDREAM_BIN" ]] && continue
+                if [[ -z "$_cleaned_path" ]]; then
+                    _cleaned_path="$_dir"
+                else
+                    _cleaned_path="$_cleaned_path:$_dir"
+                fi
+            done
+            export PATH="$_cleaned_path"
         fi
+    fi
 
-        # Write new block
+    if { [[ "$SHELL_INTEGRATE" == true ]] && [[ "$LAUNCHER_NEEDS_PATH" == true ]]; } || [[ -n "$HF_TOKEN" ]]; then
+        # Write new block — APPEND launcher dir only, never the venv bin.
         {
             print ""
             print "$MARKER"
-            if [[ "$SHELL_INTEGRATE" == true ]]; then
-                print "export PATH=\"${DAYDREAM_BIN}:\$PATH\""
+            if [[ "$LAUNCHER_NEEDS_PATH" == true ]] && [[ -n "$LAUNCHER_DIR" ]]; then
+                # Append (not prepend) so system python/pip win over anything here.
+                print "case \":\$PATH:\" in"
+                print "  *\":${LAUNCHER_DIR}:\"*) ;;"
+                print "  *) export PATH=\"\$PATH:${LAUNCHER_DIR}\" ;;"
+                print "esac"
             fi
             if [[ -n "$HF_TOKEN" ]]; then
                 print "export HF_TOKEN=\"${HF_TOKEN}\""
@@ -799,9 +843,15 @@ run_install() {
 
         # Apply PATH change to the CURRENT shell session immediately,
         # so `daydream` works right after install without restarting the terminal.
-        if [[ "$SHELL_INTEGRATE" == true ]]; then
-            export PATH="${DAYDREAM_BIN}:$PATH"
+        if [[ "$LAUNCHER_NEEDS_PATH" == true ]] && [[ -n "$LAUNCHER_DIR" ]] && ! path_has_dir "$LAUNCHER_DIR"; then
+            export PATH="$PATH:$LAUNCHER_DIR"
         fi
+    elif [[ "$LEGACY_CLEANED" == true ]]; then
+        # Legacy block removed but nothing new to write — still inform the user
+        # their shell was healed (python / pip will stop pointing at the venv
+        # after they restart the shell).
+        print_step "Cleaned legacy daydream block from ${SHELL_PROFILE}"
+        print_info "Restart your terminal so python/pip stop resolving to the Daydream venv."
     fi
 
     if [[ -n "$HF_TOKEN" ]]; then
@@ -810,24 +860,22 @@ run_install() {
 
     # Also create a symlink in /usr/local/bin (fallback for sessions that
     # haven't sourced the profile yet).  Silently skip if not writable.
-    if [[ "$SHELL_INTEGRATE" == true ]] && [[ -x "$INSTALL_DIR/.venv/bin/daydream" ]]; then
-        local link_target="$INSTALL_DIR/.venv/bin/daydream"
+    if [[ "$SHELL_INTEGRATE" == true ]] && [[ -x "$DAYDREAM_CMD" ]]; then
         local link_path="/usr/local/bin/daydream"
         if [[ -w /usr/local/bin ]] || [[ -w "$(dirname "$link_path")" ]]; then
-            ln -sf "$link_target" "$link_path" 2>/dev/null && \
+            ln -sf "$DAYDREAM_CMD" "$link_path" 2>/dev/null && \
                 print_step "Symlinked daydream → ${link_path}" || true
         fi
     fi
 
-    # ── 6. Verify ─────────────────────────────────────────────────
+    # ── 7. Verify ─────────────────────────────────────────────────
     print ""
-    local DAYDREAM_CMD="$INSTALL_DIR/.venv/bin/daydream"
     if [[ -x "$DAYDREAM_CMD" ]]; then
         local dd_version
         dd_version=$("$DAYDREAM_CMD" --version 2>&1 || echo "unknown")
         print_step "Verified: ${dd_version}"
-        if install_daydream_launcher "$DAYDREAM_CMD"; then
-            if [[ "$DAYDREAM_READY_IN_CURRENT_SHELL" == true ]]; then
+        if [[ -n "$DAYDREAM_LAUNCHER" ]]; then
+            if [[ "$DAYDREAM_READY_IN_CURRENT_SHELL" == true ]] || [[ "$LAUNCHER_NEEDS_PATH" == false ]]; then
                 print_step "Installed launcher: ${DAYDREAM_LAUNCHER}"
             else
                 print_info "Installed launcher: ${DAYDREAM_LAUNCHER}"
@@ -837,7 +885,7 @@ run_install() {
         print_warn "daydream binary not found at expected path"
     fi
 
-    # ── 7. Optional model download ────────────────────────────────
+    # ── 8. Optional model download ────────────────────────────────
     if [[ "$MODEL_DOWNLOAD_REQUESTED" == true ]] && [[ -n "$MODEL_TO_PULL" ]] && [[ -x "$DAYDREAM_CMD" ]]; then
         print ""
         print "  ${BOLD}Optional Model Download${RESET}"
