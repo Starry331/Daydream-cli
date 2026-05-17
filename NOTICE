@@ -1,0 +1,21 @@
+Daydream
+Copyright 2026 Starry331
+
+Daydream bundles the following third-party software, redistributed
+under the terms of their respective licenses:
+
+MTPLX (https://github.com/youssofal/MTPLX)
+    Apache License 2.0
+    Copyright 2026 Youssof Altoukhi
+    Used as a bundled runtime dependency for Qwen3.6 MTP / NextN
+    speculative decoding (Apple Silicon only — see pyproject.toml
+    platform marker). Daydream does not modify MTPLX's source code;
+    it imports the published PyPI distribution and drives it via
+    Daydream's own backend adapter (src/daydream/backends/mtp.py).
+
+mlx-lm (https://github.com/ml-explore/mlx-lm)
+    MIT License
+    Used as the primary MLX inference runtime.
+
+For licence texts of the above, see each project's LICENSE file
+on PyPI or its source repository.

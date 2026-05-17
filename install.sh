@@ -33,6 +33,9 @@ MODEL_TO_PULL=""
 MODEL_DOWNLOAD_REQUESTED=false
 MODEL_DOWNLOAD_COMPLETED=false
 MODEL_DOWNLOAD_FAILED=false
+MTP_REQUESTED=false
+MTP_INSTALLED=false
+MTP_CHECKPOINT="Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
 PYTHON_CANDIDATES=()
 PYTHON_VERSIONS=()
 MENU_ALT_ACTIVE=false
@@ -637,6 +640,27 @@ configure() {
     esac
     print ""
 
+    # ── MTP Speculative Acceleration (Qwen3.6, opt-in head download) ─
+    print "  ${BOLD}Qwen3.6 MTP Acceleration${RESET}  ${DIM}(optional, ~338 MB MTP head)${RESET}"
+    print "  ${DIM}The MTPLX runtime (Apache-2.0) is bundled with Daydream${RESET}"
+    print "  ${DIM}— pip install already pulled it in. The only optional part${RESET}"
+    print "  ${DIM}is the 338 MB MTP head weights (~16 GB trunk is reused${RESET}"
+    print "  ${DIM}from your existing Qwen3.6 cache via symlinks).${RESET}"
+    print ""
+    print "  ${DIM}OPT-IN — skip if unsure; enable later with:${RESET}"
+    print "  ${DIM}  daydream mtp install      ${RESET}${DIM}# adds 338 MB${RESET}"
+    print "  ${DIM}  daydream mtp uninstall    ${RESET}${DIM}# removes 338 MB${RESET}"
+    print "  ${DIM}Run: daydream run <model> --speculative mtp  (or /draft mtp in chat)${RESET}"
+    print ""
+
+    if confirm "Download Qwen3.6 MTP head now? (~338 MB)" "n"; then
+        MTP_REQUESTED=true
+        print_step "Will install the MTP head"
+    else
+        print_info "Skipped — set it up later with: daydream mtp install"
+    fi
+    print ""
+
     # ── Shell Integration ─────────────────────────────────────────
     print "  ${BOLD}Shell Integration${RESET}"
     print "  ${DIM}Add 'daydream' command to your PATH so you can use it from any terminal.${RESET}"
@@ -675,6 +699,11 @@ show_summary() {
         print "  ${CYAN}Model${RESET}          ${MODEL_TO_PULL}"
     else
         print "  ${CYAN}Model${RESET}          ${DIM}not set${RESET}"
+    fi
+    if [[ "$MTP_REQUESTED" == true ]]; then
+        print "  ${CYAN}MTP accel${RESET}      yes (Qwen3.6, ~338 MB thin)"
+    else
+        print "  ${CYAN}MTP accel${RESET}      ${DIM}skipped (opt-in later)${RESET}"
     fi
     if [[ "$SHELL_INTEGRATE" == true ]]; then
         print "  ${CYAN}Shell PATH${RESET}     yes"
@@ -898,6 +927,29 @@ run_install() {
             MODEL_DOWNLOAD_FAILED=true
             print_warn "Model download failed: ${MODEL_TO_PULL}"
             print_info "Daydream only supports quantized MLX models"
+            tail -20 /tmp/daydream-install.log 2>/dev/null || true
+        fi
+    fi
+
+    # ── 9. Optional MTP head install ──────────────────────────────
+    # The MTPLX runtime (Apache-2.0) is bundled as a base dependency
+    # via pyproject.toml — no separate pip install needed. Step 4's
+    # `pip install -e .` already pulled it in. Here we only fetch the
+    # 338 MB MTP head and symlink the trunk if the user opted in.
+    if [[ "$MTP_REQUESTED" == true ]] && [[ -x "$DAYDREAM_CMD" ]]; then
+        print ""
+        print "  ${BOLD}Qwen3.6 MTP Acceleration Setup${RESET}"
+        print "  ${DIM}Thin install: 338 MB head + reuses your trunk cache.${RESET}"
+        print "  ${DIM}MTPLX runtime is already bundled (no separate install).${RESET}"
+        print ""
+        if run_spinner_step "Installing MTP head (~338 MB)" "$DAYDREAM_CMD" mtp install; then
+            MTP_INSTALLED=true
+            print_step "MTP head installed"
+            print_info "Enable per chat with: daydream run mlx-community/Qwen3.6-27B-4bit --speculative mtp"
+            print_info "Remove later with: daydream mtp uninstall"
+        else
+            print_warn "MTP head install failed"
+            print_info "Re-try later with: daydream mtp install"
             tail -20 /tmp/daydream-install.log 2>/dev/null || true
         fi
     fi

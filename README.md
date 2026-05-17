@@ -6,7 +6,7 @@ Daydream is a local Apple Silicon model CLI built on top of `mlx-lm`.
 
 The goal is simple:
 
-- Ollama-style CLI UX
+- focused terminal UX
 - MLX-native inference
 - Hugging Face model flow
 - OpenAI-compatible local API for agents and coding tools
@@ -15,20 +15,24 @@ Daydream is intentionally narrow. It focuses on quantized MLX models, local term
 
 ## Status
 
-Current release: `v0.1.8`
+Current release: `v0.1.9`
 
 Implemented commands:
 
 - `daydream create`
+- `daydream cp`
+- `daydream link`
 - `daydream run`
 - `daydream pull`
 - `daydream list`
 - `daydream rm`
+- `daydream unalias`
 - `daydream show`
 - `daydream serve`
 - `daydream ps`
 - `daydream stop`
 - `daydream models`
+- `daydream mtp`
 
 ## Requirements
 
@@ -194,11 +198,15 @@ Inside chat:
 
 - `/` opens the slash-command menu in the chat box
 - `/effort` opens the reasoning-effort picker
+- `/context` changes the active context length
+- `/draft(beta)` chooses a speculative decoding mode
 - `/cli-page` opens the page-density picker
 - `/effort instant`
 - `/effort short`
 - `/effort default`
 - `/effort long`
+- `/context 32k`
+- `/draft(beta) lookup`
 - `/cli-page loose`
 - `/cli-page tight`
 - `/help`
@@ -228,6 +236,77 @@ If the current model likely supports reasoning-effort control, Daydream injects 
 - `tight` reduces blank space between your message, the reasoning box, the assistant reply, and the input box
 
 The selected CLI page mode is saved as the default for future chats.
+
+### Context length
+
+Set context length from the command line:
+
+```bash
+daydream run <modelname> --context-length 32k
+daydream serve <modelname> --context-length 32k
+```
+
+Inside chat:
+
+```text
+/context
+/context default
+/context 8k
+/context 32k
+/context 128k
+```
+
+`/context` changes the active chat cache size for the current model. Larger values need more memory.
+
+### Speculative decoding
+
+Daydream exposes speculative decoding as an explicit opt-in. It does not silently download large acceleration models.
+
+Command-line methods:
+
+- `--speculative none`: baseline single-model decoding
+- `--speculative lookup`: prompt-lookup decoding, no extra model, useful when output overlaps the prompt
+- `--speculative draft`: external draft-model decoding for supported model families
+- `--speculative mtp`: model-native MTP / NextN path for supported Qwen3.6-style models after MTP setup
+- `--speculative auto`: Daydream's safe default for the model family
+
+Examples:
+
+```bash
+daydream run <modelname> --speculative lookup
+daydream run <modelname> --speculative draft --draft-model hf.co/<draft-model>
+daydream run <modelname> --speculative mtp
+daydream serve <modelname> --speculative lookup
+daydream serve --model hf.co/<modelname> --speculative none
+```
+
+Short aliases are also available:
+
+```bash
+daydream run <modelname> --lookup
+daydream run <modelname> --draft
+daydream run <modelname> --no-draft
+```
+
+Inside chat:
+
+```text
+/draft(beta)
+/draft(beta) lookup
+/draft(beta) mtp
+/draft(beta) on
+/draft(beta) off
+```
+
+MTP setup:
+
+```bash
+daydream mtp status
+daydream mtp install
+daydream mtp uninstall
+```
+
+`daydream mtp install` installs the optional MTP sidecar for supported models. The default install keeps the base model shared and downloads only the MTP attachment when possible.
 
 ### Multi-line input
 
@@ -295,6 +374,14 @@ Run the server in the background:
 
 ```bash
 daydream serve --background --model hf.co/<modelname>
+```
+
+Serve also accepts the same context and speculative options:
+
+```bash
+daydream serve <modelname> --context-length 32k --speculative lookup
+daydream serve --model hf.co/<modelname> --speculative mtp
+daydream serve --model hf.co/<modelname> --no-draft
 ```
 
 ## OpenAI-Compatible API
@@ -506,7 +593,7 @@ Local model scan roots:
 
 ## Custom Models
 
-Daydream also supports manual custom model profiles, similar in spirit to an Ollama `Modelfile`.
+Daydream also supports manual custom model profiles through a `Daydreamfile`.
 
 Use a `Daydreamfile`:
 
@@ -637,7 +724,7 @@ Daydream 是一个基于 `mlx-lm` 的 Apple Silicon 本地模型 CLI。
 
 目标很明确：
 
-- 提供接近 Ollama 的 CLI 使用体验
+- 提供专注本地模型的终端使用体验
 - 使用 MLX 原生推理
 - 兼容 Hugging Face 模型工作流
 - 提供 OpenAI 兼容本地 API，方便 agent 和 coding tools 接入
@@ -646,19 +733,24 @@ Daydream 目前只专注一件事：在本地终端和 agent 场景下，稳定�
 
 ### 当前版本
 
-当前 release：`v0.1.8`
+当前 release：`v0.1.9`
 
 已实现命令：
 
+- `daydream create`
+- `daydream cp`
+- `daydream link`
 - `daydream run`
 - `daydream pull`
 - `daydream list`
 - `daydream rm`
+- `daydream unalias`
 - `daydream show`
 - `daydream serve`
 - `daydream ps`
 - `daydream stop`
 - `daydream models`
+- `daydream mtp`
 
 ### 环境要求
 
@@ -824,11 +916,15 @@ daydream run <短名称>
 
 - `/`：在聊天框里打开命令菜单
 - `/effort`：打开思维链长度选择器
+- `/context`：调整上下文长度
+- `/draft(beta)`：选择 speculative decoding 加速方式
 - `/cli-page`：切换聊天页面密度
 - `/effort instant`
 - `/effort short`
 - `/effort default`
 - `/effort long`
+- `/context 32k`
+- `/draft(beta) lookup`
 - `/cli-page loose`
 - `/cli-page tight`
 - `/help`
@@ -858,6 +954,77 @@ daydream run <短名称>
 - `tight`：尽量减少用户消息、推理框、模型正文和输入框之间的空白
 
 选中的 CLI 页面模式会被保存成之后新聊天的默认值。
+
+#### 上下文长度
+
+命令行里可以直接设置：
+
+```bash
+daydream run <模型名> --context-length 32k
+daydream serve <模型名> --context-length 32k
+```
+
+聊天里可以使用：
+
+```text
+/context
+/context default
+/context 8k
+/context 32k
+/context 128k
+```
+
+`/context` 会调整当前聊天的模型缓存长度。上下文越长，占用内存越高。
+
+#### Speculative decoding 加速
+
+Daydream 把 speculative decoding 做成显式开启的功能，不会在用户不知情的情况下自动下载很大的加速模型。
+
+命令行方法：
+
+- `--speculative none`：单模型基线推理
+- `--speculative lookup`：prompt-lookup decoding，不需要额外模型，适合输出和 prompt 有重叠的任务
+- `--speculative draft`：外部草稿模型加速，适用于支持的模型家族
+- `--speculative mtp`：模型原生 MTP / NextN 路径，适用于完成 MTP 设置后的 Qwen3.6 风格模型
+- `--speculative auto`：Daydream 对当前模型家族的安全默认策略
+
+示例：
+
+```bash
+daydream run <模型名> --speculative lookup
+daydream run <模型名> --speculative draft --draft-model hf.co/<草稿模型名>
+daydream run <模型名> --speculative mtp
+daydream serve <模型名> --speculative lookup
+daydream serve --model hf.co/<模型名> --speculative none
+```
+
+也可以使用短别名：
+
+```bash
+daydream run <模型名> --lookup
+daydream run <模型名> --draft
+daydream run <模型名> --no-draft
+```
+
+聊天里使用：
+
+```text
+/draft(beta)
+/draft(beta) lookup
+/draft(beta) mtp
+/draft(beta) on
+/draft(beta) off
+```
+
+MTP 管理命令：
+
+```bash
+daydream mtp status
+daydream mtp install
+daydream mtp uninstall
+```
+
+`daydream mtp install` 会为支持的模型安装可选 MTP sidecar。默认安装会尽量复用基础模型，只下载 MTP 附件。
 
 #### 多行输入
 
@@ -925,6 +1092,14 @@ daydream stop --force
 
 ```bash
 daydream serve --background --model hf.co/<模型名>
+```
+
+`serve` 也支持同样的上下文和 speculative 选项：
+
+```bash
+daydream serve <模型名> --context-length 32k --speculative lookup
+daydream serve --model hf.co/<模型名> --speculative mtp
+daydream serve --model hf.co/<模型名> --no-draft
 ```
 
 ### OpenAI 兼容 API
@@ -1154,7 +1329,7 @@ daydream run my-model
 
 ### 自定义模型
 
-Daydream 也支持手动定义自定义模型，思路接近 Ollama 的 `Modelfile`。
+Daydream 也支持通过 `Daydreamfile` 手动定义自定义模型。
 
 先写一个 `Daydreamfile`：
 
@@ -1183,7 +1358,7 @@ daydream run mycoder
 daydream serve mycoder
 ```
 
-这里的“手动”含义和 Ollama 类似：
+这里的“手动”含义是：
 
 - 只有你在 `Daydreamfile` 里手动写下的参数才会生效
 - 没写的参数不会自动从基础模型里推断出来

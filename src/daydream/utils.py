@@ -387,10 +387,12 @@ def build_draft_menu_lines(current: str, selected: str) -> list[str]:
     lines = [_frame_line("Draft Acceleration (Beta)", frame_width, indent)]
 
     labels = {
-        "on": "on         Enable built-in Qwen3.5 draft acceleration",
-        "off": "off        Disable draft acceleration",
+        "on":     "on        External draft — Qwen3.5/3.6 hybrid currently unsafe",
+        "mtp":    "mtp       Native MTP head — in-place, ~338 MB extra",
+        "lookup": "lookup    Prompt-ngram — free, hybrid models unsupported",
+        "off":    "off       Single-model decode — correct output (default)",
     }
-    for option in ("on", "off"):
+    for option in ("on", "mtp", "lookup", "off"):
         marker = "› " if option == selected else "  "
         suffix = "  current" if option == current else ""
         content = _fit_display_width(f"{marker}{labels[option]}{suffix}", text_width)

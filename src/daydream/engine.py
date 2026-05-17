@@ -9,71 +9,88 @@ from daydream.models import ensure_runtime_model, get_model_path, is_fixture_mod
 
 
 def _patch_arrays_cache_for_speculative():
-    """Monkey-patch ArraysCache for speculative decoding on Qwen3.5.
+    """No-op kept for import compatibility.
 
-    Draft model (advance(1) per token): exact checkpoint-based restore.
-    Main model (advance(N) batch): no-op trim — the GatedDeltaNet recurrent
-    state cannot be partially rewound, but the attention layers (KVCache)
-    always have correct context.
+    Earlier versions monkey-patched `ArraysCache.is_trimmable -> True`
+    and a checkpoint-based trim so mlx-lm would attempt speculative
+    decoding on Qwen3.5 / Qwen3.6 hybrid models. That was unsound:
+
+      * The cache only checkpoints state after `advance(1)`. Speculation's
+        main-model batch call is `advance(K+1)` in one shot, leaving NO
+        checkpoint at any intermediate position.
+      * `_patched_trim` therefore silently no-ops when asked to trim
+        back a partially-rejected batch — but the cache state HAS
+        advanced. The recurrent GatedDeltaNet state is now wrong for
+        what mlx-lm thinks the position is, and every subsequent token
+        is sampled from corrupted hidden state.
+      * User-visible symptom: missing words, truncated phrases,
+        broken sentences in the main body / reasoning chain (not a
+        token-flood the degen detector can catch).
+
+    The correct posture is to leave `ArraysCache.is_trimmable=False`
+    and refuse external-draft speculation upstream — `_resolve_
+    speculative_settings` / the /draft slash command both check
+    `is_qwen_hybrid_runtime_model` and surface a clear message.
     """
-    try:
-        from mlx_lm.models.cache import ArraysCache
-
-        if ArraysCache(1).is_trimmable():
-            return
-
-        _original_init = ArraysCache.__init__
-        _original_advance = ArraysCache.advance
-
-        def _patched_init(self, size, left_padding=None):
-            _original_init(self, size, left_padding=left_padding)
-            self._checkpoints: dict[int, tuple] = {}
-            self._position: int = 0
-
-        def _patched_advance(self, N):
-            _original_advance(self, N)
-            self._position += N
-            if N == 1:
-                self._checkpoints[self._position] = (
-                    list(self.cache), self.lengths, self.left_padding,
-                )
-                if len(self._checkpoints) > 12:
-                    cutoff = self._position - 10
-                    self._checkpoints = {
-                        k: v for k, v in self._checkpoints.items() if k >= cutoff
-                    }
-
-        def _patched_is_trimmable(self):
-            return True
-
-        def _patched_trim(self, n):
-            if n <= 0:
-                return 0
-            target = self._position - n
-            if target in self._checkpoints:
-                state, lengths, left_padding = self._checkpoints[target]
-                self.cache = list(state)
-                self.lengths = lengths
-                self.left_padding = left_padding
-                self._position = target
-                self._checkpoints = {
-                    k: v for k, v in self._checkpoints.items() if k <= target
-                }
-            # Main model batch path: no checkpoint → no-op (safe).
-            return n
-
-        ArraysCache.__init__ = _patched_init
-        ArraysCache.advance = _patched_advance
-        ArraysCache.is_trimmable = _patched_is_trimmable
-        ArraysCache.trim = _patched_trim
-    except ImportError:
-        pass
-
-
-_patch_arrays_cache_for_speculative()
+    return
 
 # Module-level cache for loaded models
 _loaded_entries: dict[str, tuple[object, object]] = {}
+
+# Module-level cache for MTP backends. The MTPLXRuntime each one
+# wraps is ~16 GB of MLX weights — we MUST NOT rebuild it on every
+# `engine.generate_stream` call. Keyed by `(model_ref, sidecar_path)`
+# so the same backend instance survives across turns in a chat REPL.
+_mtp_backends: dict[tuple[str, str], object] = {}
+
+
+def get_or_create_mtp_backend(model, tokenizer, *, model_ref: str | None):
+    """Return a cached MTPBackend for this (model_ref, sidecar) pair,
+    or build one on first use.
+
+    The cache key intentionally folds the sidecar path in too — if
+    the user reinstalls MTP into a different dir between calls, we
+    rebuild rather than reuse stale state.
+    """
+    from daydream.backends import MTPBackend
+    from daydream.backends.mtp import detect_mtp_sidecar
+
+    sidecar = detect_mtp_sidecar(model_ref)
+    sidecar_path = str(sidecar.runtime_json_path) if sidecar is not None else ""
+    cache_key = (str(model_ref or ""), sidecar_path)
+
+    cached = _mtp_backends.get(cache_key)
+    if cached is not None:
+        return cached
+
+    backend = MTPBackend(model, tokenizer, model_ref=model_ref)
+    backend.prepare()
+    _mtp_backends[cache_key] = backend
+    return backend
+
+
+def teardown_mtp_backends() -> None:
+    """Release all cached MTPBackend instances (frees their MTPLXRuntime
+    objects so MLX can reclaim GPU memory).
+
+    Called by chat.py when the user switches *out* of MTP mode via
+    /draft off or /draft on — without this, the 16 GB MTP trunk stays
+    pinned in memory for the rest of the session.
+    """
+    import gc
+
+    for backend in list(_mtp_backends.values()):
+        try:
+            backend.teardown()
+        except Exception:
+            pass
+    _mtp_backends.clear()
+    try:
+        import mlx.core as mx
+        mx.clear_cache()
+    except Exception:
+        pass
+    gc.collect()
 
 
 @dataclass
@@ -212,36 +229,57 @@ def load_model(name: str, verbose: bool = False, *, ensure_available: bool = Tru
 
 
 def warmup_draft_model(model, draft_model, tokenizer) -> None:
-    """Run a tiny speculative generation to compile Metal shaders for both models."""
+    """Compile Metal shaders for both models WITHOUT running them jointly.
+
+    Running mlx_stream_generate(main, draft=draft) on a hybrid pair
+    (Qwen3.5 / Qwen3.6) constructs a fused command buffer that frequently
+    exceeds Metal's per-buffer execution timeout
+    (kIOGPUCommandBufferCallbackErrorTimeout) on machines with tight
+    unified-memory headroom — and that surfaces as a C++ std::abort
+    which Python cannot recover from.
+
+    We avoid that landmine by warming each model on its own. The first
+    real chat token after this will JIT-compile the joint kernels, but
+    it'll be inside the existing generate_stream try/except (which can
+    fall back to plain decoding without crashing the process).
+    """
     if isinstance(model, FixtureModel):
         return
+
     try:
         import mlx.core as mx
         from mlx_lm import stream_generate as mlx_stream_generate
         from mlx_lm.sample_utils import make_sampler
+    except ImportError:
+        return
 
-        sampler = make_sampler(temp=0.0)
-        # Warm up both models together via the speculative path
-        for _ in mlx_stream_generate(
-            model, tokenizer, prompt="hi", max_tokens=2, sampler=sampler,
-            draft_model=draft_model, num_draft_tokens=2,
-        ):
-            pass
-        mx.clear_cache()
-    except Exception:
-        # Fallback: warm up individually
+    sampler = make_sampler(temp=0.0)
+
+    def _warmup_single(target) -> None:
         try:
             for _ in mlx_stream_generate(
-                model, tokenizer, prompt="hi", max_tokens=1, sampler=sampler,
+                target, tokenizer, prompt="hi", max_tokens=1, sampler=sampler,
             ):
                 pass
-            mx.clear_cache()
         except Exception:
             pass
 
+    _warmup_single(model)
+    if draft_model is not None and draft_model is not model:
+        _warmup_single(draft_model)
+    try:
+        mx.clear_cache()
+    except Exception:
+        pass
 
-def create_prompt_cache(model, draft_model=None):
-    """Create a reusable prompt cache for chat turns."""
+
+def create_prompt_cache(model, draft_model=None, *, max_kv_size: int | None = None):
+    """Create a reusable prompt cache for chat turns.
+
+    `max_kv_size` caps the working KV window in tokens. Once the cache
+    has that many entries, mlx-lm rotates them in-place. None means
+    "model default" (the model's max_position_embeddings).
+    """
     if isinstance(model, FixtureModel):
         return None
     if not type(model).__module__.startswith("mlx_lm."):
@@ -249,10 +287,67 @@ def create_prompt_cache(model, draft_model=None):
     try:
         from mlx_lm.models.cache import make_prompt_cache
 
-        prompt_cache = make_prompt_cache(model)
+        prompt_cache = make_prompt_cache(model, max_kv_size=max_kv_size) if max_kv_size else make_prompt_cache(model)
         if draft_model is not None:
-            prompt_cache += make_prompt_cache(draft_model)
+            draft_cache = make_prompt_cache(draft_model, max_kv_size=max_kv_size) if max_kv_size else make_prompt_cache(draft_model)
+            prompt_cache += draft_cache
         return prompt_cache
+    except Exception:
+        return None
+
+
+def model_max_position_embeddings(model) -> int | None:
+    """Return the loaded model's positional-embedding limit, if known."""
+    if isinstance(model, FixtureModel):
+        return None
+    args = getattr(model, "args", None)
+    for attr in ("max_position_embeddings", "max_position_embedding"):
+        value = getattr(args, attr, None) if args is not None else None
+        if isinstance(value, int) and value > 0:
+            return value
+    cfg = getattr(model, "config", None)
+    for attr in ("max_position_embeddings", "max_position_embedding"):
+        value = getattr(cfg, attr, None) if cfg is not None else None
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
+
+
+def available_ram_bytes() -> Optional[int]:
+    """Best-effort estimate of immediately-allocatable RAM in bytes.
+
+    Apple Silicon uses unified memory, so 'free RAM' is the cap on what
+    MLX can put on the GPU. We parse `vm_stat` because macOS doesn't
+    ship psutil — and we want this check to run without adding a
+    runtime dependency.
+
+    Returns None if probing fails — callers must treat that as
+    'unknown, don't refuse'.
+    """
+    import subprocess
+
+    try:
+        page_size = 16384  # M1/M2/M3 default; verified below.
+        out = subprocess.run(
+            ["vm_stat"], capture_output=True, text=True, timeout=2,
+        )
+        if out.returncode != 0:
+            return None
+        free_pages = inactive_pages = speculative_pages = 0
+        for line in out.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("Mach Virtual Memory Statistics") and "page size of" in line:
+                try:
+                    page_size = int(line.split("page size of")[1].split()[0])
+                except Exception:
+                    pass
+            elif line.startswith("Pages free"):
+                free_pages = int(line.split(":")[1].strip().rstrip("."))
+            elif line.startswith("Pages inactive"):
+                inactive_pages = int(line.split(":")[1].strip().rstrip("."))
+            elif line.startswith("Pages speculative"):
+                speculative_pages = int(line.split(":")[1].strip().rstrip("."))
+        return (free_pages + inactive_pages + speculative_pages) * page_size
     except Exception:
         return None
 
@@ -287,15 +382,20 @@ def _model_needs_chunked_speculative(model) -> bool:
 
 def _draft_with_fallback(
     model, tokenizer, draft_model, prompt_str, *,
-    max_tokens, sampler, num_draft_tokens=2,
+    max_tokens, sampler, num_draft_tokens=2, prefill_step_size=None,
+    prompt_cache=None,
 ):
-    """Draft-accelerated generation with degeneration fallback.
+    """Draft-accelerated generation with a short safety buffer.
 
-    Runs mlx-lm's native speculative loop at full speed.  Monitors every
-    token for degeneration patterns.  If detected, discards ALL draft output
-    and restarts cleanly with the main model from the original prompt.
+    On hybrid models (Qwen3.5 / Qwen3.6) the GatedDeltaNet recurrent
+    state cannot be cleanly rewound after a rejected draft token. To
+    avoid showing the user any garbage we use a *short* probe window
+    at the start of generation — if the draft pair degenerates in those
+    first few tokens we discard them and replay through the main model
+    alone. After the probe window passes we stream tokens immediately,
+    so TTFT stays close to the underlying draft path.
 
-    Detection: single-token flood (8/15) OR bigram flood (6/20).
+    Detection: single-token flood (5/10) OR bigram flood (4/12).
     """
     import time
     from collections import Counter
@@ -307,52 +407,78 @@ def _draft_with_fallback(
     prompt_tokens = mx.array(tokenizer.encode(prompt_str))
     tic = time.perf_counter()
 
-    # Degeneration detector state
+    # Degeneration detector state. Tightened thresholds vs the historic
+    # 8/15 + 6/20 — those required 20 buffered tokens before deciding,
+    # which made TTFT roughly the same as plain generation. The smaller
+    # windows still catch the dominant failure mode (the model getting
+    # stuck on a token / token-pair) within ~10 tokens.
     _recent: list[int] = []
     _bigrams: list[tuple[int, int]] = []
 
     def _is_degenerate() -> bool:
-        # Single token flood: 8+ of same token in last 15
-        if len(_recent) >= 15:
-            if Counter(_recent[-15:]).most_common(1)[0][1] >= 8:
+        # Single-token flood: 5 copies of the same token in last 10 emitted.
+        if len(_recent) >= 10:
+            if Counter(_recent[-10:]).most_common(1)[0][1] >= 5:
                 return True
-        # Bigram flood: same 2-token pair 6+ times in last 20 bigrams
-        if len(_bigrams) >= 20:
-            if Counter(_bigrams[-20:]).most_common(1)[0][1] >= 6:
+        # Bigram flood (catches "* * * *" alternation). The 4-in-12 rule
+        # only fires after 13 tokens, which doesn't help if the probe
+        # phase (8 tokens) already shows alternation. Add a tighter
+        # early-probe rule: 3 copies of the same bigram in the last 6.
+        if len(_bigrams) >= 6:
+            if Counter(_bigrams[-6:]).most_common(1)[0][1] >= 3:
+                return True
+        if len(_bigrams) >= 12:
+            if Counter(_bigrams[-12:]).most_common(1)[0][1] >= 4:
                 return True
         return False
 
-    # ── Phase 1: Draft generation (buffered, short — max 50 tokens) ──
-    # Only buffer a small number of tokens to limit the "blank" period.
-    # If the model finishes (EOS) within 50 tokens → yield buffer (fast).
-    # If not or degenerated → discard, stream with normal model (Phase 2).
+    # ── Phase 1: short probe (≤ PROBE_TOKENS, buffered for rollback) ──
+    # Buffer a handful of tokens so we can throw them away if the
+    # draft+main combo degenerates immediately. Anything beyond this
+    # streams live — at 50 tok/s, PROBE_TOKENS=8 means the user sees
+    # output after ~150 ms, which is comparable to non-draft TTFT.
+    PROBE_TOKENS = 8
     buffered: list[GenerationResponse] = []
     prompt_tps: float = 0.0
     degenerated = False
-    draft_cap = min(30, max_tokens)
 
-    for response in mlx_stream_generate(
+    extra_kwargs: dict = {
+        "draft_model": draft_model,
+        "num_draft_tokens": num_draft_tokens,
+    }
+    if prefill_step_size is not None:
+        extra_kwargs["prefill_step_size"] = prefill_step_size
+    if prompt_cache is not None:
+        extra_kwargs["prompt_cache"] = prompt_cache
+
+    stream = mlx_stream_generate(
         model, tokenizer, prompt_str,
-        max_tokens=draft_cap, sampler=sampler,
-        draft_model=draft_model, num_draft_tokens=num_draft_tokens,
-    ):
+        max_tokens=max_tokens, sampler=sampler,
+        **extra_kwargs,
+    )
+
+    # Probe phase: keep tokens in a buffer so we can fall back cleanly.
+    for response in stream:
         _recent.append(response.token)
         if len(_recent) > 1:
             _bigrams.append((_recent[-2], _recent[-1]))
-        if len(buffered) == 0:
+        if not buffered:
             prompt_tps = response.prompt_tps
         buffered.append(response)
 
         if response.finish_reason == "stop":
+            # Short answer that finished inside the probe — yield buffer.
             break
 
         if _is_degenerate():
             degenerated = True
             break
 
-    # If draft completed with EOS and no degeneration → yield buffer (fast path)
-    phase1_eos = buffered and buffered[-1].finish_reason == "stop"
-    if not degenerated and phase1_eos:
+        if len(buffered) >= PROBE_TOKENS:
+            break  # transition to live streaming
+
+    if not degenerated:
+        # Yield the buffered probe tokens, then continue streaming live.
         for i, response in enumerate(buffered):
             yield GenerationResponse(
                 text=response.text,
@@ -366,14 +492,72 @@ def _draft_with_fallback(
                 peak_memory=response.peak_memory,
                 finish_reason=response.finish_reason,
             )
-        return
-    # Otherwise (degenerated OR didn't finish in 50 tokens) → Phase 2
+            if response.finish_reason == "stop":
+                return
 
-    # ── Phase 2: Draft degenerated → discard buffer, restart with main model ──
+        # ── Phase 1b: live stream from the same draft path ─────────────
+        # We're past the probe and the model isn't degenerate. Continue
+        # consuming the SAME stream generator (so the spec-decoding KV
+        # state is preserved) and emit tokens as they arrive.
+        #
+        # Critical: we KEEP running the degeneration detector every
+        # token, not just during the probe. If the draft pair flips
+        # into a repetition loop mid-generation (the classic
+        # "* * * * *" or "8 8 8 8" failure mode), we stop emitting
+        # rather than let the user watch an asterisk field scroll by.
+        ntoks = len(buffered)
+        for response in stream:
+            _recent.append(response.token)
+            if len(_recent) > 1:
+                _bigrams.append((_recent[-2], _recent[-1]))
+            # Trim sliding windows so memory doesn't grow unbounded.
+            if len(_recent) > 32:
+                _recent = _recent[-32:]
+            if len(_bigrams) > 32:
+                _bigrams = _bigrams[-32:]
+            ntoks += 1
+            yield GenerationResponse(
+                text=response.text,
+                token=response.token,
+                logprobs=response.logprobs,
+                from_draft=response.from_draft,
+                prompt_tokens=prompt_tokens.size,
+                prompt_tps=prompt_tps,
+                generation_tokens=ntoks,
+                generation_tps=ntoks / (time.perf_counter() - tic) if ntoks > 0 else 0.0,
+                peak_memory=response.peak_memory,
+                finish_reason=response.finish_reason,
+            )
+            if response.finish_reason:
+                return
+            if _is_degenerate():
+                # Stop emitting — the loop is real, not transient.
+                # We can't rewind the tokens already yielded, but at
+                # least the chat reply doesn't fill the screen.
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+                return
+        return
+
+    # ── Phase 2: draft degenerated → discard buffer, replay clean ────
+    # Drain the generator so mlx-lm finalizes its internal state, then
+    # restart on the main model alone with the same prompt.
+    try:
+        stream.close()
+    except Exception:
+        pass
+
+    fallback_kwargs: dict = {}
+    if prefill_step_size is not None:
+        fallback_kwargs["prefill_step_size"] = prefill_step_size
+
     ntoks = 0
     for response in mlx_stream_generate(
         model, tokenizer, prompt_str,
         max_tokens=max_tokens, sampler=sampler,
+        **fallback_kwargs,
     ):
         ntoks += 1
         yield GenerationResponse(
@@ -405,6 +589,9 @@ def generate_stream(
     num_draft_tokens: int | None = None,
     prefill_step_size: int | None = None,
     prompt_cache=None,
+    pld_enabled: bool = False,
+    mtp_enabled: bool = False,
+    mtp_model_ref: str | None = None,
 ) -> Generator:
     """Stream-generate a response from a list of chat messages."""
     if isinstance(model, FixtureModel):
@@ -437,13 +624,57 @@ def generate_stream(
 
     sampler = make_sampler(temp=temp, top_p=top_p)
 
-    # For models with non-trimmable caches (Qwen3.5): run draft first,
-    # detect degeneration, fallback to clean normal generation if needed.
+    # MTP path: model-native multi-token prediction via the MTPBackend.
+    # Uses a module-level cache so the 16 GB MTPLXRuntime survives
+    # across chat turns instead of being rebuilt each time.
+    if mtp_enabled and draft_model is None:
+        from daydream.backends.base import SamplingParams, SpeculativeParams
+
+        backend = get_or_create_mtp_backend(model, tokenizer, model_ref=mtp_model_ref)
+        caps = backend.capabilities()
+        if caps.supports_speculative:
+            sampling = SamplingParams(temperature=temp, top_p=top_p, max_tokens=max_tokens)
+            speculative = SpeculativeParams(
+                method="mtp",
+                num_speculative_tokens=num_draft_tokens or 2,
+            )
+            yield from backend.generate(
+                messages,
+                sampling,
+                speculative,
+                chat_template_kwargs=chat_template_kwargs,
+                prompt_cache=prompt_cache,
+                prefill_step_size=prefill_step_size,
+            )
+            return
+        # else: fall through; the caller already saw the warning at
+        # /draft / --speculative time.
+
+    # PLD (prompt-lookup decoding) path: no draft model, ngram-based
+    # speculation. Only safe on models with trimmable prompt caches.
+    if pld_enabled and draft_model is None:
+        from daydream.pld import pld_stream, supports_pld
+
+        ok, _reason = supports_pld(model)
+        if ok:
+            yield from pld_stream(
+                model, tokenizer, prompt,
+                max_tokens=max_tokens, sampler=sampler,
+                prompt_cache=prompt_cache,
+            )
+            return
+        # If PLD isn't safe on this model, silently fall through to
+        # plain decoding rather than corrupt output.
+
+    # For models with non-trimmable caches (Qwen3.5 / Qwen3.6): run a
+    # short safety probe under the draft, then stream live.
     if draft_model is not None and _model_needs_chunked_speculative(model):
         yield from _draft_with_fallback(
             model, tokenizer, draft_model, prompt,
             max_tokens=max_tokens, sampler=sampler,
             num_draft_tokens=num_draft_tokens or 2,
+            prefill_step_size=prefill_step_size,
+            prompt_cache=prompt_cache,
         )
         return
 

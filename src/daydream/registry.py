@@ -25,6 +25,15 @@ BUILTIN_REGISTRY: dict[str, dict[str, str]] = {
         "30b": "mlx-community/Qwen3-30B-A3B-4bit",
         "32b": "mlx-community/Qwen3-32B-4bit",
     },
+    "qwen3.6": {
+        # Qwen3.6 ships with native draft-model speculative decoding
+        # support. The 27B Q4 variant is the flagship dense model.
+        "default": "mlx-community/Qwen3.6-27B-4bit",
+        "27b": "mlx-community/Qwen3.6-27B-4bit",
+        "27b-optiq": "mlx-community/Qwen3.6-27B-OptiQ-4bit",
+        "27b-8bit": "mlx-community/Qwen3.6-27B-8bit",
+        "35b-a3b": "mlx-community/Qwen3.6-35B-A3B-4bit",
+    },
     "qwen2.5-coder": {
         "default": "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
         "1.5b": "mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit",

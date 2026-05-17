@@ -1,7 +1,7 @@
 [project]
 name = "daydream"
-version = "0.1.8"
-description = "Apple Silicon local model CLI — Ollama UX, MLX engine"
+version = "0.1.9"
+description = "Apple Silicon local model CLI powered by MLX"
 requires-python = ">=3.14"
 dependencies = [
     "mlx-lm>=0.31.0",
@@ -9,6 +9,14 @@ dependencies = [
     "huggingface-hub>=0.20",
     "pyyaml>=6.0",
     "rich>=13.0",
+    # MTPLX is bundled — model-native MTP / NextN speculative decoding
+    # for Qwen3.6 (Apache-2.0, github.com/youssofal/MTPLX). Always
+    # installed alongside Daydream on Apple Silicon so `--speculative
+    # mtp` and `/draft mtp` work without a separate install step.
+    # The platform guard mirrors mtplx's own — on non-Apple-Silicon
+    # the dependency is skipped and the MTP code path reports
+    # "Apple Silicon required" via MTPBackend.capabilities().
+    'mtplx>=0.3.6; sys_platform == "darwin" and platform_machine == "arm64"',
 ]
 
 [project.scripts]

@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.1.9
+
+### Added
+
+- Added opt-in speculative decoding controls for `run` and `serve`: `--speculative auto|mtp|draft|lookup|none`, plus `--draft`, `--lookup`, `--no-draft`, `--draft-model`, and `--num-draft-tokens`.
+- Added chat slash control `/draft(beta)` with `on`, `mtp`, `lookup`, and `off` modes.
+- Added prompt-lookup decoding as a no-extra-model acceleration path for compatible prompts.
+- Added MTP management commands: `daydream mtp status`, `daydream mtp install`, and `daydream mtp uninstall`.
+- Added context-length controls through `--context-length` and chat `/context`.
+- Added speculative backend structure, MTPLX runtime integration metadata, and NOTICE attribution.
+- Added tests covering speculative method dispatch, backends, MTP install behavior, PLD, and context length.
+
+### Changed
+
+- `daydream show` now reports speculative decoding capability information for known model families.
+- `run` and `serve` now share the same speculative/context option surface where possible.
+- README now documents speculative decoding, MTP setup, context length, and chat slash controls in English and Chinese.
+- Project description and README positioning now describe Daydream as a focused local MLX terminal CLI without emphasizing older UX comparisons.
+
+### Fixed
+
+- Added safer handling for unsupported or unsafe speculative paths so Daydream falls back or explains the limitation instead of silently corrupting output.
+
 ## v0.1.8
 
 ### Added

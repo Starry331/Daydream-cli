@@ -18,7 +18,14 @@ from rich.console import Console, Group
 from rich.text import Text
 
 from daydream import engine
-from daydream.config import get_default_cli_page_mode, set_default_cli_page_mode
+from daydream.config import (
+    CONTEXT_LENGTH_PRESETS,
+    get_default_cli_page_mode,
+    get_default_context_length,
+    resolve_context_length,
+    set_default_cli_page_mode,
+    set_default_context_length,
+)
 from daydream.models import ensure_runtime_model, is_model_available_locally, pull_model
 from daydream.registry import reverse_lookup
 from daydream.speculative import (
@@ -67,13 +74,17 @@ OPEN_THINK_TAG = "<think>"
 CLOSE_THINK_TAG = "</think>"
 EFFORT_LEVELS = ("instant", "short", "default", "long")
 CLI_PAGE_LEVELS = CLI_PAGE_MODES
-_DRAFT_COMMAND_LEVELS = ("on", "off")
+# Order matters: the arrow-key picker walks this list in order, and
+# the menu (`build_draft_menu_lines`) draws them in the same order so
+# the cursor visually tracks selection.
+_DRAFT_COMMAND_LEVELS = ("on", "mtp", "lookup", "off")
 DRAFT_SLASH_COMMAND = "/draft(beta)"
 SLASH_COMMANDS = (
-    ("/effort", "adjust reasoning depth"),
-    (DRAFT_SLASH_COMMAND, "toggle draft acceleration for supported models"),
-    ("/cli-page", "choose loose or tight page spacing"),
-    ("/help", "show available commands"),
+    ("/effort", "reasoning depth"),
+    ("/context", "context length (4k / 32k / 128k / N)"),
+    (DRAFT_SLASH_COMMAND, "speculative decoding (on / mtp / lookup / off)"),
+    ("/cli-page", "page spacing (loose / tight)"),
+    ("/help", "show commands"),
     ("/new", "start a persistent chat session"),
     ("/resume", "resume a saved session"),
     ("/forget", "delete a saved session"),
@@ -301,45 +312,81 @@ def _effort_chat_template_kwargs(effort: str, tokenizer) -> dict:
     # then fall back to inspecting the Jinja template for enable_thinking.
     # Distilled models (e.g. Qwen3.5-Claude) may lack has_thinking but
     # still have a template that supports enable_thinking.
+    template_str = str(getattr(tokenizer, "chat_template", "") or "")
     has_thinking = bool(getattr(tokenizer, "has_thinking", False))
-    if not has_thinking:
-        template = getattr(tokenizer, "chat_template", None)
-        if template and "enable_thinking" in str(template):
-            has_thinking = True
+    if not has_thinking and "enable_thinking" in template_str:
+        has_thinking = True
     if not has_thinking:
         return {}
-    # Always enable thinking so the model wraps reasoning in
-    # <think>...</think> tags instead of leaking it into visible text.
-    # Always pass thinking_budget — Jinja templates silently ignore
-    # unknown variables, and omitting it can cause some templates to
-    # default to a very small budget (cutting reasoning short).
-    if effort == "default":
-        return {"enable_thinking": True, "thinking_budget": 10000}
-    if effort == "long":
-        return {"enable_thinking": True, "thinking_budget": 10000}
+
+    # Only emit `thinking_budget` when the template actually reads it.
+    # Stock Qwen3 / Qwen3.5 / Qwen3.6 templates do NOT define a
+    # thinking_budget variable, and Jinja silently drops unknown kwargs,
+    # so passing it would not change behaviour — the budget knob has to
+    # be enforced via max_tokens (see _effort_max_tokens).
+    supports_budget = "thinking_budget" in template_str
+
     if effort == "instant":
         return {"enable_thinking": False}
+
+    kwargs: dict = {"enable_thinking": True}
+    if supports_budget:
+        if effort == "short":
+            kwargs["thinking_budget"] = 200
+        else:
+            kwargs["thinking_budget"] = 10000
+    return kwargs
+
+
+def _effort_max_tokens(effort: str, base_max_tokens: int) -> int:
+    """Cap (or extend) generation length according to /effort.
+
+    Policy:
+      default → caller's budget, untouched
+      instant → ≤ 1024 (tight answer, no reasoning)
+      short   → ≤ max(512, base/4) (brief reasoning)
+      long    → ≥ max(base, 8192) (give room for thorough reasoning)
+    """
+    if base_max_tokens <= 0:
+        return base_max_tokens
+    if effort == "instant":
+        return min(base_max_tokens, 1024)
     if effort == "short":
-        return {"enable_thinking": True, "thinking_budget": 200}
-    return {"enable_thinking": True, "thinking_budget": 10000}
+        return min(base_max_tokens, max(512, base_max_tokens // 4))
+    if effort == "long":
+        return max(base_max_tokens, 8192)
+    return base_max_tokens
 
 
 def _effort_system_prompt(effort: str, model_name: str) -> str | None:
+    # /effort default explicitly does NOT inject a system prompt —
+    # keep the model's native thinking behavior untouched.
     if effort == "default" or not _model_supports_effort(model_name):
         return None
 
+    # Every non-default level adds an anti-loop directive to cut the
+    # "internal churn" (asterisk fields, restating the question,
+    # self-doubt loops) the user complained about. The directives are
+    # written to be *cumulative* with the model's native reasoning —
+    # they don't force a specific style, just forbid loops.
+    NO_LOOP = (
+        "Do not repeat earlier reasoning or restate the question. "
+        "Each thought must add new information; the moment you have "
+        "enough to answer, stop thinking and commit."
+    )
+
     prompts = {
         "instant": (
-            "Answer directly and concisely. Prefer minimal internal reasoning. "
-            "Skip preamble and go straight to the answer."
+            "Answer directly. Skip internal reasoning entirely. "
+            "One short paragraph at most. " + NO_LOOP
         ),
         "short": (
-            "Reason briefly and efficiently before answering. "
-            "Keep analysis minimal, skip obvious steps, and focus on the answer."
+            "Reason concisely — 3-5 sentences of thinking max. "
+            "Skip obvious steps and self-doubt. " + NO_LOOP
         ),
         "long": (
-            "Reason thoroughly before answering. "
-            "Explore key angles, consider edge cases, verify your logic, and then give the answer."
+            "Reason thoroughly. Cover multiple angles, edge cases, "
+            "and verification. " + NO_LOOP
         ),
     }
     return prompts.get(effort)
@@ -354,6 +401,122 @@ def _normalize_draft_command(value: str | None) -> str | None:
     return None
 
 
+def _try_enable_mtp(model, tokenizer, model_ref: str | None) -> bool:
+    """Probe MTP, prompt-install missing pieces. Returns True if ready."""
+    from daydream.backends import MTPBackend
+    from daydream.backends.mtp import detect_mtp_sidecar, mtplx_available
+
+    is_tty = sys.stdin.isatty() and err_console.is_terminal
+
+    if not mtplx_available():
+        err_console.print(
+            "[yellow]MTP runtime missing.[/] "
+            "[dim]Reinstall: pip install --force-reinstall daydream[/dim]"
+        )
+        return False
+
+    # Step 2: MTP head presence — thin install path.
+    sidecar = detect_mtp_sidecar(model_ref)
+    if sidecar is None:
+        from daydream.backends.mtp_install import (
+            DEFAULT_BASE_TRUNK,
+            DEFAULT_SIDECAR_REPO,
+            THIN_INSTALL_DOWNLOAD_BYTES,
+            find_thin_install,
+            thin_install,
+        )
+        from daydream.models import is_model_available_locally
+        from daydream.utils import format_size
+
+        thin_size = format_size(THIN_INSTALL_DOWNLOAD_BYTES)
+        err_console.print(f"[yellow]MTP head not installed (~{thin_size}).[/]")
+        err_console.print("[dim]Trunk reused from local cache (saves ~15.7 GB).[/dim]")
+
+        if not is_model_available_locally(DEFAULT_BASE_TRUNK):
+            err_console.print(f"[yellow]Trunk `{DEFAULT_BASE_TRUNK}` not cached.[/]")
+            if not is_tty or not _yes_no_prompt(
+                f"Pull trunk now (~16 GB)?", default=False
+            ):
+                err_console.print(f"[dim]Manually: daydream pull {DEFAULT_BASE_TRUNK}[/dim]")
+                return False
+            from daydream.models import pull_model
+
+            try:
+                pull_model(DEFAULT_BASE_TRUNK, register_alias=True)
+            except SystemExit:
+                return False
+
+        if not is_tty:
+            err_console.print("[dim]Install: daydream mtp install[/dim]")
+            return False
+        if not _yes_no_prompt(f"Install MTP head ({thin_size})?", default=True):
+            return False
+        try:
+            with err_console.status("Installing MTP head..."):
+                thin_install()
+        except FileNotFoundError as exc:
+            err_console.print(f"[red]{exc}[/]")
+            return False
+        except Exception as exc:
+            err_console.print(f"[red]Install failed:[/] [dim]{exc}[/dim]")
+            return False
+        sidecar = detect_mtp_sidecar(model_ref)
+        if sidecar is None:
+            err_console.print("[red]Sidecar still not detected.[/]")
+            return False
+        err_console.print(f"[green]✓[/] MTP head installed.")
+
+    # Step 3: trunk-mismatch guard. Sidecar's trained against a
+    # specific trunk; refuse cleanly if the running model differs.
+    if model_ref and sidecar.base_trunk and sidecar.base_trunk != model_ref:
+        err_console.print(
+            f"[yellow]MTP sidecar is for `{sidecar.base_trunk}`, not `{model_ref}`.[/]"
+        )
+        return False
+
+    # Step 3: build and validate the backend.
+    backend = MTPBackend(model, tokenizer, model_ref=model_ref)
+    backend.prepare()
+    caps = backend.capabilities()
+    if not caps.supports_speculative:
+        err_console.print(f"[yellow]MTP unavailable:[/] [dim]{caps.notes}[/dim]")
+        return False
+
+    # Eager RAM probe — building the runtime now (in foreground, with a
+    # status spinner) gives the user immediate feedback instead of
+    # discovering OOM on their first reply. The backend will reuse this
+    # runtime on the first generate() call.
+    from daydream.backends.mtp import MTPInsufficientMemory, MTPSidecarMissing
+
+    try:
+        with err_console.status("Loading MTP runtime..."):
+            backend._ensure_runtime()
+    except MTPInsufficientMemory as exc:
+        err_console.print(f"[yellow]MTP can't load:[/] [dim]{exc}[/dim]")
+        return False
+    except MTPSidecarMissing as exc:
+        err_console.print(f"[yellow]MTP sidecar issue:[/] [dim]{exc}[/dim]")
+        return False
+    except Exception as exc:  # noqa: BLE001
+        err_console.print(f"[yellow]MTP load failed:[/] [dim]{exc}[/dim]")
+        return False
+    err_console.print("[green]Daydream MTP acceleration on.[/]")
+    return True
+
+
+def _yes_no_prompt(prompt: str, *, default: bool = True) -> bool:
+    """Tiny readline-free prompt — matches the rest of the REPL's style."""
+    hint = "Y/n" if default else "y/N"
+    try:
+        reply = input(f"  {prompt} [{hint}]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        err_console.print()
+        return False
+    if not reply:
+        return default
+    return reply[:1] == "y"
+
+
 def _resolve_speculative_settings(
     *,
     model_name: str,
@@ -361,26 +524,60 @@ def _resolve_speculative_settings(
     draft_mode: str | None,
     just_downloaded_main: bool,
     allow_prompt: bool,
+    draft_model_override: str | None = None,
 ) -> tuple[str | None, int | None]:
     if draft_mode == "off":
         return None, None
 
-    draft_model = draft_model_for_family(resolved_model)
-    if draft_model is None:
-        if draft_mode == "force":
-            raise ValueError("Manual draft mode is only supported for Qwen3.5 MLX models.")
+    # `draft_model_for_family` returns the daydream-recommended draft
+    # repo for any *supported* main model (Qwen3.5 / Qwen3.6).
+    # `default_draft_for_model` returns the same repo only for families
+    # we want to AUTO-enable (Qwen3.6 today). The split lets Qwen3.5
+    # stay opt-in while Qwen3.6 gets draft acceleration by default.
+    manual_draft = draft_model_for_family(resolved_model)
+    auto_draft = default_draft_for_model(resolved_model)
+    if manual_draft is None:
+        if draft_mode == "force" or draft_model_override:
+            raise ValueError("Draft mode is only supported for Qwen3.5 and Qwen3.6 MLX models.")
+        return None, None
+
+    # Hybrid GatedDeltaNet models (Qwen3.5 / Qwen3.6): mlx-lm 0.31
+    # silently corrupts the recurrent cache on partial-rejection
+    # trims, producing missing words / broken sentences. Refuse rather
+    # than ship bad output. (Same diagnosis as `/draft on` in the REPL.)
+    from daydream.speculative import is_qwen_hybrid_runtime_model
+    if is_qwen_hybrid_runtime_model(resolved_model):
+        if draft_mode == "force" or draft_model_override:
+            raise ValueError(
+                "Draft acceleration on Qwen3.5/Qwen3.6 hybrid models is currently unsafe "
+                "(mlx-lm partial-rejection trims corrupt the GatedDeltaNet state). "
+                "Run without --speculative draft / --draft for correct output."
+            )
         return None, None
 
     num_draft_tokens = default_num_draft_tokens(resolved_model)
     if num_draft_tokens is None:
         return None, None
 
-    if is_model_available_locally(draft_model):
-        return draft_model, num_draft_tokens
+    # If the user explicitly passed --draft-model, honour that override.
+    # We don't validate vocab compatibility here (mlx-lm will refuse
+    # with a clear error if the draft and main don't match), but we DO
+    # auto-pull the override if it's not cached.
+    if draft_model_override:
+        target = draft_model_override.strip()
+        if not is_model_available_locally(target):
+            pull_model(target, register_alias=True)
+        return target, num_draft_tokens
 
     if draft_mode == "force":
-        pull_model(draft_model, register_alias=True)
-        return draft_model, num_draft_tokens
+        if not is_model_available_locally(manual_draft):
+            pull_model(manual_draft, register_alias=True)
+        return manual_draft, num_draft_tokens
+
+    # No explicit --draft flag: auto-enable only when the family is in
+    # the auto-enable allowlist AND the draft is already cached.
+    if auto_draft and is_model_available_locally(auto_draft):
+        return auto_draft, num_draft_tokens
 
     return None, None
 
@@ -1968,6 +2165,9 @@ def _stream_response(
     num_draft_tokens: int | None = None,
     prefill_step_size: int | None = None,
     prompt_cache=None,
+    pld_enabled: bool = False,
+    mtp_enabled: bool = False,
+    mtp_model_ref: str | None = None,
     cli_page_mode: str = "loose",
     skip_final_print: bool = False,
 ):
@@ -2003,7 +2203,7 @@ def _stream_response(
     _had_reasoning = False
     _reasoning_elapsed = None
 
-    with daydreaming_status(err_console, model_label, cli_page_mode=cli_page_mode, draft_active=draft_model is not None) as status:
+    with daydreaming_status(err_console, model_label, cli_page_mode=cli_page_mode, draft_active=draft_model is not None or pld_enabled or mtp_enabled) as status:
         for response in engine.generate_stream(
             model, tokenizer, messages,
             max_tokens=max_tokens, temp=temp, top_p=top_p,
@@ -2012,6 +2212,9 @@ def _stream_response(
             num_draft_tokens=num_draft_tokens,
             prefill_step_size=prefill_step_size,
             prompt_cache=prompt_cache,
+            pld_enabled=pld_enabled,
+            mtp_enabled=mtp_enabled,
+            mtp_model_ref=mtp_model_ref,
         ):
             raw_chunk = response.text or ""
             text_chunk, reasoning_chunk, reasoning_closed = parser.feed(raw_chunk)
@@ -2461,6 +2664,8 @@ def run_oneshot(
     verbose: bool = False,
     initial_effort: str = "default",
     draft_mode: str | None = None,
+    draft_model_override: str | None = None,
+    num_draft_tokens_override: int | None = None,
     display_name: str | None = None,
 ) -> None:
     """Run a single generation and exit."""
@@ -2483,7 +2688,39 @@ def run_oneshot(
     if type(model).__module__.startswith("mlx_lm."):
         engine.set_metal_wired_limit()
     supports_draft_runtime, draft_runtime_reason = engine.speculative_runtime_status(model)
-    if not supports_draft_runtime:
+    pld_enabled = False
+    mtp_enabled = False
+    if draft_mode == "mtp":
+        from daydream.speculative_methods import (
+            METHOD_DRAFT,
+            METHOD_LOOKUP,
+            capability_for,
+        )
+
+        if _try_enable_mtp(model, tokenizer, resolved_name):
+            mtp_enabled = True
+            draft_repo, num_draft_tokens = None, None
+            draft_mode = None
+        else:
+            cap = capability_for(resolved_name)
+            if METHOD_DRAFT in cap.available and supports_draft_runtime:
+                err_console.print("[dim]  → using --speculative draft instead.[/dim]")
+                draft_mode = "force"
+            elif METHOD_LOOKUP in cap.available:
+                err_console.print("[dim]  → using --speculative lookup instead.[/dim]")
+                draft_mode = "lookup"
+            else:
+                draft_mode = "off"
+    if draft_mode == "lookup":
+        from daydream.pld import supports_pld
+
+        ok, reason = supports_pld(model)
+        if ok:
+            pld_enabled = True
+        else:
+            err_console.print(f"[dim]/draft lookup not safe here: {reason}[/dim]")
+        draft_repo, num_draft_tokens = None, None
+    elif not supports_draft_runtime:
         draft_repo, num_draft_tokens = None, None
         if draft_mode == "force":
             err_console.print(f"[dim]{draft_runtime_reason}[/dim]")
@@ -2494,7 +2731,10 @@ def run_oneshot(
             draft_mode=draft_mode,
             just_downloaded_main=just_downloaded_main,
             allow_prompt=sys.stdin.isatty(),
+            draft_model_override=draft_model_override,
         )
+    if draft_repo and num_draft_tokens_override is not None and num_draft_tokens_override > 0:
+        num_draft_tokens = num_draft_tokens_override
     with err_console.status("Preparing model..."):
         draft_model = (
             engine.load_model(draft_repo, ensure_available=False)[0]
@@ -2513,15 +2753,19 @@ def run_oneshot(
         model_name=resolved_name,
     )
     chat_template_kwargs = _effort_chat_template_kwargs(initial_effort, tokenizer)
+    effective_max_tokens = _effort_max_tokens(initial_effort, max_tokens)
 
     _stream_response(
         model, tokenizer, request_messages,
         model_label=display_name or reverse_lookup(resolved_name) or model_name,
-        temp=temp, top_p=top_p, max_tokens=max_tokens, verbose=verbose,
+        temp=temp, top_p=top_p, max_tokens=effective_max_tokens, verbose=verbose,
         chat_template_kwargs=chat_template_kwargs,
         draft_model=draft_model,
         num_draft_tokens=num_draft_tokens,
-        prefill_step_size=2048,
+        prefill_step_size=4096,
+        pld_enabled=pld_enabled,
+        mtp_enabled=mtp_enabled,
+        mtp_model_ref=resolved_name,
         cli_page_mode=cli_page_mode,
     )
 
@@ -2536,6 +2780,8 @@ def run_chat(
     verbose: bool = False,
     initial_effort: str = "default",
     draft_mode: str | None = None,
+    draft_model_override: str | None = None,
+    num_draft_tokens_override: int | None = None,
     display_name: str | None = None,
 ) -> None:
     """Run an interactive chat REPL."""
@@ -2545,20 +2791,62 @@ def run_chat(
     with err_console.status("Preparing model..."):
         model, tokenizer = engine.load_model(repo_id, ensure_available=False)
     supports_draft_runtime, draft_runtime_reason = engine.speculative_runtime_status(model)
-    if draft_mode == "force":
-        if not supports_draft_runtime:
-            err_console.print(f"[dim]{draft_runtime_reason}[/dim]")
+    initial_pld = False
+    initial_mtp = False
+    if draft_mode == "mtp":
+        from daydream.speculative_methods import (
+            METHOD_DRAFT,
+            METHOD_LOOKUP,
+            capability_for,
+        )
+
+        # Try the real backend; if it's not ready, offer to install
+        # everything from one prompt.
+        if _try_enable_mtp(model, tokenizer, repo_id):
+            initial_mtp = True
             draft_repo, num_draft_tokens = None, None
+            draft_mode = None
         else:
-            draft_repo, num_draft_tokens = _resolve_speculative_settings(
-                model_name=model_name,
-                resolved_model=repo_id,
-                draft_mode=draft_mode,
-                just_downloaded_main=just_downloaded_main,
-                allow_prompt=True,
+            cap = capability_for(repo_id)
+            if METHOD_DRAFT in cap.available and supports_draft_runtime:
+                err_console.print("[dim]  → using --speculative draft instead.[/dim]")
+                draft_mode = "force"
+            elif METHOD_LOOKUP in cap.available:
+                err_console.print("[dim]  → using --speculative lookup instead.[/dim]")
+                draft_mode = "lookup"
+            else:
+                err_console.print("[dim]  → no speculation; running plain decode.[/dim]")
+                draft_mode = "off"
+    if draft_mode == "lookup":
+        from daydream.pld import supports_pld
+
+        ok, reason = supports_pld(model)
+        if ok:
+            initial_pld = True
+            err_console.print(
+                "[dim]Prompt-lookup acceleration on (no extra model). "
+                "Speedup depends on prompt/output overlap; use /draft off to disable.[/dim]"
             )
-    else:
+        else:
+            err_console.print(f"[dim]/draft lookup not safe here: {reason}[/dim]")
         draft_repo, num_draft_tokens = None, None
+    elif not supports_draft_runtime:
+        draft_repo, num_draft_tokens = None, None
+        if draft_mode == "force":
+            err_console.print(f"[dim]{draft_runtime_reason}[/dim]")
+    else:
+        draft_repo, num_draft_tokens = _resolve_speculative_settings(
+            model_name=model_name,
+            resolved_model=repo_id,
+            draft_mode=draft_mode,
+            just_downloaded_main=just_downloaded_main,
+            allow_prompt=True,
+            draft_model_override=draft_model_override,
+        )
+        if draft_repo and num_draft_tokens_override is not None and num_draft_tokens_override > 0:
+            num_draft_tokens = num_draft_tokens_override
+        if draft_repo and draft_mode != "force":
+            err_console.print(f"[dim]Draft on: {draft_repo} ({num_draft_tokens}/step).[/dim]")
     if type(model).__module__.startswith("mlx_lm."):
         engine.set_metal_wired_limit()
     with err_console.status("Preparing model..."):
@@ -2574,7 +2862,24 @@ def run_chat(
     cli_page_mode = get_default_cli_page_mode()
     supported_draft_repo = draft_model_for_family(repo_id)
     active_num_draft_tokens = num_draft_tokens
-    prompt_cache = engine.create_prompt_cache(model, draft_model)
+    # PLD (prompt-lookup decoding) — no-extra-model speculative path,
+    # toggled via `/draft lookup` or `--lookup`. Mutually exclusive
+    # with the draft-model path (draft_model overrides).
+    pld_enabled = initial_pld
+    # MTP path — model-native multi-token prediction via MTPLX,
+    # toggled via `/draft mtp` or `--speculative mtp`. Mutually
+    # exclusive with both the draft-model and PLD paths.
+    mtp_enabled = initial_mtp
+
+    # Context-length wiring. The user-facing knob is `/context` (or the
+    # --context-length CLI flag). We resolve the stored preference once
+    # against the loaded model's max_position_embeddings + a hard
+    # safety ceiling, then build every subsequent prompt cache with
+    # that max_kv_size.
+    context_pref = get_default_context_length()
+    model_ctx_cap = engine.model_max_position_embeddings(model)
+    max_kv_size = resolve_context_length(context_pref, model_max_position_embeddings=model_ctx_cap)
+    prompt_cache = engine.create_prompt_cache(model, draft_model, max_kv_size=max_kv_size)
 
     err_console.print(f"[bold cyan]{short}[/]")
     err_console.print("[dim]Use / for commands.[/dim]")
@@ -2606,7 +2911,7 @@ def run_chat(
         if stripped in ("/reset", "/clear", "/r"):
             messages = []
             transcript_blocks = []
-            prompt_cache = engine.create_prompt_cache(model, draft_model)
+            prompt_cache = engine.create_prompt_cache(model, draft_model, max_kv_size=max_kv_size)
             if session is not None:
                 session.messages = []
                 session.updated_at = time.time()
@@ -2626,9 +2931,10 @@ def run_chat(
             err_console.print("[dim]/rename   — rename a saved session[/dim]")
             err_console.print("[dim]/dreaming — consolidate memories from conversation[/dim]")
             err_console.print("[dim]/memory   — view extracted memories[/dim]")
-            err_console.print("[dim]/effort   — pick instant / short / default / long[/dim]")
-            err_console.print(f"[dim]{DRAFT_SLASH_COMMAND} — turn draft acceleration on / off[/dim]")
-            err_console.print("[dim]/cli-page — choose loose / tight page spacing[/dim]")
+            err_console.print("[dim]/effort   — instant / short / default / long[/dim]")
+            err_console.print("[dim]/context  — default / 4k / 8k / 16k / 32k / 64k / 128k / N[/dim]")
+            err_console.print(f"[dim]{DRAFT_SLASH_COMMAND} — on / mtp / lookup / off[/dim]")
+            err_console.print("[dim]/cli-page — loose / tight[/dim]")
             err_console.print("[dim]/reset    — clear conversation history[/dim]")
             err_console.print("[dim]/clear    — alias for /reset[/dim]")
             err_console.print("[dim]/t        — show last captured reasoning[/dim]")
@@ -2636,7 +2942,7 @@ def run_chat(
             err_console.print("[dim]/help     — show this help[/dim]")
             continue
         if stripped == "/":
-            err_console.print(f"[dim]Type /effort, {DRAFT_SLASH_COMMAND}, /cli-page, /new, /resume, /rename, /dreaming, /memory, /t, /reset, or /help.[/dim]")
+            err_console.print(f"[dim]Type /effort, /context, {DRAFT_SLASH_COMMAND}, /cli-page, /new, /resume, /rename, /dreaming, /memory, /t, /reset, or /help.[/dim]")
             continue
         if stripped.startswith("/effort"):
             parts = stripped.split(maxsplit=1)
@@ -2644,7 +2950,7 @@ def run_chat(
             if selected is None:
                 selected = _select_effort(effort, supported=effort_supported, cli_page_mode=cli_page_mode)
             effort = selected
-            prompt_cache = engine.create_prompt_cache(model, draft_model)
+            prompt_cache = engine.create_prompt_cache(model, draft_model, max_kv_size=max_kv_size)
             note = "[dim]Model may ignore this setting.[/dim]" if not effort_supported else ""
             err_console.print(f"[dim]Reasoning effort set to {effort}.[/dim] {note}".rstrip())
             continue
@@ -2653,33 +2959,101 @@ def run_chat(
             parts = stripped.split(maxsplit=1)
             selected = _normalize_draft_command(parts[1]) if len(parts) > 1 else None
             if selected is None:
-                current = "on" if draft_model is not None else "off"
+                # `current` must reflect ALL exclusive modes (on / mtp /
+                # lookup / off) — if mtp_enabled is true but draft_model
+                # is None we'd otherwise display "off", which is wrong.
+                if mtp_enabled:
+                    current = "mtp"
+                elif draft_model is not None:
+                    current = "on"
+                elif pld_enabled:
+                    current = "lookup"
+                else:
+                    current = "off"
                 if len(parts) == 1:
                     selected = _select_draft_mode(current, cli_page_mode=cli_page_mode)
                 else:
                     err_console.print(
-                        f"[dim]Draft acceleration is {current}. Use {DRAFT_SLASH_COMMAND} on or {DRAFT_SLASH_COMMAND} off.[/dim]"
+                        f"[dim]Draft is {current}. Use {DRAFT_SLASH_COMMAND} on / mtp / lookup / off.[/dim]"
                     )
                     continue
+            if selected == "mtp":
+                if not _try_enable_mtp(model, tokenizer, repo_id):
+                    continue
+                # Turning MTP ON: clear the draft-model and PLD modes.
+                if draft_model is not None:
+                    draft_model = None
+                    active_num_draft_tokens = None
+                pld_enabled = False
+                mtp_enabled = True
+                prompt_cache = engine.create_prompt_cache(model, None, max_kv_size=max_kv_size)
+                continue
+            if selected == "lookup":
+                from daydream.pld import supports_pld
+
+                ok, reason = supports_pld(model)
+                if not ok:
+                    err_console.print(f"[dim]/draft lookup unsafe here ({reason}).[/dim]")
+                    continue
+                if draft_model is not None:
+                    draft_model = None
+                    active_num_draft_tokens = None
+                if mtp_enabled:
+                    engine.teardown_mtp_backends()  # free ~16 GB GPU mem
+                pld_enabled = True
+                mtp_enabled = False
+                prompt_cache = engine.create_prompt_cache(model, None, max_kv_size=max_kv_size)
+                err_console.print("[dim]Lookup (prompt-ngram) on. Free on chat.[/dim]")
+                continue
+            if selected == "off":
+                if mtp_enabled:
+                    engine.teardown_mtp_backends()
+                draft_model = None
+                active_num_draft_tokens = None
+                pld_enabled = False
+                mtp_enabled = False
+                prompt_cache = engine.create_prompt_cache(model, None, max_kv_size=max_kv_size)
+                err_console.print("[dim]Draft off.[/dim]")
+                continue
+            # The remaining draft-model branches require a supported family.
             if supported_draft_repo is None:
-                err_console.print("[dim]Draft acceleration is only supported for Qwen3.5 MLX models.[/dim]")
+                err_console.print("[dim]/draft on needs Qwen3.5/Qwen3.6. Try /draft lookup.[/dim]")
                 continue
             if not supports_draft_runtime:
                 reason = draft_runtime_reason or "Draft acceleration is unavailable for this runtime."
                 err_console.print(f"[dim]{reason}[/dim]")
                 continue
-            if selected == "off":
-                draft_model = None
-                active_num_draft_tokens = None
-                prompt_cache = engine.create_prompt_cache(model, None)
-                err_console.print("[dim]Draft acceleration disabled.[/dim]")
+            # Hybrid GatedDeltaNet models (Qwen3.5 / Qwen3.6) cannot
+            # support partial-rejection trims on the recurrent state.
+            # mlx-lm 0.31's speculation silently corrupts the cache and
+            # the user sees missing words / truncated sentences in the
+            # main body or reasoning chain. Refuse cleanly until
+            # mlx-lm gains real hybrid speculation support.
+            from daydream.speculative import is_qwen_hybrid_runtime_model
+            if is_qwen_hybrid_runtime_model(repo_id):
+                err_console.print(
+                    "[yellow]External draft is not safe on Qwen3.5/Qwen3.6.[/]"
+                )
+                err_console.print(
+                    "[dim]The hybrid GatedDeltaNet cache can't be trimmed on partial "
+                    "rejection, which corrupts the main body. Use /draft off (single-model, "
+                    "correct output) or wait for native hybrid speculation in mlx-lm.[/dim]"
+                )
                 continue
+            # Switching from lookup / mtp → on: free MTP runtime if held.
+            if mtp_enabled:
+                engine.teardown_mtp_backends()
+            pld_enabled = False
+            mtp_enabled = False
             if not is_model_available_locally(supported_draft_repo):
                 err_console.print(
                     f"[dim]Draft model not installed locally: {supported_draft_repo}. Pull it first to enable acceleration.[/dim]"
                 )
                 continue
             if draft_repo != supported_draft_repo or draft_model is None:
+                # Hybrid main+draft warmup can hit Metal GPU timeout on
+                # tight unified-memory Macs — fatal C++ abort, uncatchable.
+                err_console.print("[dim]Loading draft. /draft off if Metal timeout hits.[/dim]")
                 with err_console.status("Loading draft model..."):
                     draft_model = engine.load_model(supported_draft_repo, ensure_available=False)[0]
                 if type(model).__module__.startswith("mlx_lm."):
@@ -2687,8 +3061,48 @@ def run_chat(
                         engine.warmup_draft_model(model, draft_model, tokenizer)
             draft_repo = supported_draft_repo
             active_num_draft_tokens = default_num_draft_tokens(repo_id)
-            prompt_cache = engine.create_prompt_cache(model, draft_model)
-            err_console.print(f"[dim]Draft acceleration enabled with {supported_draft_repo}.[/dim]")
+            prompt_cache = engine.create_prompt_cache(model, draft_model, max_kv_size=max_kv_size)
+            err_console.print(f"[dim]Draft on: {supported_draft_repo}.[/dim]")
+            continue
+        if stripped.startswith("/context"):
+            parts = stripped.split(maxsplit=1)
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            if not arg:
+                if max_kv_size:
+                    detail = f"{max_kv_size}"
+                elif model_ctx_cap:
+                    detail = f"auto ({model_ctx_cap})"
+                else:
+                    detail = "auto"
+                err_console.print(f"[dim]Context: {context_pref} ({detail}).[/dim]")
+                err_console.print("[dim]Options: default | 4k | 8k | 16k | 32k | 64k | 128k | <N>[/dim]")
+                continue
+            try:
+                context_pref = set_default_context_length(arg)
+            except Exception as exc:
+                err_console.print(f"[dim]Bad value: {exc}[/dim]")
+                continue
+            new_max = resolve_context_length(context_pref, model_max_position_embeddings=model_ctx_cap)
+            if new_max == max_kv_size:
+                err_console.print(f"[dim]Already at {context_pref}.[/dim]")
+                continue
+            try:
+                prompt_cache = engine.create_prompt_cache(model, draft_model, max_kv_size=new_max)
+            except Exception as exc:
+                err_console.print(f"[dim]Alloc failed ({exc}); reverting to auto.[/dim]")
+                context_pref = set_default_context_length("auto")
+                max_kv_size = None
+                prompt_cache = engine.create_prompt_cache(model, draft_model, max_kv_size=max_kv_size)
+                continue
+            max_kv_size = new_max
+            shown = f"{max_kv_size}" if max_kv_size else "auto"
+            err_console.print(f"[dim]Context: {context_pref} ({shown}). History cleared.[/dim]")
+            messages = []
+            transcript_blocks = []
+            if _is_tight_cli_page_mode(cli_page_mode):
+                _repack_tight_page(short, transcript_blocks)
+            else:
+                _repack_loose_page(short, transcript_blocks)
             continue
         if stripped.startswith("/cli-page"):
             parts = stripped.split(maxsplit=1)
@@ -2724,7 +3138,7 @@ def run_chat(
                 memories=[],
             )
             session_memories = []
-            prompt_cache = engine.create_prompt_cache(model, draft_model)
+            prompt_cache = engine.create_prompt_cache(model, draft_model, max_kv_size=max_kv_size)
             # Copy existing messages into session if any
             for msg in messages:
                 session.messages.append(ChatMessage(
@@ -2757,7 +3171,7 @@ def run_chat(
                         if session is not None and session.session_id == selected_session.session_id:
                             session = None
                             session_memories = []
-                            prompt_cache = engine.create_prompt_cache(model, draft_model)
+                            prompt_cache = engine.create_prompt_cache(model, draft_model, max_kv_size=max_kv_size)
                         err_console.print(
                             f"[dim]Deleted saved session: {selected_session.title or selected_session.session_id[:8]}[/dim]"
                         )
@@ -2767,7 +3181,7 @@ def run_chat(
                 session = selected_session
                 messages = [{"role": m.role, "content": m.content} for m in session.messages]
                 session_memories = load_memories(session.session_id)
-                prompt_cache = engine.create_prompt_cache(model, draft_model)
+                prompt_cache = engine.create_prompt_cache(model, draft_model, max_kv_size=max_kv_size)
                 transcript_blocks = _transcript_blocks_from_messages(session.messages)
                 err_console.print(f"[dim]Resumed: {session.title} ({len(messages)} messages)[/dim]")
                 if _is_tight_cli_page_mode(cli_page_mode):
@@ -2834,7 +3248,7 @@ def run_chat(
                 session.updated_at = time.time()
                 save_memories(session.session_id, session_memories)
                 save_session(session)
-                prompt_cache = engine.create_prompt_cache(model, draft_model)
+                prompt_cache = engine.create_prompt_cache(model, draft_model, max_kv_size=max_kv_size)
                 err_console.print(f"[dim]Added {len(new_memories)} memories to this session.[/dim]")
             else:
                 err_console.print("[dim]Discarded extracted memories.[/dim]")
@@ -2860,16 +3274,20 @@ def run_chat(
             session_memories=session_memories if session is not None else None,
         )
         chat_template_kwargs = _effort_chat_template_kwargs(effort, tokenizer)
+        effective_max_tokens = _effort_max_tokens(effort, max_tokens)
 
         stream_result = _stream_response(
             model, tokenizer, request_messages,
             model_label=short,
-            temp=temp, top_p=top_p, max_tokens=max_tokens, verbose=verbose,
+            temp=temp, top_p=top_p, max_tokens=effective_max_tokens, verbose=verbose,
             chat_template_kwargs=chat_template_kwargs,
             draft_model=draft_model,
             num_draft_tokens=active_num_draft_tokens,
-            prefill_step_size=2048,
+            prefill_step_size=4096,
             prompt_cache=prompt_cache,
+            pld_enabled=pld_enabled,
+            mtp_enabled=mtp_enabled,
+            mtp_model_ref=repo_id,
             cli_page_mode=cli_page_mode,
             skip_final_print=True,
         )

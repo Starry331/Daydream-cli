@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -25,6 +27,42 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 from rich.table import Table
+
+
+@contextlib.contextmanager
+def _silence_hf_progress_bars():
+    """Suppress huggingface_hub's own tqdm bars during a download.
+
+    snapshot_download spawns per-file tqdm bars that fight our Rich
+    Progress for the same stderr stream — the result is a screen-full
+    of overlapping spinners. We disable HF's progress for the duration
+    of the call and restore it afterwards.
+    """
+    prev_env = os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS")
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    disabled_via_api = False
+    try:
+        from huggingface_hub.utils import (
+            disable_progress_bars,
+            enable_progress_bars,
+        )
+
+        disable_progress_bars()
+        disabled_via_api = True
+    except Exception:
+        pass
+    try:
+        yield
+    finally:
+        if disabled_via_api:
+            try:
+                enable_progress_bars()
+            except Exception:
+                pass
+        if prev_env is None:
+            os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
+        else:
+            os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = prev_env
 
 from daydream.config import MODEL_CACHE_DIR, ensure_home
 from daydream.registry import (
@@ -246,12 +284,13 @@ def _repo_storage_dir(repo_id: str) -> Path:
 
 def _estimate_download_bytes(repo_id: str) -> int | None:
     try:
-        entries = snapshot_download(
-            repo_id,
-            allow_patterns=MODEL_FILE_PATTERNS,
-            cache_dir=str(MODEL_CACHE_DIR),
-            dry_run=True,
-        )
+        with _silence_hf_progress_bars():
+            entries = snapshot_download(
+                repo_id,
+                allow_patterns=MODEL_FILE_PATTERNS,
+                cache_dir=str(MODEL_CACHE_DIR),
+                dry_run=True,
+            )
     except Exception:
         return None
 
@@ -269,7 +308,10 @@ def _watch_downloaded_bytes(
     total_bytes: int | None,
     stop_event: threading.Event,
 ) -> None:
-    while not stop_event.wait(0.12):
+    # Poll the cache size at ~4 Hz. Anything faster makes the spinner
+    # churn faster than the terminal can repaint cleanly and produces
+    # the screen-flood we want to avoid.
+    while not stop_event.wait(0.25):
         current_bytes = _dir_size(storage_dir) if storage_dir.exists() else initial_bytes
         completed = max(0, current_bytes - initial_bytes)
         if total_bytes is not None:
@@ -318,6 +360,52 @@ def _install_fixture_model(repo_id: str) -> Optional[Path]:
     return snapshot_dir
 
 
+def _maybe_offer_draft_copull(repo_id: str) -> None:
+    """If the just-pulled model has a recommended draft model that
+    isn't cached yet, ask the user whether to download it too.
+
+    Skipped in non-interactive contexts (e.g. inside `daydream run`'s
+    auto-pull, or when stdin is not a TTY) so we never block scripts.
+    """
+    import sys
+
+    from daydream.speculative import draft_model_for_family
+
+    draft_repo = draft_model_for_family(repo_id)
+    if draft_repo is None or draft_repo == repo_id:
+        return
+    if is_model_available_locally(draft_repo):
+        return
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        # Show the hint, but don't pause for input.
+        console.print()
+        console.print(
+            f"[dim]Tip: run `daydream pull {draft_repo}` to enable draft acceleration.[/dim]"
+        )
+        return
+
+    console.print()
+    console.print(
+        f"[bold]Draft acceleration[/] is available for this model via "
+        f"[cyan]{draft_repo}[/]."
+    )
+    try:
+        from daydream.utils import format_size
+
+        est = _estimate_download_bytes(draft_repo)
+        if est:
+            console.print(f"[dim]Draft model download size ≈ {format_size(est)}.[/dim]")
+    except Exception:
+        pass
+
+    if click.confirm("Download the draft model now?", default=True):
+        pull_model(draft_repo)
+    else:
+        console.print(
+            f"[dim]Skipped. You can pull it later with: `daydream pull {draft_repo}`.[/dim]"
+        )
+
+
 def pull_model(name: str, *, register_alias: bool = False) -> None:
     """Download a model from HuggingFace."""
     ensure_home()
@@ -333,7 +421,7 @@ def pull_model(name: str, *, register_alias: bool = False) -> None:
     download_total = total_bytes if total_bytes and total_bytes > 0 else None
 
     use_live_progress = bool(progress_console.is_terminal and getattr(progress_console.file, "isatty", lambda: False)())
-    with terminal_title_status(f"Downloading {short}"):
+    with terminal_title_status(f"Downloading {short}"), _silence_hf_progress_bars():
         if use_live_progress:
             with Progress(
                 SpinnerColumn(),
@@ -345,6 +433,10 @@ def pull_model(name: str, *, register_alias: bool = False) -> None:
                 TimeElapsedColumn(),
                 console=progress_console,
                 transient=True,
+                # Single-line refresh cadence: 4 Hz matches the watcher
+                # poll interval so the bar can't churn between samples
+                # and waste terminal repaints on identical state.
+                refresh_per_second=4,
             ) as progress:
                 task = progress.add_task("Downloading model", total=download_total, completed=0)
                 stop_event = threading.Event()
@@ -403,6 +495,8 @@ def pull_model(name: str, *, register_alias: bool = False) -> None:
     console.print(f"[green]✓[/] {short} downloaded to {path}")
     if alias and alias != short:
         console.print(f"[dim]Registered alias:[/] {alias}")
+
+    _maybe_offer_draft_copull(repo_id)
 
 
 def ensure_runtime_model(name: str, *, auto_pull: bool = False, register_alias: bool = False) -> str:
@@ -585,5 +679,16 @@ def show_model(name: str) -> None:
         bits = quant.get("bits", "?")
         group_size = quant.get("group_size", "?")
         info_lines.append(f"[bold]Quantization:[/]   {bits}-bit (group_size={group_size})")
+
+    # Speculative-decoding capability (see daydream.speculative_methods).
+    try:
+        from daydream.speculative_methods import describe_capability
+
+        info_lines.append("")
+        info_lines.extend(describe_capability(repo_id))
+    except Exception:
+        # The capability table is best-effort decoration; never block
+        # `daydream show` because of it.
+        pass
 
     console.print(Panel("\n".join(info_lines), title=f"[bold]{short}[/]", border_style="cyan"))

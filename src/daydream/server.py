@@ -27,11 +27,13 @@ from daydream.config import (
     SERVER_LOG_FILE,
     SERVER_STATE_FILE,
     ensure_home,
+    get_default_context_length,
     get_default_host,
     get_default_max_tokens,
     get_default_port,
     get_default_temp,
     get_default_top_p,
+    resolve_context_length,
 )
 from daydream.models import ensure_runtime_model, is_fixture_model, is_model_available_locally, pull_model
 from daydream.profiles import get_profile
@@ -177,7 +179,7 @@ def _build_server_args(
         chat_template_args=chat_template_args or {},
         decode_concurrency=32,
         prompt_concurrency=8,
-        prefill_step_size=2048,
+        prefill_step_size=4096,
         prompt_cache_size=10,
         prompt_cache_bytes=None,
         pipeline=False,
@@ -282,6 +284,8 @@ def _run_runtime_server(
     top_p: float = 1.0,
     max_tokens: int = 4096,
     chat_template_args: dict | None = None,
+    max_kv_size: int | None = None,
+    num_draft_tokens: int | None = None,
 ) -> None:
     generation_lock = threading.Lock()
 
@@ -341,11 +345,12 @@ def _run_runtime_server(
             request_top_p = float(payload.get("top_p", top_p))
             request_max_tokens = int(payload.get("max_tokens", max_tokens))
 
-            prompt_cache = engine.create_prompt_cache(model, draft_model)
+            prompt_cache = engine.create_prompt_cache(model, draft_model, max_kv_size=max_kv_size)
             parser = _ReasoningParser()
             chunks: list[str] = []
             last_response = None
 
+            effective_num_draft = num_draft_tokens if num_draft_tokens else default_num_draft_tokens(repo_id)
             with generation_lock:
                 response_iter = engine.generate_stream(
                     model,
@@ -356,8 +361,8 @@ def _run_runtime_server(
                     top_p=request_top_p,
                     chat_template_kwargs=chat_template_args or {},
                     draft_model=draft_model,
-                    num_draft_tokens=default_num_draft_tokens(repo_id) if draft_model is not None else None,
-                    prefill_step_size=2048,
+                    num_draft_tokens=effective_num_draft if draft_model is not None else None,
+                    prefill_step_size=4096,
                     prompt_cache=prompt_cache,
                 )
 
@@ -658,6 +663,8 @@ def start_server(
     detach: bool = False,
     max_tokens: int | None = None,
     draft_mode: str | None = None,
+    draft_model_override: str | None = None,
+    num_draft_tokens_override: int | None = None,
 ) -> None:
     """Start the OpenAI-compatible API server."""
     import logging
@@ -668,21 +675,42 @@ def start_server(
         datefmt="%H:%M:%S",
     )
 
+    # Raise Metal's wired-memory limit before the model loads. Once the
+    # GPU heap is allocated, the wired limit affects how aggressively
+    # MLX can pin tensors in unified memory — meaningfully faster on
+    # 27B/35B targets, no-op on Intel / unavailable Metal devices.
+    engine.set_metal_wired_limit()
+
     profile = get_profile(model) if model else None
     source_model = profile.from_model if profile else model
     repo_id = ensure_runtime_model(source_model, auto_pull=True, register_alias=True) if source_model else None
     draft_repo_id = None
     num_draft_tokens = None
     draft_disabled_reason = None
-    if repo_id and draft_mode == "force":
+    auto_draft_repo = default_draft_for_model(repo_id) if repo_id else None
+    if repo_id and draft_model_override and draft_mode != "off":
+        # User-picked draft repo wins over both auto- and family-defaults.
+        target = draft_model_override.strip()
+        if not is_model_available_locally(target):
+            pull_model(target, register_alias=True)
+        draft_repo_id = target
+        num_draft_tokens = default_num_draft_tokens(repo_id) or 3
+    elif repo_id and draft_mode == "force":
         candidate_draft = draft_model_for_family(repo_id)
         if candidate_draft:
             if not is_model_available_locally(candidate_draft):
                 pull_model(candidate_draft, register_alias=True)
             draft_repo_id = candidate_draft
-            num_draft_tokens = default_num_draft_tokens(repo_id) or 6
+            num_draft_tokens = default_num_draft_tokens(repo_id) or 3
         else:
             console.print("[yellow]This model does not support draft acceleration.[/yellow]")
+    elif repo_id and draft_mode != "off" and auto_draft_repo and is_model_available_locally(auto_draft_repo):
+        # Auto-enable draft for Qwen3.6 when the draft is cached.
+        draft_repo_id = auto_draft_repo
+        num_draft_tokens = default_num_draft_tokens(repo_id) or 3
+
+    if draft_repo_id and num_draft_tokens_override is not None and num_draft_tokens_override > 0:
+        num_draft_tokens = num_draft_tokens_override
 
     if detach:
         _spawn_background_server(
@@ -739,6 +767,11 @@ def start_server(
         if repo_id and draft_repo_id is not None:
             loaded_model, loaded_tokenizer = engine.load_model(repo_id, ensure_available=False)
             loaded_draft_model, _ = engine.load_model(draft_repo_id, ensure_available=False)
+            # Raise Metal's wired-memory limit so the GPU can hold both
+            # weights without paging — the single biggest non-algorithmic
+            # tok/s win for serve on big models.
+            if type(loaded_model).__module__.startswith("mlx_lm."):
+                engine.set_metal_wired_limit()
             profile_parameters = profile.parameters if profile else {}
             chat_template_args = {}
             if profile_parameters.get("effort") == "instant":
@@ -747,6 +780,11 @@ def start_server(
                 chat_template_args = {"enable_thinking": True}
 
             effective_max_tokens = max_tokens or int(profile_parameters.get("max_tokens", get_default_max_tokens()))
+            ctx_pref = get_default_context_length()
+            model_ctx_cap = engine.model_max_position_embeddings(loaded_model)
+            max_kv_size = resolve_context_length(ctx_pref, model_max_position_embeddings=model_ctx_cap)
+            if max_kv_size:
+                console.print(f"[dim]Context window capped at {max_kv_size} tokens (preset: {ctx_pref}).[/dim]")
             _run_runtime_server(
                 host,
                 port,
@@ -758,6 +796,8 @@ def start_server(
                 top_p=float(profile_parameters.get("top_p", get_default_top_p())),
                 max_tokens=effective_max_tokens,
                 chat_template_args=chat_template_args,
+                max_kv_size=max_kv_size,
+                num_draft_tokens=num_draft_tokens,
             )
             return
 
@@ -782,7 +822,11 @@ def start_server(
                 max_tokens=effective_max_tokens,
                 chat_template_args=chat_template_args,
                 draft_model=serve_draft,
-                num_draft_tokens=serve_num_tokens or 6,
+                # 3 draft tokens matches the daydream-native runtime
+                # default; 6 over-commits speculative work on hybrid
+                # models and bleeds wall-clock time when rejections
+                # happen.
+                num_draft_tokens=serve_num_tokens or 3,
             )
             provider = ModelProvider(args)
             mlx_server_run(host, port, provider)
